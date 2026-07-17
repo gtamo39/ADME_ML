@@ -1,0 +1,40 @@
+# ADME_ML — pinned local environment (conda env `ML`, python 3.12+)
+# All libraries run fully offline after install; no telemetry, no per-inference downloads.
+
+# --- core (already installed) ---
+pandas==3.0.3
+numpy==1.26.4
+scikit-learn==1.8.0
+scipy==1.17.1
+rdkit==2025.9.3
+xgboost==3.2.0
+pyyaml==6.0.3
+
+# --- multitask ADME regression (NEW 2026-07-07) ---
+# Chemprop 2.x (D-MPNN, multitask regression). Pulls torch; use the CPU wheel if no GPU:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+# GPU (env `chemprop`, RTX A6000, driver CUDA 12.9): the default torch 2.13 wheel is a cu130 build
+# too new for the 12.9 driver (falls back to CPU). Pin the cu126 build to enable the GPU:
+#   pip install --index-url https://download.pytorch.org/whl/cu126 torch==2.13.0+cu126
+torch==2.13.0+cu126
+# Chemprop has no telemetry; weights are trained locally, nothing is downloaded at inference.
+# CheMeleon foundation model (--from-foundation CHEMELEON, needs --multi-hot-atom-featurizer-mode V2)
+# ships inside chemprop 2.2.0+; weights fetched once from Zenodo then cached, no per-inference network.
+chemprop>=2.1,<3
+# Descriptastorus: RDKit 2D normalized descriptors as model features (offline; no phone-home).
+descriptastorus>=2.8.0
+# PyTDC: downloads PUBLIC ADMET datasets once (Harvard Dataverse) then caches locally.
+# Only public data is fetched IN; no in-house data ever leaves. Used for Lipophilicity_AZ,
+# Caco2_Wang, PPBR_AZ, Clearance_Microsome_AZ.
+PyTDC>=1.1.0
+
+# --- notebook (vignettes/Multitask_adme_preds.ipynb; env `chemprop`, NEW 2026-07-17) ---
+# Going forward the `chemprop` env is the single working env for this repo, so it needs the
+# extra libraries the notebook's top import cell pulls in (absent from a fresh chemprop env).
+# xgboost is pinned above but is NOT installed in chemprop by default — install it there too.
+openTSNE==1.0.4     # 2D embedding for chemical-space plots (ML)
+nonconformist==2.1.0 # conformal prediction intervals (ML)
+adjustText==1.4.0   # non-overlapping text labels on plots (visualization)
+py3Dmol==2.5.3      # 3D molecule viewer (visualization only; unused in the modelling sections)
+meeko==0.7.1        # docking prep (unused in the modelling sections; top-cell import only)
+gemmi==0.7.4        # meeko runtime dependency (install explicitly if meeko used --no-deps)

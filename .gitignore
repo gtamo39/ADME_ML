@@ -1,0 +1,27 @@
+# Heavy / generated / private data — never committed (mirrors ../MS_ML)
+data/
+output/
+autoresearch/
+tmp/
+__MACOSX/
+
+# Belt-and-suspenders: heavy/private artifacts anywhere (SMILES-bearing or large)
+*.parquet
+*.ckpt
+*.pt
+*.joblib
+*.pkl
+
+# Python build / cache artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Local editor / OS junk
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code per-machine settings
+.claude/settings.local.json

@@ -1,0 +1,94 @@
+SERAC_C:                    # named palette: name -> hex (quote hex; '#' is a YAML comment otherwise)
+  azure: '#0EA5CE'
+  ember: '#E65D32'
+  terracotta: '#EEA090'
+  gold: '#E8B04B'
+  olive: '#74B24A'
+  sky_blue: '#A6C8E4'
+  paper: '#E3E0DA'
+
+CHEMLIB_OVERWRITE: false
+CHEMLIB_PATH: data/chemical_libs/SERAC_lib.csv
+SOL_OVERWRITE: false
+CUTOFF_SOL: 10
+
+# --- single-task RF systematic run (python/run_RF_SingleTask_systematic.py) ---
+RF_SINGLETASK:
+  seed: 42
+  n_jobs: 32
+  cv_folds: 5
+  output_dir: output/predictions_runs
+  features_type: H236                 # H236 (MLTrail-deployable) | MFDS (needs descriptastorus + custom featurizer)
+  champion: {n_estimators: 200, max_depth: 20, max_features: 0.3, min_samples_leaf: 2}
+  register_mltrail: true
+  archive_public_in_trainset: true   # archive the FULL internal+public trainset (reproducible in isolation)
+  # per-endpoint public sources for the deployed "augmented" model (default = all available parquets).
+  # solubility: EXPERIMENTAL only — ADMETlab PREDICTED solubility HURTS (wiki 2026-07: experimental
+  # moves temporal 0.044->0.313, predicted pseudo-labels poison newest compounds). Others use all available.
+  augmented_sources:
+    solubility: [EXP]
+
+# --- multitask ADME regression ---
+ADME_OVERWRITE: false
+ADME_CSV: data/20260707_all_adme.csv
+ADME_ID_COL: name              # SRB-XXXXXXX id; digits give temporal recency (bigger = newer)
+ADME_SMILES_COL: smiles
+# endpoint -> in-house target column + transform to modelling space.
+# transforms: log10 (assay value must be >0), identity (already log), logit_pct (%->fraction->logit)
+ADME_ENDPOINTS:
+  solubility: {col: 'solubility_Thermodynamic Solubility (1)', transform: log10,     unit: uM}
+  logd:       {col: 'logd_LogD7.4',                            transform: identity,  unit: logD7.4}
+  hlm:        {col: 'hlm_CLint (raw)',                         transform: log10,     unit: uL/min/mg}
+  mlm:        {col: 'mlm_CLint (raw)',                         transform: log10,     unit: uL/min/mg}
+  rlm:        {col: 'rlm_CLint (raw)',                         transform: log10,     unit: uL/min/mg}
+  caco2:      {col: 'caco2_Mean Papp A to B',                  transform: log10,     unit: 1e-6cm/s}
+  mdck:       {col: 'mdck_Mean Papp A to B',                   transform: log10,     unit: 1e-6cm/s, filter: {col: 'mdck_Cell line', contains: MDR1}}  # MDR1-MDCK only (drop MDR2/MDR3)
+  ppb:        {col: 'ppb_%Unbound',                            transform: logit_pct, unit: pct_unbound}
+
+# public-source harmonization: per-endpoint best public dataset + unit conversion to modelling space.
+# tier: direct (same units) | convert (deterministic) | scale (physiological, approximate) | none
+ADME_PUBLIC:
+  logd:  {source: tdc, name: Lipophilicity_AstraZeneca, tier: direct,  op: identity}
+  hlm:   {source: tdc, name: Clearance_Microsome_AZ,    tier: direct,  op: log10}
+  caco2: {source: tdc, name: Caco2_Wang,                tier: convert, op: log10_offset, offset: 6.0}  # cm/s -> 1e-6 cm/s
+  ppb:   {source: tdc, name: PPBR_AZ,                   tier: convert, op: pctbound_to_logit_fu}
+  hlm_biogen: {source: biogen, col: 'LOG HLM_CLint (mL/min/kg)', tier: scale, op: log_clint_bw_to_invitro, species: human}
+  rlm:        {source: biogen, col: 'LOG RLM_CLint (mL/min/kg)', tier: scale, op: log_clint_bw_to_invitro, species: rat}
+  ppb_biogen: {source: biogen, col: 'LOG PLASMA PROTEIN BINDING (HUMAN) (% unbound)', tier: convert, op: log_pctunbound_to_logit_fu}
+# physiological scaling: mL/min/kg = uL/min/mg x MPPGL(mg/g liver) x LW(g liver/kg bw) / 1000
+ADME_SCALING:
+  human: {MPPGL: 32.0, LW: 20.0}
+  rat:   {MPPGL: 45.0, LW: 40.0}
+BIOGEN_ADME_CSV: data/public_solubility/biogen_fang_adme/ADME_public_set_3521.csv
+
+# public solubility (from the predict_solubility project's harmonize_solubility, µM).
+# in-house solubility endpoint = thermodynamic (log10 µM). Notebook dataset-selection kept
+# thermo+kinetic experimental (dropped mixed + predicted PROTAC-PatentDB); mirror that here.
+SOL_HARMONIZED_CSV: data/public_solubility/harmonized_sol.csv
+SOL_PUBLIC_TYPES: [thermodynamic_experimental, kinetic_experimental]
+SOL_SUBSAMPLE_PER_TYPE: 5000     # cap per type (dedup by InChIKey first) for RF tractability
+
+# ADMETlab predictions on PROTAC-DB patent compounds (63k, in our chemical space) — 2nd predictor
+# (cf. Novartis). Covers logd/caco2/mdck/ppb/solubility; NOT microsomal clearance (LM-human is a
+# 0-1 stability prob, cl-plasma is whole-body). PREDICTED, not experimental.
+ADMETLAB_CSV: data/public_solubility/protac_patent/PROTAC_Patent_Compounds.xlsx
+ADMETLAB_SUBSAMPLE: full          # int cap, or 'full' = use all ~63k PROTAC-patent compounds
+ADMETLAB_PUBLIC:                 # pred column -> in-house modelling space
+  logd:       {col: logD,  op: identity}
+  caco2:      {col: caco2, op: log10cm_s_plus6}      # log10(cm/s) -> log10(1e-6 cm/s)
+  mdck:       {col: MDCK,  op: log10cm_s_plus6}      # GAP endpoint (with Novartis)
+  ppb:        {col: PPB,   op: pctbound_to_logit_fu} # %bound -> logit(fu)
+  solubility: {col: logS,  op: logSmolL_plus6}       # log10(mol/L) -> log10(µM)
+
+# Novartis/NIBR in-silico ADME PREDICTIONS (not experimental) on ProtacDB2.0+ZINC+ChEMBL.
+# Used to test 3 roles: benchmark vs experimental, stacking features, distillation/pretraining.
+NOVARTIS_CSV: data/protacdb2.0_zinc_chembl_dataset.csv
+NOVARTIS_SUBSAMPLE: full          # int cap (PROTAC-DB kept fully + rest sampled), or 'full' = all ~273k
+NOVARTIS_PUBLIC:                  # pred column -> in-house modelling space (op as in ADME_PUBLIC)
+  logd:  {col: 'pred(Direct NIBR LogD7.4)', op: identity}
+  hlm:   {col: 'pred(hLM LogCLint)',        op: identity}
+  mlm:   {col: 'pred(mLM LogCLint)',        op: identity}   # GAP endpoint — only public signal
+  rlm:   {col: 'pred(rLM LogCLint)',        op: identity}
+  caco2: {col: 'pred(Caco-2_LogPapp)',      op: identity}   # appears log10(1e-6 cm/s); verified by benchmark
+  mdck:  {col: 'pred(LE-MDCKv2_LogPapp)',   op: identity}   # GAP — LE-MDCK proxy (not MDR1); flag
+  ppb:   {col: 'pred(LogFu-Human)',         op: logfu_to_logit}
