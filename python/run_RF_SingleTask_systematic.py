@@ -161,6 +161,40 @@ class OUTPUT:
             model=RandomForestRegressor(**params.rf_kw), col_to_rm=['compound', 'smiles', 'label'], v=False)
         return pred
 
+    def eval_public_only(self, data, params, ep, sources):
+        """Train on PUBLIC rows only (zero internal in train), predict ALL internal compounds
+        (external validation / domain-transfer baseline). test = every internal compound with ep measured."""
+        ML, d, pub = data.pooled(ep, sources)
+        if not pub or len(d) < 3:
+            return None
+        ids = [[pd.concat(pub)['compound'].tolist(), d['compound'].tolist()]]   # train=public, test=all internal
+        _, pred = ML_Reg.K_fold_by_defined_IDs(ML, ID='compound', ID_sets=ids,
+            model=RandomForestRegressor(**params.rf_kw), col_to_rm=['compound', 'smiles', 'label'], v=False)
+        return pred
+
+    def run_public_only(self, data, params):
+        """Public-only -> internal for each requested endpoint; save pred_public_only.parquet + summary."""
+        rows = []
+        for ep in params.endpoints:
+            aug = data.augmented_sources(ep, params)
+            pred = self.eval_public_only(data, params, ep, aug)
+            if pred is not None:
+                epdir = ROOT / params.output_dir / ep; epdir.mkdir(parents=True, exist_ok=True)
+                pred.to_parquet(epdir / 'pred_public_only.parquet', index=False)
+            r2, rho = _metrics(pred)
+            rows.append({'endpoint': ep, 'sources': '+'.join(aug), 'publiconly_r2': r2,
+                         'publiconly_rho': rho, 'publiconly_n': 0 if pred is None else len(pred)})
+            print(f'  {ep:11} PUBLIC->INT  r2={r2} rho={rho} n={rows[-1]["publiconly_n"]}', flush=True)
+        out_dir = ROOT / params.output_dir; out_dir.mkdir(parents=True, exist_ok=True)
+        long = pd.DataFrame(rows); prev = out_dir / 'summary_public_only.csv'
+        if prev.exists():
+            old = pd.read_csv(prev).pipe(lambda o: o[~o['endpoint'].isin(long['endpoint'])])
+            long = pd.concat([old, long], ignore_index=True) \
+                     .sort_values('endpoint', key=lambda s: s.map({e: i for i, e in enumerate(ENDPOINTS)})).reset_index(drop=True)
+        long.to_csv(prev, index=False)
+        print(f'\n> wrote {prev}', flush=True)
+        print(long.to_string(index=False), flush=True)
+
     @staticmethod
     def modelling_unit(cfg_ep):
         t, u = cfg_ep['transform'], cfg_ep['unit']
@@ -189,17 +223,27 @@ class OUTPUT:
         col = 'prediction' if 'prediction' in out.columns else out.select_dtypes('number').columns[-1]
         return int(out[col].notna().sum()), len(ref)
 
-    def run_endpoint(self, data, params, ep, registry):
-        """Evaluate the 4 arms (save pred_dfs), then fit + register the deployable augmented model."""
+    def run_endpoint(self, data, params, ep, registry, resume=False):
+        """Evaluate the 4 arms (save pred_dfs), then fit + register the deployable augmented model.
+        resume=True: if the 4 pred_dfs already exist, reload them and skip the re-fits; and skip MLTrail
+        registration if `adme_<ep>` is already in the registry — so a restart after a crash picks up where
+        it stopped instead of redoing completed endpoints."""
         aug = data.augmented_sources(ep, params)
         epdir = ROOT / params.output_dir / ep; epdir.mkdir(parents=True, exist_ok=True)
-        arms = {'internal_temporal': self.eval_temporal(data, params, ep, []),
-                'augmented_temporal': self.eval_temporal(data, params, ep, aug),
-                'internal_cv': self.eval_cv(data, params, ep, []),
-                'augmented_cv': self.eval_cv(data, params, ep, aug)}
+        arm_names = ['internal_temporal', 'augmented_temporal', 'internal_cv', 'augmented_cv']
+        cached = resume and all((epdir / f'pred_{a}.parquet').exists() for a in arm_names)
+        if cached:
+            arms = {a: pd.read_parquet(epdir / f'pred_{a}.parquet') for a in arm_names}
+            print(f'  {ep:11} [resume] reloaded 4 cached pred_dfs — skipped re-fit', flush=True)
+        else:
+            arms = {'internal_temporal': self.eval_temporal(data, params, ep, []),
+                    'augmented_temporal': self.eval_temporal(data, params, ep, aug),
+                    'internal_cv': self.eval_cv(data, params, ep, []),
+                    'augmented_cv': self.eval_cv(data, params, ep, aug)}
         row = {'endpoint': ep, 'sources': '+'.join(aug)}
-        for arm, pred in arms.items():
-            if pred is not None:
+        for arm in arm_names:
+            pred = arms[arm]
+            if not cached and pred is not None:
                 pred.to_parquet(epdir / f'pred_{arm}.parquet', index=False)
             r2, rho = _metrics(pred)
             row[f'{arm}_r2'], row[f'{arm}_rho'], row[f'{arm}_n'] = r2, rho, (0 if pred is None else len(pred))
@@ -207,27 +251,36 @@ class OUTPUT:
         row['deployed'] = 'augmented'                          # always deploy internal + augmented
 
         if registry is not None:
-            ML, d, _ = data.pooled(ep, aug)
-            rf = RandomForestRegressor(**params.rf_kw).fit(ML[data.feats], ML['label'])
-            metrics = {k: v for k, v in {'r2_temporal': row['augmented_temporal_r2'], 'rho_temporal': row['augmented_temporal_rho'],
-                                         'r2_cv': row['augmented_cv_r2'], 'rho_cv': row['augmented_cv_rho']}.items() if v is not None}
-            comment = (f'champion RF on H236; deployed = internal + augmented (sources: {"+".join(["internal"]+aug)}); '
-                       f'fit on {len(ML)} rows; full internal+public trainset archived (reproducible in isolation). '
-                       f'Verdict note: Chemprop wins solubility/mlm/hlm — this is the single-task RF baseline.')
-            train_df = (ML[['compound', 'smiles', 'label']] if params.archive_public_in_trainset
-                        else d[['compound', 'smiles', 'label']])
-            mid = self.register(data, params, registry, ep, rf, aug, train_df, metrics, comment)
-            ok, tot = self.deploy_sanity(registry, mid)
-            print(f'  {ep:11} -> MLTrail id={mid} sources={["internal"]+aug} n_train={len(ML)} '
-                  f'metrics={metrics} | sanity {ok}/{tot} non-null', flush=True)
+            listing = registry.list()
+            if resume and len(listing) and (listing['experiment_name'] == f'adme_{ep}').any():
+                print(f'  {ep:11} [resume] already in MLTrail — skipped registration', flush=True)
+            else:
+                ML, d, _ = data.pooled(ep, aug)
+                rf = RandomForestRegressor(**params.rf_kw).fit(ML[data.feats], ML['label'])
+                metrics = {k: v for k, v in {'r2_temporal': row['augmented_temporal_r2'], 'rho_temporal': row['augmented_temporal_rho'],
+                                             'r2_cv': row['augmented_cv_r2'], 'rho_cv': row['augmented_cv_rho']}.items() if v is not None}
+                comment = (f'champion RF on H236; deployed = internal + augmented (sources: {"+".join(["internal"]+aug)}); '
+                           f'fit on {len(ML)} rows; full internal+public trainset archived (reproducible in isolation). '
+                           f'Verdict note: Chemprop wins solubility/mlm/hlm — this is the single-task RF baseline.')
+                train_df = (ML[['compound', 'smiles', 'label']] if params.archive_public_in_trainset
+                            else d[['compound', 'smiles', 'label']])
+                mid = self.register(data, params, registry, ep, rf, aug, train_df, metrics, comment)
+                ok, tot = self.deploy_sanity(registry, mid)
+                print(f'  {ep:11} -> MLTrail id={mid} sources={["internal"]+aug} n_train={len(ML)} '
+                      f'metrics={metrics} | sanity {ok}/{tot} non-null', flush=True)
         return row
 
-    def evaluate_all(self, data, params, registry):
-        return [self.run_endpoint(data, params, ep, registry) for ep in params.endpoints]
+    def evaluate_all(self, data, params, registry, resume=False):
+        return [self.run_endpoint(data, params, ep, registry, resume) for ep in params.endpoints]
 
     def write_outputs(self, data, params, summary):
         out_dir = ROOT / params.output_dir; out_dir.mkdir(parents=True, exist_ok=True)
         sdf = pd.DataFrame(summary)
+        prev = out_dir / 'summary.csv'                          # partial run: merge into the existing table, don't clobber
+        if prev.exists() and set(params.endpoints) != set(ENDPOINTS):
+            keep = pd.read_csv(prev).pipe(lambda d: d[~d['endpoint'].isin(sdf['endpoint'])])
+            sdf = pd.concat([keep, sdf], ignore_index=True)
+            sdf = sdf.sort_values('endpoint', key=lambda s: s.map({e: i for i, e in enumerate(ENDPOINTS)})).reset_index(drop=True)
         sdf.to_csv(out_dir / 'summary.csv', index=False)
         sdf.to_parquet(out_dir / 'summary.parquet', index=False)
         try:
@@ -251,6 +304,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--endpoints', default=','.join(ENDPOINTS), help='comma-separated subset')
     ap.add_argument('--no-mltrail', action='store_true', help='skip MLTrail registration')
+    ap.add_argument('--resume', action='store_true',
+                    help='skip endpoints whose 4 pred_dfs already exist (and MLTrail entry) — restart after a crash')
+    ap.add_argument('--public-only', dest='public_only', action='store_true',
+                    help='train on PUBLIC data only and predict ALL internal (external-validation baseline); no 4-arm run, no MLTrail')
     args = ap.parse_args()
 
     params = PARAMS(CONFIG)
@@ -259,13 +316,17 @@ def main():
     print(f'> {len(data.internal)} internal cmpd | {len(data.feats)} {params.features_type} feats | '
           f'LOCAL per-endpoint temporal split (newest 30%) | endpoints={params.endpoints}', flush=True)
 
+    if args.public_only:
+        OUTPUT().run_public_only(data, params)
+        return
+
     registry = None
     if not args.no_mltrail and params.register_mltrail:
         from mltrail import Registry
         registry = Registry.from_default()
 
     output = OUTPUT()
-    summary = output.evaluate_all(data, params, registry)
+    summary = output.evaluate_all(data, params, registry, resume=args.resume)
     output.write_outputs(data, params, summary)
 
 

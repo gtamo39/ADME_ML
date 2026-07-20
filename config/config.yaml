@@ -26,7 +26,42 @@ RF_SINGLETASK:
   # solubility: EXPERIMENTAL only — ADMETlab PREDICTED solubility HURTS (wiki 2026-07: experimental
   # moves temporal 0.044->0.313, predicted pseudo-labels poison newest compounds). Others use all available.
   augmented_sources:
-    solubility: [EXP]
+    solubility: [EXP]            # ADMETlab predicted solubility poisons it (wiki 2026-07)
+    mdck: [NVS]                  # ADM ablation: dropping ADMETlab lifts mdck 0.163 -> 0.321
+    ppb: [EXP, NVS]              # ADM ablation: dropping ADMETlab lifts ppb 0.149 -> 0.316
+
+# --- systematic Chemprop grouping run (python/run_Chemprop_SystematicGroups.py; env chemprop) ---
+# Trains one multitask model per grouping (augmented+internal, temporal only) and scores each member
+# endpoint on the SAME local per-endpoint temporal test as the RF run. Hyperparams read from the HPO.
+CHEMPROP_SYSTEMATIC:
+  output_dir: output/predictions_runs_chemprop
+  epochs: 50
+  patience: 15
+  cv_folds: 5                        # --cv: K-fold over internal compounds (public always in train), mirrors RF eval_cv
+  hpopt_config: autoresearch/predict_adme/chemprop_run/hpopt/best_config.json  # HPO best params (read at run time)
+  register_mltrail: false            # MLTrail v1 cannot PREDICT chemprop (backend stub) -> archive-only; off until decided
+  groupings:                         # grouping name -> member endpoints (from autoresearch validation)
+    sol_logd:  [solubility, logd]
+    clearance: [hlm, mlm, rlm]
+    all8:      [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]
+
+# --- public-only -> internal experiment (external-validation / domain-transfer baseline) ---
+# Train each endpoint's WINNING model on PUBLIC data ONLY (zero internal compounds in train) and predict
+# ALL internal compounds. Measures pure public->internal transfer (the floor internal data lifts us above).
+#   RF arm:       python python/run_RF_SingleTask_systematic.py --public-only --endpoints logd,caco2,ppb
+#   Chemprop arm: python python/run_Chemprop_SystematicGroups.py --public-only --groupings clearance all8
+#   combine:      python python/combine_public_to_internal.py   (assembles the winner table below)
+# winners = per-endpoint best model/grouping from the CV+temporal head-to-head; REFRESH after CV lands.
+PUBLIC_TO_INTERNAL:
+  winners:
+    solubility: {model: chemprop, grouping: all8}
+    logd:       {model: rf}
+    hlm:        {model: chemprop, grouping: clearance}
+    mlm:        {model: chemprop, grouping: clearance}
+    rlm:        {model: chemprop, grouping: clearance}
+    caco2:      {model: rf}
+    mdck:       {model: chemprop, grouping: all8}
+    ppb:        {model: rf}
 
 # --- multitask ADME regression ---
 ADME_OVERWRITE: false

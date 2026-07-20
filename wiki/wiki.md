@@ -11,6 +11,117 @@ Train a public-data ML model to predict **thermodynamic solubility** of in-house
 - **Feature/compound reference:** `data/protacdb2.0_zinc_chembl_dataset.csv` (ProtacDB 2.0 + ZINC + ChEMBL, with predicted ADME columns — clearance, LogFu, LogP/D, permeability, CYP; **no solubility column**).
 - **Strategy (2026-06-25):** pretrain on curated thermodynamic small-molecule sets → fine-tune on in-house μM data. Multi-task option using Biogen-Fang ADME endpoints.
 
+## Systematic deployment runs — vignette scripts (2026-07-18)
+
+Two `PARAMS/DATA/OUTPUT/MAIN` runners in `python/` (user's preferred class shape) built this session,
+scored on a **LOCAL per-endpoint temporal split** (newest 30% of *each endpoint's* compounds — fixes
+the global split's solubility 29/91 train/test skew; also makes rlm/caco2 scorable). H236 features only
+(DS ablation: mean Δ ≈ +0.018 r², mixed sign → not worth it; deployable via MLTrail's H236 featurizer).
+
+**`run_RF_SingleTask_systematic.py`** (env `ML`) — champion RF, 8 endpoints × 4 arms (internal/augmented
+× temporal/CV), pred_dfs → `output/predictions_runs/<ep>/`, registers deployable H236 models to MLTrail
+(`adme_<ep>`). H236 cache in `output/features/`; `--resume` skips done endpoints. **Final temporal r²
+(augmented, best datasets):** caco2 0.856 · mdck 0.321 · ppb 0.316 · logd 0.309 · mlm 0.221 · rlm 0.057 ·
+sol 0.048 · hlm 0.002. **CV r² (robust):** logd 0.81 · sol 0.73 · mlm/rlm ~0.55/0.32 · caco2 0.55 · etc.
+
+**Augmented-source policy (config `RF_SINGLETASK.augmented_sources`, config-vetted per endpoint):**
+solubility=EXP · logd=EXP+NVS+ADM · hlm=EXP+NVS · mlm=NVS · rlm=EXP+NVS · caco2=EXP+NVS+ADM ·
+**mdck=NVS · ppb=EXP+NVS**. Decided by:
+- **ADMETlab (ADM) is PER-ENDPOINT, not uniformly bad** (2026-07-18 ablation, augmented-temporal): drop ADM
+  → mdck **0.163→0.321**, ppb **0.149→0.316** (ADM HURTS); but ADM HELPS logd (0.31, −0.07 if dropped) and
+  caco2 (0.86, −0.11 if dropped) → kept. solubility already EXP-only (ADMETlab predicted poisons it).
+
+**`run_Chemprop_SystematicGroups.py`** (env `chemprop`, GPU) — multitask counterpart, **augmented+temporal
+only** (no CV/internal — too small for a DNN). 3 groupings {sol,logd},{hlm,mlm,rlm},all-8 (autoresearch
+best), each scored on the **same RF local-temporal tests** (leakage-safe: hold out the UNION of members'
+tests, score each endpoint on its own newest-30%). Reads the SAME config-vetted augmented sources + the
+HPO's `best_config.json` hyperparams at run time. Saves model dirs → `output/chemprop_models/<grp>/`;
+**MLTrail deferred** (v1 can't predict chemprop — `backends.py` stub). Guarded launcher
+`run_chemprop_groups.sh` waits for the HPO to fully exit, then runs on the finalized datasets.
+
+**FINAL head-to-head (2026-07-19, DONE), same local-temporal tests, in-house Pearson r²** — RF internal-only
+· RF augmented · Chemprop(best grouping) → deploy:
+
+| endpoint | n | RF internal | RF augmented | Chemprop (best grp) | deploy → r² |
+|---|---|---|---|---|---|
+| solubility | 36 | 0.011 | 0.048 | **0.484** (all8) | Chemprop-all8 → 0.484 |
+| logd | 96 | 0.141 | **0.309** | 0.288 (all8) | RF-aug → 0.309 (~tie) |
+| hlm | 98 | 0.015 | 0.002 | **0.217** (clearance) | Chemprop-clearance → 0.217 |
+| mlm | 98 | 0.023 | 0.221 | **0.323** (clearance) | Chemprop-clearance → 0.323 |
+| rlm | 12 | 0.068 | 0.057 | **0.148** (clearance) | Chemprop-clearance → 0.148 |
+| caco2 | 29 | **0.879** | 0.856 | 0.608 (all8) | RF-internal → 0.879 |
+| mdck | 33 | 0.352 | 0.321 | **0.444** (all8) | Chemprop-all8 → 0.444 |
+| ppb | 21 | 0.118 | **0.316** | 0.066 (all8) | RF-aug → 0.316 |
+
+**Chemprop wins 5 (sol, hlm, mlm, rlm, mdck), RF wins 3 (logd, caco2, ppb).** Multitask sharing rescues
+the fragile endpoints RF couldn't touch (sol 0.05→0.48, hlm 0.00→0.22 — biggest wins of the project).
+caco2 is the only endpoint where augmentation doesn't help temporally (RF internal 0.879 > aug 0.856).
+**Grouping matters:** hlm/mlm/rlm want the 3-task *clearance* block (collapse to ~0 in all8); sol/logd/mdck
+want *all8*; the 2-task *sol_logd* grouping is worst for both its members (don't ship). **Deploy stack:**
+clearance→chemprop-clearance · sol/logd/mdck→chemprop-all8 · caco2/ppb→single-task RF.
+
+**Chemprop CV (2026-07-19, RUNNING)** — added a `--cv` path to `run_Chemprop_SystematicGroups.py`
+(multitask analog of RF `eval_cv`): one shared **compound-level** K-fold split per grouping (a compound's
+graph can't split train/test), **public always in train**, pooled out-of-fold predictions per endpoint →
+`pred_<grp>_cv.parquet` + `summary_chemprop_cv.csv`, CV r² directly comparable to RF `internal_cv`/
+`augmented_cv`. Running the 2 winning groupings via `run_chemprop_cv.sh` (detached): **clearance first
+(~10h), then all8 (~20h)**; 5 folds each, same tuned HPO hyperparams + 50 epochs as the temporal run. Fold
+models are throwaway (`persist=False`); the deploy artifacts remain the temporal `output/chemprop_models/`.
+
+**Chemprop MLTrail deployment (2026-07-19) — NO LONGER DEFERRED.** MLTrail now predicts chemprop natively
+(backend built + tested in the MLTrail repo — shells out to a chemprop CLI, works cross-env; see MLTrail
+wiki 2026-07-19). Register the saved grouping models with `run_Chemprop_SystematicGroups.py --register`
+(framework=chemprop, model_type=multitask_regression, target_columns=endpoints; idempotent `adme_mt_<grp>`;
+runs a public-SMILES deploy sanity). Predict via `registry.predict(id, df, smiles_column=...)` → one column
+per endpoint (modelling space, same as RF — no inverse transform). Smoke-verified end-to-end on the real
+clearance model (hlm/mlm/rlm) from the `ML` env, CPU, ~6.5s. Not yet registered into the production vault
+(awaiting go-ahead + which groupings).
+
+**Metric panel sweep (2026-07-20) — temporal Pearson-r² was masking miscalibration.**
+`python/compute_metrics_sweep.py` computes Pearson-r² + **R²_det (coeff of determination)** + RMSE + MAE +
+Spearman + `calib_gap`(=Pearson-r²−R²_det) over all 63 saved pred_dfs → `output/predictions_runs/metrics_all.csv`.
+Findings (settled):
+- **CV is calibrated, temporal is NOT.** Every CV arm has calib_gap≈0 (R²_det≈Pearson-r²: e.g. logd
+  internal_cv 0.809/0.801, sol 0.703/0.702). Temporal arms have hugely NEGATIVE R²_det (worse than the
+  mean) — caco2 aug_temporal Pearson 0.856 but **R²_det −0.56, RMSE 0.725**; rlm temporal R²_det −120 (n=12).
+  The small-n temporal Pearson-r² is correlation on a handful of points with terrible calibration → **trust
+  CV for selection, not temporal.**
+- **caco2 ADM decision FLIPS.** With-ADM aug_temporal is miscalibrated (R²_det −0.56, RMSE 0.725); **no-ADM
+  is genuinely good (R²_det +0.607, RMSE 0.364, ≈ its CV 0.400/0.733).** The 0.856 Pearson was bias masked
+  as correlation. → **caco2 should DROP ADM** (join mdck/ppb). logd holds up WITH ADM on every metric — keep.
+- **Public-only is rank-good, calibration-poor:** transfers in Spearman (0.65–0.76) but negative R²_det
+  (hlm clearance_publiconly −0.63 at Pearson 0.386) — absolute predictions on our compounds still need internal.
+- Convention going forward: report R²_det + RMSE alongside in-house Pearson-r²; a large calib_gap = the
+  "correlated but biased/flattened" failure.
+
+**Public-only → internal experiment (2026-07-19, BUILT — run after CV).** External-validation /
+domain-transfer baseline: train each endpoint's **winning** model on **public data ONLY** (zero internal
+compounds in train) and predict **ALL** internal compounds. Isolates pure public→internal transfer (the
+floor internal data lifts us above; every other run keeps internal in train). Arms mirror the deploy split:
+- RF: `run_RF_SingleTask_systematic.py --public-only [--endpoints ...]` → `eval_public_only` (train=public
+  ids, test=all internal via `K_fold_by_defined_IDs`) → `summary_public_only.csv` + `pred_public_only.parquet`.
+- Chemprop: `run_Chemprop_SystematicGroups.py --public-only --groupings clearance all8` → `build_public_only`
+  (all internal→test, public→train+10% val; verified 0 internal leakage) → `summary_chemprop_publiconly.csv`.
+- Combine: `combine_public_to_internal.py` picks the winner per endpoint (config `PUBLIC_TO_INTERNAL.winners`)
+  → `summary_public_to_internal.csv` (publiconly_r2 vs deploy_temporal_r2 = the transfer gap).
+Launcher `run_public_to_internal.sh` waits for CV, runs both arms + combine. **Winners map = current
+temporal head-to-head; REFRESH from CV before trusting the combined table.** Same tuned HPO hp + 50 epochs.
+
+**RESULTS (2026-07-20, public→internal r², winner per endpoint, test = ALL internal):** logd 0.708 (RF) ·
+caco2 0.536 (RF) · mlm 0.494 · hlm 0.386 · rlm 0.368 (clearance) · mdck 0.199 · solubility 0.181 (all8) ·
+ppb 0.006 (RF). **Two tiers:** (a) public data alone already transfers well — logd + the clearance panel
+(hlm/mlm/rlm) + caco2 (r² 0.37–0.71 with ZERO internal compounds); (b) genuinely need internal — ppb
+(0.006, public useless), solubility (0.18), mdck (0.20). **CAVEAT:** public-only is scored on ALL internal
+(n=317/324/…), the temporal deploy number on the newest-30% (n=96/98/…) — different/harder test, so
+public-only ">" temporal for logd/clearance is largely a test-set artifact, NOT evidence internal hurts.
+Clean with-internal reference = CV (also pooled over internal); recompute the gap vs CV when CV lands.
+
+**Chemprop HPO** — `chemprop_hpopt.py` + `run_hpopt.sh`: Optuna TPE (offline, no ray/telemetry), stopped
+early at trial 29/40 (plateaued 2026-07-19). **Best = trial 21, val_loss 0.36 vs stock-default 0.45 (−20%).**
+Tuned config is much larger + regularized vs the autoresearch stock defaults: depth 6 (vs 3), message-hidden
+1800 (vs 300), ffn 2×1200 (vs 1×300), dropout 0.15 (vs 0.0), batch 256 (vs 64), sum aggregation (vs norm).
+`best_config.json` feeds the grouping run. `torch==2.13.0+cu126` for the A6000 GPU.
+
 ## Multitask ADME regression (2026-07-07, `autoresearch/predict_adme/`)
 
 Extension of the solubility exercise to the full in-house ADME panel as **regression**. Goal:
