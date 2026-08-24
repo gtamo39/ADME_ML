@@ -31,6 +31,27 @@ gene names, gene-sets, metrics — **never** SMILES / compound IDs / per-compoun
 
 ---
 
+## Language — reply in Simplified Technical English (ASD-STE100)
+
+**Write every reply in ASD-STE100 Simplified Technical English.** This applies to chat replies, to
+documentation, to code comments, and to commit messages.
+
+Obey these rules:
+
+- Use approved words only. Use one word for one meaning, and one meaning for one word.
+- Use the active voice. Do not use the passive voice.
+- Use simple tenses only: simple present, simple past, and simple future.
+- Write 20 words or less in a procedural sentence. Write 25 words or less in a descriptive sentence.
+- Give one instruction in one sentence.
+- Do not use idioms, slang, or jargon.
+- Do not make a noun cluster of more than three words.
+- Use a vertical list for a complex action.
+- Write a WARNING before a step that can injure a person.
+- Write a CAUTION before a step that can cause damage or data loss.
+- Keep technical names and technical verbs. STE permits them.
+
+---
+
 ## Development Workflow
 
 ### 1. Prototype in Jupyter, then move to Python
@@ -131,8 +152,10 @@ If a tool would meaningfully accelerate the work but only runs as a hosted API, 
 
 - **Read before writing** — always read a file before editing it
 - **Check for existing patterns** — match the style already in the codebase
+- **Never re-import** — before adding an import in a notebook cell or script, check the imports already available above (the notebook's import cell / module header); never duplicate one that is already in scope
 - **Write simplified code** — the fewest clear statements: inline single-use intermediates, derive lists directly, collapse verbose literals; no redundant variables or steps. Prefer a vectorized/built-in expression over a hand-rolled helper function when equally clear (e.g. `.str.extract(...).astype(float)` over a custom `apply` function). Simplify before reporting done — readability first (simple ≠ cryptic one-liner).
 - **Keep comments to 1 line** — 2 lines max, and only if really necessary. Applies to inline/block comments (incl. notebook cell-top `##` comments); docstrings are exempt.
+- **Comment every step** — put one short `#` line above each logical step in a cell or function (what the step does), even when the code looks explicit; keep it to a single line.
 - **Encapsulate state properly** — use classes or function parameters instead of global variables
 - **Update docs when changing code** — keep documentation in sync
 - **Break complex tasks into a todo list** — write out the steps, get approval, then execute
@@ -151,6 +174,11 @@ If a tool would meaningfully accelerate the work but only runs as a hosted API, 
 - Don't write documentation files unless explicitly requested
 - Don't add error handling, fallbacks, or abstractions for hypothetical future requirements
 - **Don't delete any files or directories without explicit permission** — even if they seem unused or large (like virtualenvs, cache directories, or data files), always ask first before removing them
+- **Don't change or remove anything outside this repository without explicit permission** — this
+  covers system paths (`/etc`, `/usr`, `/opt`, `/lib`), system configuration, shared volumes, and
+  other users' files. Investigate freely, but do not write. Propose the exact command and let the
+  user run it. On a shared machine, assume another person or program depends on any file you did
+  not create.
 
 ---
 

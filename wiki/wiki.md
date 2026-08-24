@@ -4,12 +4,216 @@ Durable aggregate memory for this repo. Survives context compaction. Aggregate-o
 
 ---
 
+## Solubility cleaning sweep — thermo-only augmentation wins (2026-07-20, `python/solubility_cleaning_sweep.py`)
+
+9 cleaning strategies for the public solubility augmentation, single-task RF, internal test FIXED
+(cleaning touches public train only). Ranked by **R²_det** (coeff. of determination — calibration-sensitive;
+squared-Pearson r² is affine-invariant and was masking everything). Verified leakage-free by a workflow
+(0 internal↔public InChIKey twins, id-disjoint, NaN-free; asserts added). Output: `output/predictions_runs_solsweep/`.
+**CV (calibrated) result:** thermo-only family beats all full-public strategies despite 6× fewer rows (18k vs 105k):
+S7_combo R²det 0.727 / S9_thermo_pruned 0.720 / S2_thermo 0.711 vs contaminated baseline S0 0.652 (+0.075), RMSE_log 0.623 vs 0.703.
+Thermo fixes calibration: bias ≈0 (vs −0.05..−0.08 full-public) and R²det_RAW +0.52..0.54 (vs ≈0). **Matching assay
+type (internal is thermodynamic; 82.5% of public was kinetic) beats data volume** — the dominant lever. Physical-clip /
+IQR / dedup alone barely move CV (kinetic majority remains); dedup slightly hurts (blends thermo+kinetic twins).
+**pearson_r² is FLAT ~0.73 across all 9** → confirms selection must use R²_det, not Pearson. **Winner: S2 (plain thermo) promoted** (S9/S7 within noise; S2 has best raw calibration + ~0 bias, simplest).
+Caveat: TEMPORAL arm is negative R²_det for all 9 (newest-30% is tiny + 55% floor-censored → no model beats the mean there);
+CV is the decision basis.
+**PROMOTED to pipeline (2026-07-21):** `SOL_PUBLIC_TYPES: [thermodynamic_experimental]` + `SOL_MAX_LOG10_UM: 6.0` clip +
+`SOL_DROP_ORIGINS: []` knob (=[PHYS,AQUA] reproduces S9) in config; `build_solubility_features.py` applies clip+blocklist.
+Rebuilt `public_solubility.parquet` 106k→**17,877 thermo-clean** rows (DS preserved; contaminated backup at
+`public_solubility.contaminated_bak.parquet`). `run_RF` now pulls 17,877 public. **NOT yet redeployed** (MLTrail re-register)
+nor chemprop-rerun on clean data — those are the follow-ups. NOTE: `run_RF`'s summary reports Pearson r² (blind to the
+gain); the calibration lift shows only in the sweep's R²_det.
+
+## ADME cleaning sweep — thermo-only approach generalized to the other 6 endpoints (2026-07-21, `python/adme_cleaning_sweep.py`)
+
+Same design as the solubility sweep, for logd/hlm/mlm/rlm/mdck/ppb (caco2 excluded; solubility done). Public comes as
+3 source classes per endpoint: **EXP** (experimental — TDC/Biogen), **NVS** (Novartis-NIBR predicted), **ADM** (ADMETlab
+predicted). Cleaning touches public only; internal test FIXED; RF single-task temporal+CV; ranked by R²_det. Config knobs
+under `ADME_CLEAN_SWEEP` (predicted_cap 40k for tractability, per-endpoint phys ranges, winsor/iqr). Strategies S0_all_raw /
+S1_all_phys / S2_exp_only / S3_drop_adm / S4_best_combo / S5_internal_only (degenerate ones auto-aliased per endpoint).
+
+**Source audit (modelling-space medians; `output/predictions_runs_admesweep/adme_source_audit.csv`)** — the dominant
+lever is again assay/source matching, not value-clipping (physical clip triggers on only 5 rows total; **0 InChIKey leakage**
+anywhere):
+| ep | internal | EXP | NVS | ADM | note |
+|----|---------|-----|-----|-----|------|
+| logd | 3.10 | 2.36 | 2.84 | 3.26 | well-aligned (identity) — augmentation should help |
+| hlm | 1.29 | **1.32** | 2.01 | – | EXP matches internal; NVS biased +0.7 |
+| mlm | 1.40 | – | 2.34 | – | no experimental; NVS biased +0.94 |
+| rlm | 1.07 | 2.06 | 2.39 | – | only **39 internal**; both sources biased +1.0–1.3 |
+| mdck | −0.62 | – | 1.31 | 1.01 | no experimental; both predicted biased +1.6–1.9 (wrong assay variant) |
+| ppb | −1.95 | −1.30 | −1.40 | −1.15 | our bRo5 bind more; all public shifted ~+0.6 |
+
+Predicted public (NVS/ADM) carries a systematic upward bias vs our bRo5 internal (higher clearance-stable / lower Papp /
+higher binding); experimental (esp. hlm) is far better calibrated. Hypotheses: mdck & mlm (predicted-only, badly shifted)
+may prefer **internal-only** on R²_det (challenges current `mdck:[NVS]` deploy); hlm should prefer EXP; logd benefits from
+augmentation. **DONE (2026-07-21)** → `output/predictions_runs_admesweep/adme_cleaning_sweep.csv`. Best strategy per endpoint, CV
+R²_det (prev unswept = deployed all-source augmented):
+| ep | prev R²det | swept R²det | winner → policy |
+|----|-----------|-------------|-----------------|
+| logd | 0.766 | 0.801 | internal-only (drop all public) |
+| hlm  | 0.380 | 0.538 | internal-only (drop EXP+NVS) |
+| mlm  | 0.455 | 0.610 | internal-only (drop NVS; no EXP exists) |
+| rlm  | −0.149 | 0.234 | **experimental-only** (Biogen; drop NVS) |
+| mdck | 0.088 | 0.479 | internal-only (drop NVS; both predicted shifted) |
+| ppb  | 0.385 | 0.481 | **experimental-only** (drop NVS+ADM) |
+(solubility handled by SOL_* thermo switch: 0.652→0.711.) **Every endpoint improved.** Verdict: **predicted public
+(NVS/ADM) hurts every endpoint** (calibration-blind Pearson r² hid it — e.g. rlm prev Pearson 0.324 masked R²det −0.149);
+augmentation only earns its keep with matched experimental (rlm's 39-cmpd internal, ppb) or assay-matched (solubility thermo).
+The public-only→internal transfer arm confirms public alone transfers worse than internal everywhere (e.g. logd 0.59 vs
+internal-CV 0.80). caco2 added later (CV: 0.262→**0.733** internal-only; predicted sources hurt it too). CV winners: solubility/rlm/ppb→[EXP],
+logd/hlm/mlm/mdck/caco2→internal-only.
+
+## Temporal validation + CV↔temporal reconciliation (2026-07-21, `python/temporal_eval.py`)
+
+The single-cut newest-30% split is degenerate (newest-block variance collapses → R²det explodes). Replaced with **rolling-origin
+(expanding-window) CV, disjoint next-block tests, predictions pooled over the newest 50%** — each compound scored once by a
+past-only model; headline = **RMSE + bias (+ bootstrap CI)** since R²det stays degenerate on small/censored blocks. Arms per
+endpoint: `previous_deployed` (config policy) vs `internal_only` vs `experimental`([EXP])/`predicted`. Also a fraction-sensitivity
+curve and applicability-domain columns per pred_df. Global-vs-per-endpoint cut: chose per-endpoint percentiles (balanced blocks);
+SRB id = registration-order proxy.
+
+**Reconciled per-endpoint policy (CV winner vs temporal winner):** 6/8 agree.
+| ep | CV R²det (prev→new) | temporal winner (RMSE) | reconciled |
+|----|--------------------|------------------------|-----------|
+| solubility | 0.652→0.711 | EXP-thermo 0.599 | **[EXP] thermo** ✓ |
+| logd | 0.766→0.801 | all-source 0.778 (R²det 0.596, best temporal) | internal-only *(CONFLICT, low-conf; augment defensible)* |
+| hlm | 0.380→0.538 | **EXP 0.528** (vs internal 0.643) | **[EXP]** *(FLIP: CV said internal-only)* |
+| mlm | 0.455→0.610 | internal 0.605 | internal-only ✓ |
+| rlm | −0.149→0.234 | EXP 0.608 (4/5 folds) | **[EXP]** ✓ |
+| caco2 | 0.262→0.733 | internal 0.478 (R²det +0.55) | internal-only ✓ |
+| mdck | 0.088→0.479 | internal 0.507 (R²det +0.20) | internal-only ✓ |
+| ppb | 0.385→0.481 | EXP 0.428 | **[EXP]** ✓ |
+**Two conflicts:** hlm flips to EXP (temporal is deployment-realistic; experimental clearly best out-of-time); logd ambiguous
+(CV internal-only, temporal mild-augment — user's call). **Per-fold robustness is weak** (pooled winner wins only 2–4/5 folds;
+only rlm 4/5 robust; logd/mlm/ppb 2/5 = toss-ups) → winners are directional. **Proposed `augmented_sources` (NOT yet wired,
+awaiting confirmation esp. logd):** solubility/rlm/ppb/hlm → [EXP]; logd/mlm/caco2/mdck → []. Net: drop predicted NVS/ADM everywhere.
+
+**Applicability domain — NN-distance predicts error (2026-07-21).** Per-compound `nn_tanimoto_dist` (1−max ECFP4 Tanimoto to
+train) and `scaffold_novel` added to every temporal pred_df. Pooled over 652 newest-compound predictions (error standardized
+per endpoint): **Spearman(NN-dist, |err|)=+0.34**, and mean standardized |err| rises monotonically 0.65 (dist≤0.3) → 1.31
+(dist>0.7) — error ~doubles. **Novel scaffold |err| 0.89 vs known 0.51** (~75% worse). All 8 endpoints positive (strongest
+mlm/solubility/logd; ppb flat, n=35). Explains the weak temporal metrics (newest blocks are 45–70% novel scaffolds) and gives a
+deployable confidence gate: predictions within ~0.3 Tanimoto of train are ~2× more trustworthy than beyond 0.7.
+
+## Temporal fraction-split RF-vs-Chemprop experiment (2026-07-21, `python/temporal_fractions_{rf,chemprop}.py`)
+
+Overnight run to compare **RF single-task vs Chemprop multitask vs internal-only** on realistic temporal holdouts,
+config `TEMPORAL_FRACTIONS`. Single-cut split per endpoint (train oldest 1−f, **test newest f**, by SRB id);
+started with **f=0.3 (70/30)** only (full 3-way 0.4/0.3/0.2 deferred — the uncapped 273K NVS makes RF fits slow).
+Chosen so we can pick a cut with real test spread (report `test_std`; e.g. caco2 newest-20% has std≈0 → R²det degenerate).
+
+- **Arms** (config): RF `internal` + RF `augmented`; Chemprop `augmented` only for **sol,mdck (all8)** and **hlm,mlm,rlm (clearance)** — NOT logd/caco2/ppb. hlm & rlm run **both** EXP and EXP+NVS; mlm only NVS (no experimental MLM data). NVS is used by 6 endpoints (logd,hlm,mlm,rlm,mdck,ppb); solubility & caco2 use EXP only.
+- **FULL public, NO cap** (the sweep's 40K cap was tractability-only; size experiment showed full ~2× temporal — see above). NVS=273,638, ADM=63,136.
+- **Holdout = "virtual enumerated":** the target's newest-f internal compounds are removed from training ENTIRELY (all tasks); public rows whose InChIKey matches a test compound are dropped. Chemprop runs **per target endpoint** (only that endpoint's test held out) so its per-endpoint train matches RF single-task; multitask aux tasks stay internal-only.
+- **Wide multitask:** predicted sources (NVS/ADM) keep ALL their covered-endpoint columns (real cross-task transfer); experimental (EXP) is single-endpoint. RF single-task uses target column only.
+- **Custom Novartis-column cluster arms** (`python/build_novartis_clusters.py` → `tf_novartis_<name>.parquet`): internal target + specific Novartis pred columns as auxiliary tasks. **mdck_perm** = mdck + [LE-MDCKv2/v1 LogPapp, Caco-2 LogPapp, MDCK-MDR1 LogER, logPAMPA]; **ppb_fu** = ppb + [LogFu Rat/Human/Mouse/Dog/Monkey, HPLC LogFu HSA, LogFubrain, LogFumic, Direct NIBR LogP/LogD7.4]. (ppb has no grouping arm — cluster only.)
+- **Chemprop arms vs RF:** LMs drop the EXP-only chemprop arm (RF keeps both); chemprop hlm/rlm = EXP+NVS, mlm = NVS. Config `endpoints[*].cp_arms` / `cp_clusters` separate from RF `augmented`.
+- **Fast model (config `chemprop_hp`/`chemprop_epochs`):** hand-picked config {depth 3, msg-hidden 300, ffn 2×300, dropout 0.1464, agg sum}, 30 epochs, **ensemble=1**. (2026-07-22: tried HPO trial 0 [depth3/hidden300/ffn3×1200/dropout0.0727/agg norm] but it lost to hand-picked on these small temporal blocks — worse RMSE+R²det on 9/12 arms — so reverted. Beefy best remains trial 21 depth6/hidden1800 if accuracy>compute.)
+- **Descriptors precomputed ONCE:** `tf_ds_cache.parquet` (440,061 smiles × 200 `DS_` RDKit2DNormalized) reused from the built parquets + internal; fed via chemprop `--descriptors-columns` (verified byte-identical to on-the-fly `v1_rdkit_2d_normalized`), so no per-run descriptastorus recompute of the 273K public rows.
+- **Output:** `output/predictions_runs_temporal_fractions/<ep>/f30/{rf_internal,rf_<srcs>,cp_<srcs>,cp_<cluster>}.parquet` — pred_dfs (compound/real_y/pred_y MODELLING space + nn_tanimoto_dist/scaffold_novel vs INTERNAL train), loadable by `endpoint_metrics_table`.
+
+## Per-endpoint summary-metrics tables in the notebook (2026-07-21, `vignettes/Summary_results.ipynb` cell "## Summary metrics")
+
+`endpoint_metrics_table(pred_dict, endpoint)` (defined in the solubility summary cell, reused by all 8 sections) renders one
+HTML row per prediction arm: `source` (provider), regression (R²det, R²pears-squared, RMSE, N), `n_train`, and the full
+classification set (Accuracy/PPV/NPV/F1±/MCC) at `CUTOFFS[endpoint]` with the endpoint's convention sign. **Best per column =
+bold cyan, worst = orange, scored WITHIN each block separately** (so the best temporal arm is visible even though temporal
+values run lower than CV); CV arms sorted above a double rule, temporal arms below, each block sorted by R²det desc. The table
+is emitted from the (merged) load cell — `<ep>_summary = endpoint_metrics_table(pred_<ep>, '<ep>')` appended after the loader. Exact
+duplicate metric rows collapse into one label (e.g. `internal_cv = cv_internal (winner)`); the `cv_winner` alias is folded in and
+marked. `n_train` + `source` come from **`python/adme_train_counts.py`** → `output/train_counts.csv` (counts only, no fits):
+n_train = internal + cleaned-public pool (CV: all internal + per-strategy n_public matching the sweep logs; temporal: oldest-90%
+window + pooled public capped at 40000, as temporal_eval does). Providers (aggregate origins): logd=AstraZeneca, hlm/ppb=Biogen+AZ,
+rlm=Biogen, caco2=Wang(TDC), solubility=PharmaBench/ChEMBL/Biogen(+); NVS=Novartis-NIBR, ADM=ADMETlab (both predicted).
+
+## Data-quality audit — public value distributions vs internal (2026-07-20)
+
+Prompted by a raw-units RF run giving RMSE ~317,000 µM for solubility. Audited every source's value
+distribution per endpoint (aggregate percentiles only). Findings:
+- **solubility EXP is contaminated**: log10 max 8.63 → 4.26e8 µM = **426 mol/L** (impossible; water ~55 mol/L).
+  **777 rows (0.73%) > 1 mol/L**, 98 > 10 mol/L. Sits 4+ log-units past internal max (4.25) → contaminates even
+  the log model; blows up raw training. Likely a `harmonize_sol.py` µg/mL→µM unit bug (bad/missing MW) on a subset.
+- **internal solubility is 55% floor-censored** at log10 0.19 (≈1.56 µM, detection limit) → solubility R²/RMSE inherently limited.
+- **predicted-source (Novartis) tail outliers, physically implausible**: rlm max 76,600 µL/min/mg (p99.9 1,630),
+  caco2 max 9,290 ×1e-6 cm/s (p99.9 153, realistic Papp ≲200), mdck max 880. Clip pseudo-labels before augmenting.
+- **distribution shifts (not unit bugs)**: mdck NVS median 20.6 vs internal 0.24 (~85× higher; mdck augments NVS-only);
+  ppb internal tightly bound (raw 1–19% unbound, median 1.1%) vs public spanning 0–100% → explains ppb transfer R²≈0.
+- **clean**: logd (identity, all sources consistent), hlm, mlm.
+Recommended (NOT yet applied): drop/clip solubility EXP >~log10 6 + fix harmonizer; clip NVS pseudo-labels to physical
+ranges (CLint ≲5000, Papp ≲200); reconsider mdck NVS-only; flag solubility censoring. Applies to the MAIN analysis, not just raw.
+Takeaway: modelling in raw units surfaced contamination that log space was masking (see the modelling-space metrics section below).
+
 ## Current objective
 
 Train a public-data ML model to predict **thermodynamic solubility** of in-house compounds (PROTACs / molecular glues, bRo5).
 - **In-house target:** `data/20260625_thermoSol.csv` — thermodynamic solubility in μM, range ~1.5 → 21,000 μM (4+ orders of magnitude → model in log space). Censored `< X` values parsed to float in `vignettes/Main.ipynb`.
 - **Feature/compound reference:** `data/protacdb2.0_zinc_chembl_dataset.csv` (ProtacDB 2.0 + ZINC + ChEMBL, with predicted ADME columns — clearance, LogFu, LogP/D, permeability, CYP; **no solubility column**).
 - **Strategy (2026-06-25):** pretrain on curated thermodynamic small-molecule sets → fine-tune on in-house μM data. Multi-task option using Biogen-Fang ADME endpoints.
+
+## Sharing slides / files with the laptop (reverse SSH tunnel) — 2026-07-20
+
+The cluster (`dl`, 192.168.146.108) has **no mount** to the user's Windows Desktop; VS Code Remote-SSH
+is just a terminal channel. File transfer to the laptop rides a **reverse SSH tunnel** (same mechanism
+MS_ML documents for Dropbox-over-SSH).
+
+- **Laptop is WSL2 behind Windows NAT.** The user opens the tunnel from a **WSL terminal** (VS Code's
+  *Windows* ssh client won't reach WSL's sshd, so a dedicated side-session is required; keep it open):
+  `ssh -R 2222:localhost:22 -N gtamo@192.168.146.108`
+- **Then from the cluster**, `localhost:2222` reaches back to the laptop (key-auth, BatchMode works):
+  `scp -P 2222 -o BatchMode=yes -o StrictHostKeyChecking=accept-new <file> gtamo@localhost:/mnt/c/Users/gtamo/Desktop/GT/Claude_ppt/`
+  WSL `/mnt/c` = Windows `C:`, so this lands in `C:\Users\gtamo\Desktop\GT\Claude_ppt\` (default drop dir).
+  `mkdir -p` the dest first; verify with `ssh -p 2222 gtamo@localhost 'ls -la <dest>'`.
+- **If port 2222 refuses** → the tunnel isn't up; ask the user to (re)open the WSL side-session.
+- **Privacy:** only transfer aggregate/non-sensitive artifacts (slides of counts, metrics, source names —
+  never SMILES/structures/per-compound values). Slides are built to `output/ppt/`
+  (`python python/make_datasets_slide.py`, python-pptx in the `ML` env). Verified live 2026-07-20.
+
+## Unit tests for the systematic runners (`tests/`, 2026-07-20)
+
+`unittest` (stdlib — no pytest dep, mirrors MS_ML). Run in env `ML` from repo root:
+`python -m unittest discover -s tests` (**22 tests, ~57s**, 1 skipped). `tests/_adme_fixture.py` builds a
+~1K-compound **LOCAL subset** of the real cache into a temp dir (first-batch parquet slice, values never
+printed) and points each runner's module globals (`CACHE`/`FEATDIR`/`output_dir`) at it — no production
+output touched; temp dirs auto-cleaned.
+- **`test_rf_systematic.py`** (14): features load (4269), `internal_ep` labels; **no-leakage** for all 3
+  arms — temporal (train∩test=∅, test⊆newest-30%), CV (OOF = internal only, public never scored, each
+  internal cmpd predicted once), public-only (train/test compound-disjoint); **MLTrail** register→predict
+  (3/3 public SMILES non-null, records unit/features_type), predict invariant to row/col order + extra
+  columns, **idempotent re-registration** (same id, new version); **source policy** (config override
+  filtered to available; solubility excludes predicted ADM even when present — poisoning guard);
+  **modelling_unit** transform→label contract (identity/log10/logit_pct); **CV determinism** (same seed).
+- **`test_chemprop_systematic.py`** (8): chemprop temporal test == RF temporal test (bit-identical);
+  `build_combined`/`build_public_only`/CV-fold leakage; all-8 target columns present even for source-less
+  endpoints; split determinism; eval+scoring via a **mocked chemprop CLI** (perfect preds → r²≈1, OOF
+  parquet written) incl. the endpoint-named vs `pred_i` column branch; MLTrail chemprop register→predict
+  (mocked CLI, invalid SMILES→null). `TestRealTrain` (real 1-epoch CV) skipped unless `RUN_CHEMPROP=1`.
+Chemprop training is never run in the fast suite — all leakage logic lives in the pure split builders.
+
+## Metrics are computed in MODELLING space, not raw assay units — deliberate (2026-07-20)
+
+Targets are transformed from raw CDD values before modelling (`python/extract_adme.py::_transform`):
+**log10** for solubility/hlm/mlm/rlm/caco2/mdck, **logit** of fraction-unbound for ppb, **identity** for
+logd. So `internal_targets.parquet`, training, predictions and all reported R²/RMSE live in log/logit
+space. Checked whether recomputing R² in RAW units changes model selection (best model per endpoint,
+temporal): logd unchanged (identity, sanity ✓); clearance/ppb move ≤0.04; **caco2 +0.19 (→0.94), mdck
++0.17 (→0.61)** and the argmax flips for caco2 (RF int→aug) and mdck (CP all8→RF int). These flips are
+**leverage artifacts** — raw-space Pearson r² is dominated by a few high-Papp compounds (mdck's CP:all8
+has Spearman only 0.149 yet raw r²≈0.61). Spearman (rank-invariant) doesn't change. **Decision: keep
+selection + reported metrics in modelling space; back-transform ONLY the delivered predictions** to raw
+units for chemists (`vignettes` MLTrail-predict cell inverts per `ADME_ENDPOINTS[ep]['transform']`:
+log10→10**p, logit→100/(1+10**-p), identity→p).
+
+## ADME_build_ML.py — notebook↔module port (2026-08-20, in progress)
+
+`python/ADME_build_ML.py` mirrors `MS_build_ML.py`: `PARAMS`/`DATA`/`OUTPUT` scaffold, runs standalone
+(`--config`, `--overwrite`) AND callable from `vignettes/Multitask_adme_preds.ipynb` (`%autoreload 2`).
+Section 0 ported: `params = PARAMS(cfg).load_params()` (+ uppercase-key shim), `data = DATA();
+data.load_df_all(params)` -> `data.df_all` (326×102, cached `data/20260707_all_adme.csv`, overwrite re-pulls
+CDD). Notebook keeps bare-name shims (`df_all`, `dfs`, `MF_features`, `ML_data` = the `data.*` objects).
+Solubility analysis flow to port next: harmonize -> H237 features -> ML frame -> power-set transfer / CV /
+temporal (internal vs Biogen-Fang augmented; regression + 15µM classification, log & raw).
 
 ## Systematic deployment runs — vignette scripts (2026-07-18)
 

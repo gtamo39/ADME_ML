@@ -27,6 +27,9 @@ def main():
     cp_pub = _read(CP_DIR / 'summary_chemprop_publiconly.csv')
     rf_dep = _read(RF_DIR / 'summary.csv').set_index('endpoint') if (RF_DIR / 'summary.csv').exists() else pd.DataFrame()
     cp_dep = _read(CP_DIR / 'summary_chemprop.csv')
+    metrics = _read(RF_DIR / 'metrics_all.csv')                  # per-arm RMSE (public-only arms)
+    rmse_of = lambda src, ep, arm: (lambda s: float(s.iloc[0]) if len(s) else None)(
+        metrics.loc[(metrics.source == src) & (metrics.endpoint == ep) & (metrics.arm == arm), 'rmse'])
 
     rows = []
     for ep in ENDPOINTS:
@@ -37,14 +40,16 @@ def main():
             pub_r2 = pub['publiconly_r2'].iloc[0] if len(pub) else None
             pub_n = int(pub['publiconly_n'].iloc[0]) if len(pub) else 0
             dep_r2 = dep['r2'].iloc[0] if len(dep) else None
+            pub_rmse = rmse_of('chemprop', ep, f'{grp}_publiconly')
             label = f'chemprop:{grp}'
         else:
             pub_r2 = rf_pub.loc[ep, 'publiconly_r2'] if ep in rf_pub.index else None
             pub_n = int(rf_pub.loc[ep, 'publiconly_n']) if ep in rf_pub.index else 0
             dep_r2 = rf_dep.loc[ep, 'augmented_temporal_r2'] if ep in rf_dep.index else None
+            pub_rmse = rmse_of('RF', ep, 'public_only')
             label = 'RF'
-        rows.append({'endpoint': ep, 'winner': label, 'publiconly_r2': pub_r2, 'publiconly_n': pub_n,
-                     'deploy_temporal_r2': dep_r2,
+        rows.append({'endpoint': ep, 'winner': label, 'publiconly_r2': pub_r2, 'publiconly_rmse': pub_rmse,
+                     'publiconly_n': pub_n, 'deploy_temporal_r2': dep_r2,
                      'gap_from_internal': (None if pub_r2 is None or dep_r2 is None else round(float(dep_r2) - float(pub_r2), 3))})
 
     out = pd.DataFrame(rows)

@@ -155,13 +155,20 @@ class OUTPUT:
                           ('--dropout', 'dropout'), ('-b', 'batch_size'), ('--aggregation', 'aggregation')]:
             if key in hp:
                 cmd += [flag, str(hp[key])]
-        print(f'  [{gname}] training chemprop ({len(endpoints)} tasks, {params.epochs}ep, hp={hp or "defaults"})...', flush=True)
+        featurizers = getattr(params, 'molecule_featurizers', None) or []      # descriptastorus extra descriptors
+        if featurizers:
+            cmd += ['--molecule-featurizers', *featurizers]
+        print(f'  [{gname}] training chemprop ({len(endpoints)} tasks, {params.epochs}ep, hp={hp or "defaults"}'
+              f'{", feat=" + "+".join(featurizers) if featurizers else ""})...', flush=True)
         cp._run_quiet(cmd, run / f'sysgrp_train_{gname}.log')
         ckpts = list(model_dir.rglob('best*.ckpt')) or list(model_dir.rglob('*.ckpt'))
         ckpt = max(ckpts, key=lambda p: p.stat().st_mtime)
         preds_path = run / f'sysgrp_preds_{gname}.csv'
-        cp._run_quiet([cp.CHEMPROP, 'predict', '-i', str(test_in), '-s', 'smiles',
-                       '--model-path', str(ckpt), '--preds-path', str(preds_path)], run / f'sysgrp_predict_{gname}.log')
+        pred_cmd = [cp.CHEMPROP, 'predict', '-i', str(test_in), '-s', 'smiles',
+                    '--model-path', str(ckpt), '--preds-path', str(preds_path)]
+        if featurizers:                                                        # must match train (v2 re-computes at predict)
+            pred_cmd += ['--molecule-featurizers', *featurizers]
+        cp._run_quiet(pred_cmd, run / f'sysgrp_predict_{gname}.log')
         # persist the full trained model dir (for later prediction/deployment) to output/chemprop_models/<gname>/
         if persist:
             saved = MODELS_DIR / gname; shutil.rmtree(saved, ignore_errors=True); saved.mkdir(parents=True, exist_ok=True)
