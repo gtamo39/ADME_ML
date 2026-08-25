@@ -1,0 +1,13 @@
+# ADME_ML prediction webapp (webapp/app.py) — LOCALHOST-ONLY drag-drop scorer.
+# The `ML` conda env already has the scientific stack (mltrail, rdkit, scikit-learn, pandas,
+# numpy, pyyaml). Only the web framework is missing — install these two into `ML` with pip
+# (pure-Python; they do NOT disturb the numpy/pandas/sklearn/rdkit stack):
+#
+#   conda run -n ML pip install -r webapp/requirements.txt
+#
+# Then run:  conda run -n ML python webapp/app.py   ->  http://127.0.0.1:8050
+#
+# Everything runs offline; the app binds 127.0.0.1 only (chemistry data must not leave the box).
+fastapi==0.139.0
+uvicorn==0.50.2
+python-multipart==0.0.32   # required by FastAPI to parse multipart file uploads (/api/predict)

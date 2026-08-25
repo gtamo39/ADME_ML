@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ADME property prediction</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Newsreader:wght@400;500&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#f4f1ea; --card:#fffdf7; --ink:#2b2723; --muted:#6f675c; --line:#e3ddd0;
+    --azure:#0ea5ce; --ember:#e65d32; --olive:#74b24a;
+    --display:"Fraunces",Georgia,serif; --body:"Newsreader",Georgia,serif;
+    --mono:"JetBrains Mono",ui-monospace,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0}
+  body{background:var(--paper);color:var(--ink);font-family:var(--body);font-size:17px;line-height:1.5;-webkit-font-smoothing:antialiased;padding:40px 24px}
+  .wrap{max-width:1400px;margin:0 auto}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;text-transform:uppercase;color:var(--ember);margin:0 0 10px}
+  h1{font-family:var(--display);font-weight:600;font-size:38px;line-height:1.05;letter-spacing:-.01em;margin:0 0 12px}
+  .lede{font-size:17px;color:var(--muted);margin:0 0 26px;max-width:70ch}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:26px;box-shadow:0 1px 0 rgba(0,0,0,.02),0 16px 40px -28px rgba(43,39,35,.35)}
+  .drop{border:2px dashed #e7d7cd;border-radius:12px;background:linear-gradient(180deg,#fffefb,#fffdf7);padding:36px 24px;text-align:center;cursor:pointer;transition:border-color .15s,background .15s,transform .05s}
+  .drop:hover{border-color:var(--ember)}
+  .drop.drag{border-color:var(--ember);background:#fbf2ec;transform:translateY(-1px)}
+  .drop .icon{font-family:var(--display);font-size:32px;color:var(--ember);display:block;margin-bottom:8px}
+  .drop strong{font-family:var(--display);font-weight:600}
+  .drop .hint{font-family:var(--mono);font-size:12px;color:var(--muted);margin-top:10px;letter-spacing:.04em}
+  input[type=file]{display:none}
+
+  .actions{display:flex;gap:12px;align-items:center;margin-top:18px;flex-wrap:wrap}
+  .btn{appearance:none;border:none;cursor:pointer;font-family:var(--mono);font-size:13px;letter-spacing:.04em;padding:10px 18px;border-radius:9px;background:var(--olive);color:#fff;transition:filter .15s}
+  .btn:hover{filter:brightness(1.06)} .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line)}
+  .btn[disabled]{background:#cdc7ba;cursor:default;filter:none}
+  .status{font-family:var(--mono);font-size:12px;color:var(--muted)}
+
+  .legend{display:flex;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--muted);margin:18px 0 6px}
+  .legend .sw{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:-1px;margin-right:5px}
+
+  .gridwrap{margin-top:14px;overflow-x:auto}
+  table.grid{border-collapse:collapse;font-family:var(--mono);font-size:12px;white-space:nowrap}
+  table.grid th{position:sticky;top:0;background:var(--card);text-align:left;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;padding:8px 10px;border-bottom:2px solid var(--line);vertical-align:bottom}
+  table.grid th .u{display:block;color:#a49b8d;font-size:9.5px;text-transform:none;letter-spacing:0;margin-top:2px}
+  table.grid td{border-bottom:1px solid var(--line);border-left:1px solid #efeadf;padding:0}
+  table.grid td.meta{padding:7px 10px;vertical-align:middle}
+  .struct{padding:4px 6px}
+  .struct svg{display:block}
+  .noparse{color:var(--ember);font-size:10.5px;padding:8px 10px}
+  .cid{color:var(--ink);font-weight:500;max-width:180px;white-space:normal;word-break:break-word}
+  input.score{font-family:var(--mono);font-size:12px;width:66px;border:1px solid var(--line);border-radius:6px;padding:5px 6px;background:#fffefb;color:var(--ink)}
+
+  /* diagonal-split endpoint cell: top-right = confidence, bottom-left = predicted value */
+  .epcell{position:relative;width:98px;height:58px}
+  .epcell .half{position:absolute;inset:0}
+  .epcell .conf{clip-path:polygon(0 0,100% 0,100% 100%)}   /* upper-right triangle */
+  .epcell .pred{clip-path:polygon(0 0,0 100%,100% 100%)}   /* lower-left triangle */
+  .epcell .divider{position:absolute;inset:0;pointer-events:none;background:linear-gradient(to bottom right,transparent calc(50% - .5px),rgba(43,39,35,.18) calc(50% - .5px),rgba(43,39,35,.18) calc(50% + .5px),transparent calc(50% + .5px))}
+  .epcell b{position:absolute;font-weight:600;color:#1f1b17}
+  .epcell .cv{top:3px;right:6px;font-weight:400;font-size:10px;color:#3a352f}
+  .epcell .pv{bottom:3px;left:6px;font-size:12px}
+  .epcell.empty{background:#f6f3ec}
+
+  footer{margin-top:26px;font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:.05em}
+  .note{margin-top:22px;font-size:14px;color:var(--muted);border-left:3px solid #e6e7d4;padding:2px 0 2px 14px}
+  .note b{color:var(--olive);font-weight:500}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <p class="eyebrow">ADME_ML · champion RF (H236) · local only</p>
+  <h1>ADME property prediction</h1>
+  <p class="lede">Drop an <b>SDF</b> or <b>CSV</b> of compounds with SMILES. Every compound is scored by the 8 champion single-task RF models in the MLTrail vault. Each endpoint cell is split on the diagonal: the <b>lower-left</b> shows the predicted value (colored by triage cutoff), the <b>upper-right</b> shows the RF confidence.</p>
+
+  <div class="card">
+    <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose or drop files">
+      <span class="icon">↑</span>
+      <strong>Drop SDF / CSV here</strong>
+      <div class="hint">or click to choose · a CSV needs a column with “smiles” in its name</div>
+    </div>
+    <input type="file" id="file" multiple accept=".sdf,.csv,.txt,.tsv">
+
+    <div class="actions">
+      <button class="btn" id="download" disabled>Download CSV</button>
+      <button class="btn ghost" id="clear">Clear</button>
+      <span class="status" id="status">idle</span>
+    </div>
+
+    <div class="legend" id="legend" style="display:none">
+      <span><span class="sw" style="background:#74b24a"></span>favorable</span>
+      <span><span class="sw" style="background:#c94c3c"></span>unfavorable</span>
+      <span><span class="sw" style="background:#0ea5ce"></span>confidence &gt; 0.5</span>
+      <span><span class="sw" style="background:#e65d32"></span>confidence ≤ 0.5</span>
+    </div>
+
+    <div class="gridwrap"><table class="grid" id="grid"></table></div>
+
+    <p class="note"><b>Private &amp; local.</b> Files are read on this machine and scored in-process; predictions render only in this local browser. Nothing is sent to any cloud or written into the repo.</p>
+  </div>
+
+  <footer id="foot">bind 127.0.0.1 · MLTrail vault</footer>
+</div>
+<script src="/static/app.js?v=2026-08-24"></script>
+</body>
+</html>

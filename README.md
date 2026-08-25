@@ -55,3 +55,36 @@ pip install xgboost==3.2.0 openTSNE==1.0.4 py3Dmol==2.5.3 meeko==0.7.1
 - **py3Dmol, meeko** — 3D viewer / docking prep; imported at the top but unused in the ADME
   modelling sections. If `pip` tries to touch rdkit/torch, add `--no-deps` for `meeko` (or drop
   those two and comment their imports — the modelling cells don't need them).
+
+### RAPIDS (GPU cuRF) env — optional, for large-row RF fits
+
+The single-task RandomForest fits can run on GPU via RAPIDS **cuML** (`cuRF`). It only pays off
+for **large-row** arms — e.g. the MDCK/Novartis augmented set (~336k rows). On small-row,
+high-feature arms (e.g. LogD, ~4k rows × 4,469 features) 32-core sklearn is faster. Enable it
+**per run** with `use_cuml=True` on `transfer()` / `predict_and_record()` in the notebook;
+sklearn stays the default (`make_model()` builds either from the same `champion` params).
+
+Caveats when `use_cuml=True`: no `uq_std` / `confidence` (cuML has no per-tree API, so those come
+back NaN), and results are not bit-identical to sklearn (float32 + `n_streams`). Keep sklearn as
+the reference champion.
+
+Create the env (RAPIDS core is conda-only; tested on CUDA 12.9 / RTX A6000):
+
+```bash
+# 1) RAPIDS core (resolves the newest cuML compatible with the CUDA 12.9 driver)
+conda create -n rapids -c rapidsai -c conda-forge -c nvidia \
+    cuml=26.08 python=3.12 'cuda-version>=12.0,<=12.9'
+
+# 2) extras the notebook's top import cell needs (absent from a fresh rapids env)
+conda install -n rapids -c conda-forge networkx requests adjusttext xgboost \
+    openTSNE pyyaml dill seaborn pyarrow ipykernel
+conda run -n rapids pip install nonconformist          # pip-only
+
+# 3) register the Jupyter kernel FROM the env so activation runs (cupy needs CUDA on the path)
+conda run -n rapids python -m ipykernel install --user --name rapids --display-name "Python (rapids)"
+```
+
+Pinned versions in `requirements_rapids.txt`. **Run the notebook on the "Python (rapids)"
+kernel** — pointing Jupyter directly at the env's bare `python` skips conda activation and cupy
+then fails with "Failed to find CUDA headers". (`pip` alternative for the core:
+`pip install --extra-index-url=https://pypi.nvidia.com cuml-cu12`.)

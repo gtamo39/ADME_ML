@@ -753,8 +753,43 @@ Predicted rows (PROTAC-PatentDB) kept in the same table, `type='thermodynamic_pr
   the public-data lift is directly measurable. Notebook cells `sol_eval_1a/1b/2a/2b` are the reference implementation.
   Caveat: no InChIKey leakage mask between public and internal (fine for bRo5 in-house vs small-molecule public).
 
+## Prediction webapp — LiveDesign-style drag-drop scorer (2026-08-24, `webapp/`, v1 built)
+
+Local-only FastAPI webapp in `ADME_ML/webapp/` (mirrors `../CDD_Vault_API/webapp` skeleton). Drag-drop an
+SDF or CSV of compounds + SMILES; it scores every compound with the **8 champion RF models (H236)** in the
+MLTrail vault (`/data2/MLTrail_vault`) and shows a LiveDesign-style grid.
+
+**Files:** `webapp/app.py` (FastAPI backend), `webapp/static/{index.html,app.js}` (drop zone + grid),
+`webapp/requirements.txt`. **Run:** `conda run -n ML python webapp/app.py` -> http://127.0.0.1:8050.
+The `ML` env has mltrail/rdkit/sklearn/pandas; only **fastapi+uvicorn** must be installed into `ML` first
+(`conda install -n ML -c conda-forge fastapi uvicorn`). Core predict path verified on public SMILES
+(2026-08-24): all 8 champions load, H236 = 4269 features, per-tree std -> confidence, inverse transforms sane.
+
+- **Model backend:** MLTrail. Champions = registry entries with `experiment_name` starting `adme_`,
+  `features_type='H236'`, `framework='sklearn'`, `model_type='single_task_regression'`.
+  `registry.predict(mid, df, smiles_column='smiles', compound_id='compound')` returns modelling-space
+  predictions; SDF/CSV both handled by MLTrail's `read_dataset` (H236 featurizer is RDKit-only, offline).
+- **Efficiency:** featurize H236 **once**, run all 8 models on the shared matrix (avoids 8× re-featurize).
+- **Predictions are in modelling space** → webapp inverse-transforms with `_TF` (ADME_build_ML.py) to raw units.
+- **Grid columns:** structure (RDKit SVG, server-side) · compound_id · score (user-defined, wired later) ·
+  one column per endpoint. **Each endpoint cell is diagonally split:** bottom triangle = predicted raw value
+  colored by cutoff (favorable/unfavorable); top triangle = RF confidence, diverging gradient centered at 0.5
+  (`SERAC_C.azure #0EA5CE` for >0.5, `SERAC_C.ember #E65D32` for ≤0.5).
+- **Confidence:** per-tree std across `rf.estimators_` → `ML_Reg.uq_std_to_confidence`. **sigma (v1) =
+  per-endpoint training-label std**, taken from the champion's archived training set
+  (`registry.load_training_set(mid)['label'].std()`, modelling space — consistent with the std units).
+- **CUTOFFS (raw units) + signs** (favorable when): solubility 10 (≥), logd 3 (<), caco2 10 (≥), mdck 10 (≥),
+  ppb 1 (<, % unbound), hlm/mlm/rlm 12 (<, µL/min/mg — WEAK: measurement-floor convention, no verified triage cutoff).
+- **Privacy:** binds `127.0.0.1` ONLY. Predictions/SMILES/ids render in the LOCAL browser (same as the CDD
+  app's `/api/summary`); nothing crosses to any cloud. Claude must never Read/echo the prediction outputs.
+- **REMINDER (next iteration):** replace the training-label-std sigma with **CV-RMSE-calibrated confidence** —
+  scale tree-variance by each champion's cross-validation RMSE so confidence reflects real predictive error,
+  comparable across endpoints. v1 std-based is a placeholder.
+
 ## Open / next
 
+- Prediction webapp: install fastapi+uvicorn into `ML`, then run + eyeball the grid on a real drop file.
+- Prediction webapp: move to CV-RMSE-calibrated confidence (see REMINDER above).
 - Write InChIKey-dedup loader to harmonize core sets to one logS table + report true unique count.
 - Convert PharmaBench log10 nM → logS (mol/L) for merge.
 - Decide intrinsic-S0 vs apparent-pH handling (pKa conversion vs model intrinsic).

@@ -185,5 +185,41 @@ NOVARTIS_PUBLIC:                  # pred column -> in-house modelling space (op 
   ppb:   {col: 'pred(LogFu-Human)',         op: logfu_to_logit}
 
 ## ML model training and deployment:
-MF_features_solubility_f: 'output/ML_checkpoints/solubility/20260819_MF_features.parquet'
-MF_features_logd_f: 'output/ML_checkpoints/logd/20260821_MF_features.parquet'
+MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
+
+# public EXP parquet(s) per endpoint (concatenated; value already in modelling space) for the generic
+# DATA._endpoint_dfs builder. solubility/logd/mdck keep their own bespoke get_*_data methods.
+ENDPOINT_PUBLIC_FILES:
+  hlm:   [public_hlm.parquet, public_novartis_hlm.parquet]
+  mlm:   [public_novartis_mlm.parquet]
+  rlm:   [public_rlm.parquet, public_novartis_rlm.parquet]
+  caco2: [public_caco2.parquet, public_novartis_caco2.parquet, public_admetlab_caco2.parquet]
+  ppb:   [public_ppb.parquet, public_novartis_ppb.parquet, public_admetlab_ppb.parquet]
+
+BEST_PUBLIC:
+  solubility: ['thermodynamic:ChEMBL','thermodynamic:AQUA','thermodynamic:PHYS']
+  logd:       ['TDC:Lipophilicity_AstraZeneca']
+  mdck:       ['Novartis-NIBR']
+  hlm:        ['Biogen:hlm_biogen','Novartis-NIBR']
+  mlm:        ['Novartis-NIBR']
+  rlm:        ['Biogen:rlm', 'Novartis-NIBR']
+  caco2:      ['Novartis-NIBR', 'ADMETlab-PROTAC']
+
+# ---- Prediction webapp (webapp/app.py) — LiveDesign-style drag-drop scorer, LOCALHOST ONLY ----
+# Scores dropped SDF/CSV compounds with the 8 champion RF (H236) models in the MLTrail vault.
+webapp:
+  host: '127.0.0.1'                # bind localhost only — chemistry data must not leave the box
+  port: 8050
+  endpoint_order: [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]   # column order in the grid
+  confidence_split: 0.5            # confidence > split -> azure, <= split -> ember (diverging gradient)
+  cutoffs:                         # raw-unit triage cutoff + the comparison that means FAVORABLE
+    solubility: {value: 10, favorable: '>='}   # uM
+    logd:       {value: 3,  favorable: '<'}     # logD7.4 sweet-spot upper bound
+    hlm:        {value: 12, favorable: '<'}     # uL/min/mg (WEAK: measurement-floor convention)
+    mlm:        {value: 12, favorable: '<'}     # uL/min/mg
+    rlm:        {value: 12, favorable: '<'}     # uL/min/mg
+    caco2:      {value: 10, favorable: '>='}    # 1e-6 cm/s
+    mdck:       {value: 10, favorable: '>='}    # 1e-6 cm/s
+    ppb:        {value: 1,  favorable: '<'}     # % unbound
+
+

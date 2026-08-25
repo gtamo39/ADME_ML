@@ -1,0 +1,39 @@
+# ADME_ML — RAPIDS GPU env `rapids` (python 3.12, CUDA 12.9, RTX A6000)
+# Enables cuML `cuRF` for the LARGE-ROW single-task fits (e.g. MDCK/Novartis ~336k rows), opted
+# into per run with use_cuml=True on transfer() / predict_and_record(). sklearn stays the default
+# (faster on small-row / high-feature arms, and the only backend that yields uq_std/confidence).
+# See README "RAPIDS (GPU cuRF) env" for the full recipe and caveats.
+#
+# The RAPIDS core is NOT pip-installable from PyPI — create the env with conda FIRST:
+#   conda create -n rapids -c rapidsai -c conda-forge -c nvidia \
+#       cuml=26.08 python=3.12 'cuda-version>=12.0,<=12.9'
+#   (pip alternative for the core: pip install --extra-index-url=https://pypi.nvidia.com cuml-cu12)
+# Then add the extras below with conda-forge (nonconformist via pip). All run offline after install.
+
+# --- RAPIDS core (conda; listed for reference, versions fixed by the conda solve) ---
+# cuml==26.08.00
+# cudf==26.08.00
+# cupy==14.2.0
+
+# --- base scientific stack (installed with / alongside RAPIDS) ---
+numpy==2.4.6
+pandas==3.0.5
+scikit-learn==1.9.0
+scipy==1.17.1
+rdkit==2026.03.5
+seaborn==0.13.2
+matplotlib==3.11.1
+pyarrow==23.0.1
+tqdm==4.70.0
+joblib==1.5.3
+ipykernel==7.3.0        # register the Jupyter kernel FROM the activated env (so cupy finds CUDA)
+
+# --- extras the notebook's top import cell needs (absent from a fresh rapids env) ---
+openTSNE==1.0.4         # 2D chemical-space embedding
+pyyaml==6.0.3           # config loading (PARAMS.load_params)
+dill==0.4.1             # Statistics_tools dependency
+networkx==3.6.1         # Rdkit_tools / Molecule dependency
+requests==2.34.2        # CDD Vault API (get_library / get_protocol_data)
+adjustText==1.4.0       # non-overlapping plot labels
+xgboost==3.4.1          # ML_Class single-task XGB arms
+nonconformist==2.1.0    # conformal prediction intervals (pip-only)
