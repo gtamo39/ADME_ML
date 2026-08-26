@@ -123,7 +123,7 @@ ADME_SMILES_COL: smiles
 # endpoint -> in-house target column + transform to modelling space.
 # transforms: log10 (assay value must be >0), identity (already log), logit_pct (%->fraction->logit)
 ADME_ENDPOINTS:
-  solubility: {col: 'solubility_Thermodynamic Solubility (1)', transform: log10,     unit: uM}
+  solubility: {col: 'solubility_Thermodynamic Solubility (1)', transform: log10,     unit: uM, label_cap_raw: 15000}   # winsorize saturated high solubility (µM)
   logd:       {col: 'logd_LogD7.4',                            transform: identity,  unit: logD7.4}
   hlm:        {col: 'hlm_CLint (raw)',                         transform: log10,     unit: uL/min/mg}
   mlm:        {col: 'mlm_CLint (raw)',                         transform: log10,     unit: uL/min/mg}
@@ -184,12 +184,13 @@ NOVARTIS_PUBLIC:                  # pred column -> in-house modelling space (op 
   mdck:  {col: 'pred(LE-MDCKv2_LogPapp)',   op: identity}   # GAP — LE-MDCK proxy (not MDR1); flag
   ppb:   {col: 'pred(LogFu-Human)',         op: logfu_to_logit}
 
-## ML model training and deployment:
-MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
 
 # public EXP parquet(s) per endpoint (concatenated; value already in modelling space) for the generic
 # DATA._endpoint_dfs builder. solubility/logd/mdck keep their own bespoke get_*_data methods.
 ENDPOINT_PUBLIC_FILES:
+  solubility: [public_solubility.parquet]
+  logd:  [public_logd.parquet]
+  mdck:  [public_novartis_mdck.parquet, public_admetlab_mdck.parquet]
   hlm:   [public_hlm.parquet, public_novartis_hlm.parquet]
   mlm:   [public_novartis_mlm.parquet]
   rlm:   [public_rlm.parquet, public_novartis_rlm.parquet]
@@ -204,13 +205,24 @@ BEST_PUBLIC:
   mlm:        ['Novartis-NIBR']
   rlm:        ['Biogen:rlm', 'Novartis-NIBR']
   caco2:      ['Novartis-NIBR', 'ADMETlab-PROTAC']
+  ppb:        ['TDC:PPBR_AZ']
+
+## ---- ML model training and deployment ---- ##
+MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
+METRICS_PKL_DIR: 'output/results/20260825_metrics/'   # OUTPUT.assess_predictions writes <k>.pkl here (per-endpoint arms)
+
+# OUTPUT.deploy_all_endpoints — fit the deployable RF (internal + BEST_PUBLIC public) and register to MLTrail.
+DEPLOY:
+  features_type: 'H237'          # featurizer MLTrail re-derives at predict time (needs descriptastorus)
+  experiment_suffix: '_h237'     # new models land as adme_<endpoint><suffix> (champions adme_<endpoint> untouched)
+
 
 # ---- Prediction webapp (webapp/app.py) — LiveDesign-style drag-drop scorer, LOCALHOST ONLY ----
 # Scores dropped SDF/CSV compounds with the 8 champion RF (H236) models in the MLTrail vault.
 webapp:
   host: '127.0.0.1'                # bind localhost only — chemistry data must not leave the box
   port: 8050
-  endpoint_order: [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]   # column order in the grid
+  endpoint_order: [solubility, logd, mdck, hlm, mlm, rlm, caco2, ppb]   # column order in the grid
   confidence_split: 0.5            # confidence > split -> azure, <= split -> ember (diverging gradient)
   cutoffs:                         # raw-unit triage cutoff + the comparison that means FAVORABLE
     solubility: {value: 10, favorable: '>='}   # uM
@@ -221,5 +233,4 @@ webapp:
     caco2:      {value: 10, favorable: '>='}    # 1e-6 cm/s
     mdck:       {value: 10, favorable: '>='}    # 1e-6 cm/s
     ppb:        {value: 1,  favorable: '<'}     # % unbound
-
 

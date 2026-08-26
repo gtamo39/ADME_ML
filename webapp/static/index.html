@@ -42,7 +42,20 @@
   .gridwrap{margin-top:14px;overflow-x:auto}
   table.grid{border-collapse:collapse;font-family:var(--mono);font-size:12px;white-space:nowrap}
   table.grid th{position:sticky;top:0;background:var(--card);text-align:left;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;padding:8px 10px;border-bottom:2px solid var(--line);vertical-align:bottom}
+  table.grid th.sortable{cursor:pointer;user-select:none} table.grid th.sortable:hover{color:var(--ember)}
+  table.grid th .ar{color:var(--ember);font-size:9px;margin-left:4px;letter-spacing:0}
   table.grid th .u{display:block;color:#a49b8d;font-size:9.5px;text-transform:none;letter-spacing:0;margin-top:2px}
+
+  /* MPO formula field */
+  .mpo{margin-top:18px;background:#fffefb;border:1px solid var(--line);border-radius:10px;padding:14px 16px}
+  .mpo label{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
+  .mpo .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .mpo input{flex:1;min-width:280px;font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:8px;padding:9px 11px;background:var(--paper);color:var(--ink)}
+  .mpo input:focus{outline:none;border-color:var(--azure)}
+  .mpostatus{font-family:var(--mono);font-size:11px;min-width:70px} .mpostatus.ok{color:var(--olive)} .mpostatus.err{color:var(--ember)}
+  .mpo .help{font-family:var(--mono);font-size:10.5px;color:#a49b8d;margin-top:9px;line-height:1.7}
+  .mpo .help code{background:var(--paper);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink)}
+  .mpocell{font-family:var(--mono);font-size:12px;font-weight:600;color:#1f1b17;text-align:right;padding:0 10px;min-width:56px}
   table.grid td{border-bottom:1px solid var(--line);border-left:1px solid #efeadf;padding:0}
   table.grid td.meta{padding:7px 10px;vertical-align:middle}
   .struct{padding:4px 6px}
@@ -87,6 +100,24 @@
       <span class="status" id="status">idle</span>
     </div>
 
+    <div class="mpo">
+      <label for="mpo">MPO score — weighted formula (edit to retune; the grid updates live)</label>
+      <div class="row">
+        <input id="mpo" type="text" spellcheck="false" placeholder="mean(d('logd'), d('solubility'), …)">
+        <span class="mpostatus" id="mpostatus"></span>
+      </div>
+      <div class="help">
+        <code>logd</code> = raw predicted value ·
+        <code>c('logd')</code> = confidence ·
+        <code>sigmoid('logd', 3)</code> = desirability 0–1, center = cutoff (defaults to the config cutoff if omitted;
+        optional slope <code>sigmoid('logd', 3, 2)</code>) — the favorable inequality (e.g. mdck ≥ 10, hlm &lt; 12) sets the
+        direction, so every term is 1 = good, 0 = bad · <code>d(…)</code> is the same as <code>sigmoid(…)</code> ·
+        <code>sigmoid(x, center, slope)</code> = manual numeric form.
+        Helpers <code>mean(…)</code> <code>min max clamp exp log abs pow</code>.
+        Example: <code>0.4*sigmoid('logd',3) + 0.3*sigmoid('solubility',10) + 0.3*sigmoid('hlm',12)</code>
+      </div>
+    </div>
+
     <div class="legend" id="legend" style="display:none">
       <span><span class="sw" style="background:#74b24a"></span>favorable</span>
       <span><span class="sw" style="background:#c94c3c"></span>unfavorable</span>
@@ -101,6 +132,6 @@
 
   <footer id="foot">bind 127.0.0.1 · MLTrail vault</footer>
 </div>
-<script src="/static/app.js?v=2026-08-24"></script>
+<script src="/static/app.js?v=2026-08-26"></script>
 </body>
 </html>

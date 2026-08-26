@@ -156,7 +156,8 @@ def _predict_all(df):
     ep_out = {}
     for ep, c in CHAMPIONS.items():
         X = align_features(feats, c["feature_cols"])
-        per_tree = np.stack([est.predict(X) for est in c["model"].estimators_])   # (n_trees, n_valid)
+        Xv = X.to_numpy() if hasattr(X, "to_numpy") else np.asarray(X)   # drop names: trees were fitted on a plain array
+        per_tree = np.stack([est.predict(Xv) for est in c["model"].estimators_])   # (n_trees, n_valid)
         raw = _INV[c["transform"]](per_tree.mean(axis=0))
         conf = np.exp(-per_tree.std(axis=0) / c["sigma"])                          # (0, 1], mirrors uq_std_to_confidence
         ep_out[ep] = (raw, conf)
@@ -205,7 +206,8 @@ def models():
     """Champion roster (endpoint, unit, cutoff, favorable direction) + the cell palette. Metadata only."""
     order = _ordered_endpoints()
     eps = [{"key": ep, "unit": CHAMPIONS[ep]["unit"], "cutoff": CHAMPIONS[ep]["cutoff"],
-            "favorable": CHAMPIONS[ep]["favorable"], "model_id": CHAMPIONS[ep]["model_id"]} for ep in order]
+            "favorable": CHAMPIONS[ep]["favorable"], "transform": CHAMPIONS[ep]["transform"],
+            "model_id": CHAMPIONS[ep]["model_id"]} for ep in order]
     return {"endpoints": eps, "palette": PALETTE}
 
 

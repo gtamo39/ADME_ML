@@ -215,6 +215,65 @@ CDD). Notebook keeps bare-name shims (`df_all`, `dfs`, `MF_features`, `ML_data` 
 Solubility analysis flow to port next: harmonize -> H237 features -> ML frame -> power-set transfer / CV /
 temporal (internal vs Biogen-Fang augmented; regression + 15µM classification, log & raw).
 
+**Per-endpoint eval flow internalized (2026-08-25).** `DATA`: `get_internal_public_sets(k, min_n=1000)` ->
+`self.k/d/internal/pub/origins` (InChIKey leak-drop); `select_best_combo_and_update(params, k)` ->
+`self.combo/pub_ids/int_ids/fold_ids/fold_ids_aug/train_temp_ids/test_temp_ids` (combo = `BEST_PUBLIC[k]`
+origins present, else all); `transfer(combo, make_model, use_cuml)` -> one combo's ext->internal metrics.
+New `OUTPUT(params)` owns the model machinery + results: `make_model(use_cuml, n_bins)`,
+`predict_and_record(d, result_df, exp_name, ids, col_to_rm, use_cuml)`, `run_origin_powerset(data)` ->
+`output.res_origin_powerset`, `assess_predictions(data, outpath)` -> `output.metrics_results[data.k]`
+(6 arms: ext->internal, internal/augmented CV, internal/augmented temporal, ext->temp; compute-or-load
+pickle at outpath). Notebook: `output = OUTPUT(params)` in the data cell; the **sol** section now calls these
+methods (other 7 sections still inline until harmonized); the metrics HTML table still renders in the notebook
+via `endpoint_metrics_table_from_dict(output.metrics_results[k], k)`.
+
+**CLI + MF cleanup (2026-08-25).** `python python/ADME_build_ML.py --config … --assess_RF_all_endpoints`
+[--endpoints a,b] [--min_n N] builds `df_all` + `MF_features['all']` then runs
+`OUTPUT.assess_all_endpoints` -> one pickle per endpoint at config `METRICS_PKL_DIR`
+(`output/results/20260825_metrics/`). Per-endpoint feature builders removed
+(`build_MF_features_{solubility,logd,mdck}`, generic `_endpoint_MF`, and the alias) — features now come
+only from `MF_features['all']` via `DATA._feats(k)` (falls back to 'all' when no per-endpoint matrix).
+`get_<k>_data` and the whole-set `build_MF_features(params)` KEPT (`load_combine_dfs` calls `get_<k>_data`
+to build `dfs[k]`). **Update (2026-08-25): `get_<k>_data` is now ALSO fully generic** — see below.
+
+**Deploy to MLTrail (2026-08-26, `OUTPUT.deploy_endpoint` / `deploy_all_endpoints`, CLI `--deploy_RF_all_endpoints`).**
+Fits the deployable RF for each endpoint on **internal + BEST_PUBLIC public** (all rows, no held-out fold) and
+registers a **NEW** MLTrail model `adme_<k>_h237` (the H236 champions `adme_<k>` stay untouched). Config knobs in
+`DEPLOY:` — `features_type: H237`, `experiment_suffix: _h237`. Confidence = **conf_recal**: the method runs the
+**augmented CV** (`fold_ids_aug`, public in TRAIN only, `uq=True`), calibrates via `ML_Reg.calibrate_confidence_params`,
+and stores `{rmse_cv, recal_a, recal_b, label_std}` **inside the model bundle artifact**
+(`{model, feature_cols, endpoint, features, sources, n_train, transform, unit, calibration, sklearn_ver}`) — travels
+atomically with the fitted estimator, versioned by MLTrail, read by the webapp in its one startup `joblib.load`. The
+recal scalars are ALSO mirrored into the registry `metrics` dict so `registry.details()` exposes them without loading
+the artifact. Features = **H237** (4469; `MF_features['all']`); MLTrail's built-in `H237` featurizer re-derives them at
+predict time (**needs `descriptastorus` in the predict env — present in `ML`**). Run:
+`python python/ADME_build_ML.py --config config/config.yaml --deploy_RF_all_endpoints [--endpoints a,b] [--dry_run]`.
+Tests: `tests/test_deploy.py` (synthetic, fake registry — no vault write). **TODO webapp:** switch it from H236 to the
+new H237 models + read `conf_recal` from the bundle (replaces the v1 training-label-std sigma path).
+
+**build_ML_data fully generic (2026-08-25).** The bespoke `build_ML_data_{solubility,logd,mdck}` are gone;
+all 8 route through `DATA._endpoint_ML(endpoint)` (aliased for every endpoint). The only per-endpoint
+difference was the solubility label cap — now config-driven: `ADME_ENDPOINTS[ep]['label_cap_raw']` (raw
+units, applied in modelling space via the transform); solubility=15000 µM, others uncapped. `_endpoint_ML`
+reads `self.params` (stored in `load_df_internal_exp_all`). Tests: `tests/test_build_ml_data.py` (synthetic
+data — cap, feature merge, NaN/inf drop, SMILES dedup-prefers-internal, all-8-aliases).
+
+**get_<k>_data also fully generic (2026-08-25).** The bespoke `get_{solubility,logd,mdck}_data` are gone;
+all 8 route through `DATA._endpoint_dfs` (internal transform via `_TF`, cell-line `filter`, public-file
+concat, `raw`=inverse). Added their public files to config `ENDPOINT_PUBLIC_FILES` (solubility:
+[public_solubility], logd: [public_logd], mdck: [public_novartis_mdck, public_admetlab_mdck]). The alias
+loop now sets BOTH `get_<ep>_data` and `build_ML_data_<ep>` for all 8. So the ONLY per-endpoint bespoke
+code left is config (transform/unit/filter/label_cap_raw + the file lists). Test added for `_endpoint_dfs`
+(transform/filter/multi-file-concat/raw).
+
+**caco2 temporal split is degenerate (2026-08-25).** The newest 20% of INTERNAL caco2 compounds (the
+temporal test slice, SRB-id order) all share ONE identical measured value (`test_unique_labels=1`), so
+`real_y` is constant and Pearson/R²/linregress are mathematically undefined — this crashed
+`assess_all_endpoints` at the caco2 `internal_temp` arm. The split LOGIC is correct; caco2's newest block
+is genuinely constant (other 7 endpoints fine). Fix: `ML_Reg.get_reg_metrics_from_preddf` now guards
+constant/`n<2` inputs — returns `nan` for pearson_r/r2/r2det/spearman_rho (RMSE/MAE still computed) instead
+of raising. So caco2's temporal arms report `nan` correlations (honest); the run completes.
+
 ## Systematic deployment runs — vignette scripts (2026-07-18)
 
 Two `PARAMS/DATA/OUTPUT/MAIN` runners in `python/` (user's preferred class shape) built this session,
@@ -772,9 +831,24 @@ The `ML` env has mltrail/rdkit/sklearn/pandas; only **fastapi+uvicorn** must be 
 - **Efficiency:** featurize H236 **once**, run all 8 models on the shared matrix (avoids 8× re-featurize).
 - **Predictions are in modelling space** → webapp inverse-transforms with `_TF` (ADME_build_ML.py) to raw units.
 - **Grid columns:** structure (RDKit SVG, server-side) · compound_id · score (user-defined, wired later) ·
-  one column per endpoint. **Each endpoint cell is diagonally split:** bottom triangle = predicted raw value
-  colored by cutoff (favorable/unfavorable); top triangle = RF confidence, diverging gradient centered at 0.5
-  (`SERAC_C.azure #0EA5CE` for >0.5, `SERAC_C.ember #E65D32` for ≤0.5).
+  **MPO** (client-side weighted formula, see below) · one column per endpoint. **Each endpoint cell is
+  diagonally split:** bottom triangle = predicted raw value colored by cutoff (favorable/unfavorable); top
+  triangle = RF confidence, diverging gradient centered at 0.5 (`SERAC_C.azure #0EA5CE` for >0.5,
+  `SERAC_C.ember #E65D32` for ≤0.5).
+- **Sortable columns + MPO formula (2026-08-26, app.js v2, `?v=2026-08-26`).** All work **client-side** (rows kept
+  in `ROWS`; no re-scoring, no data leaves the browser). Click any header to sort (numeric high-first, blanks last;
+  toggle direction). The **MPO** column reads an editable formula field that recomputes live per keystroke and
+  re-sorts if MPO is the active column. Formula scope: a bare endpoint name (e.g. `logd`) = raw predicted value;
+  `d('logd'[, slope])` = **desirability** in [0,1] = a sigmoid at the triage cutoff in the model transform space
+  toward the favorable side (default slope 2, d=0.5 at the cutoff); `c('logd')` = confidence; helpers
+  `sigmoid('logd'[, center, slope])` = desirability, center defaults to that endpoint cutoff (2nd arg overrides it in raw
+  units), favorable inequality sets the direction so every term is 1=good/0=bad (== `d`); `sigmoid(x,center,slope)` =
+  manual numeric form; `mean(...)` `clamp min max exp log abs pow`. Default formula shows cutoffs explicitly
+  (`mean(sigmoid('solubility',10), sigmoid('logd',3), ...)`). Eval = `new Function` + `with(scope)`,
+  blocked tokens (`=>`, `function`, backtick, `window/document/fetch/this`) — safe enough for a localhost single
+  user. Default formula = equal-weight `mean(d(ep)...)` over all endpoints. `/api/models` now also returns each
+  endpoint `transform` (needed to build `d()`). Logic tested in `scratchpad/test_mpo.js` (14 checks: cutoff→0.5 in
+  each transform space, favorable direction, `sigmoid(logd,3)` literal, weights, invalid-row→null, token guard, sort).
 - **Confidence:** per-tree std across `rf.estimators_` → `ML_Reg.uq_std_to_confidence`. **sigma (v1) =
   per-endpoint training-label std**, taken from the champion's archived training set
   (`registry.load_training_set(mid)['label'].std()`, modelling space — consistent with the std units).
@@ -782,9 +856,30 @@ The `ML` env has mltrail/rdkit/sklearn/pandas; only **fastapi+uvicorn** must be 
   ppb 1 (<, % unbound), hlm/mlm/rlm 12 (<, µL/min/mg — WEAK: measurement-floor convention, no verified triage cutoff).
 - **Privacy:** binds `127.0.0.1` ONLY. Predictions/SMILES/ids render in the LOCAL browser (same as the CDD
   app's `/api/summary`); nothing crosses to any cloud. Claude must never Read/echo the prediction outputs.
-- **REMINDER (next iteration):** replace the training-label-std sigma with **CV-RMSE-calibrated confidence** —
-  scale tree-variance by each champion's cross-validation RMSE so confidence reflects real predictive error,
-  comparable across endpoints. v1 std-based is a placeholder.
+- **Confidence calibration — 4-way comparison implemented (2026-08-25).** `ML_Reg.calibrate_confidence_params(cv_pred_df)`
+  learns per-endpoint params from the **augmented_cv** arm (has tree-std + true residual): `rmse_cv`, `label_std`,
+  a nonneg linear fit `|resid| ~ a + b*std` (recalibrates the under-dispersed RF tree-std into error units), and
+  the sorted split-conformal nonconformity scores `|resid|/std`. `ML_Reg.apply_confidences(pred_df, calib)` then
+  adds 4 comparison columns to every arm's pred_df: **conf_labelstd** (v1, `exp(-std/label_std)`), **conf_rmse**
+  (`exp(-std/rmse_cv)`), **conf_recal** (`exp(-clip(a+b*std,0)/rmse_cv)`), **conf_conformal**
+  (`frac(nonconf <= rmse_cv/std)` = split-conformal P(|err|<=RMSE_cv)). `OUTPUT.assess_predictions` computes the
+  calibration once (from augmented_cv) and applies it to all 6 arms; params stored under
+  `metrics_results[k]['_calibration']` for the webapp. `OUTPUT.predict_and_record` no longer writes the old inline
+  `confidence`. Tests: `tests/test_confidence.py`. Pick a winner later, then wire that one into the webapp
+  (replacing the v1 training-label-std path). NOTE: cached pickles from the earlier run predate these columns —
+  delete `output/results/20260825_metrics/*.pkl` to recompute with the 4 conf_* columns.
+- **Leakage fix — leave-one-fold-out calibration (2026-08-25).** The v1 above calibrated AND scored the same
+  `augmented_cv` residuals (in-sample) — biases the variant comparison toward the flexible calibrations. Fixed:
+  `K_fold_by_defined_IDs` now returns a **`fold`** column (1-indexed test fold; single split -> all 1).
+  `ML_Reg.apply_confidences_lofo(pred_df)` does **cross-conformal / CV+**: each fold scored by a calibration fit
+  on the OTHER folds (no extra model fits; needs >=2 folds, else None). `OUTPUT.assess_predictions`: **CV arms**
+  (internal_cv, augmented_cv) use LOFO; **single-block arms** (ext_->_internal, both temporals, ext_->_temp)
+  calibrate on `augmented_cv` EXCLUDING that arm's test compounds (fully honest), falling back to the pooled
+  deploy calibration when <30 rows remain (notably `ext_->_internal`, whose test = ALL internal, so nothing is
+  left — augmented_cv OOF is internal-only because public is train-only in fold_ids_aug). Pooled augmented_cv
+  stays as `_calibration` for the webapp (no leakage at deploy: new compounds are unseen). conformal kept as a
+  free 4th column under the same scheme (user deprioritized it). Tests cover LOFO order/bounds/monotonicity + the
+  <2-fold None path.
 
 ## Open / next
 
