@@ -5,11 +5,13 @@ LOCALHOST ONLY. This app handles SMILES / compound ids / predicted values, so it
 MUST NOT be exposed off this machine — it binds to 127.0.0.1 (see config webapp.host).
 
 Pipeline (reusing the MLTrail vault + the ADME config):
-  startup -> discover the 8 champion RF (H236) models in the MLTrail vault
-          -> load each estimator + its trained feature columns
-          -> per endpoint, sigma = std of the archived training-set labels (modelling space)
-  upload  -> read the dropped SDF/CSV once -> featurize H236 once
-          -> per model: mean (raw value) + per-tree std (-> confidence) -> favorable flag
+  startup -> discover the deployed RF models in the MLTrail vault (prefer new H237 over H236)
+          -> load each estimator + trained feature columns + conf_recal calibration (from the bundle)
+          -> fallback scale = std of the archived training-set labels when no calibration is bundled
+          -> load any config `webapp.extra_models` (non-ADME MLTrail models, own grid column)
+  upload  -> read the dropped SDF/CSV once -> featurize H237 once
+          -> per model: mean (raw value) + per-tree std (-> conf_recal confidence) -> favorable flag
+          -> per extra classifier: P(positive class) + the decision margin |2p-1| as the confidence
   render  -> LiveDesign-style grid, one diagonal-split cell per endpoint
 
 Predictions/SMILES/ids render only in the LOCAL browser (localhost); nothing crosses to any cloud.
@@ -22,6 +24,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import yaml
@@ -32,7 +35,7 @@ from rdkit import Chem
 from rdkit.Chem.Draw import rdMolDraw2D
 
 from mltrail import Registry
-from mltrail.backends import align_features, load_model
+from mltrail.backends import align_features
 from mltrail.featurizers import get_featurizer
 from mltrail.readers import read_dataset
 
@@ -51,6 +54,10 @@ PALETTE = {
     "split": WEBAPP.get("confidence_split", 0.5),
 }
 
+# Steepness of the favorable<->unfavorable value fade, per MODELLING-space unit from the cutoff.
+# 2.0 means one log unit (or one logD unit) past the cutoff reaches ~88% of the full color.
+COLOR_SLOPE = float(WEBAPP.get("color_slope", 2.0))
+
 # raw-unit -> modelling-space inverse transforms (mirror ADME_build_ML._TF inverses).
 _INV = {
     "log10": lambda a: np.power(10.0, a),
@@ -63,6 +70,7 @@ STAGE_DIR = Path(tempfile.mkdtemp(prefix="adme_webapp_"))
 atexit.register(lambda: shutil.rmtree(STAGE_DIR, ignore_errors=True))
 
 CHAMPIONS = {}          # endpoint -> {model, feature_cols, sigma, transform, unit, cutoff, favorable, model_id}
+EXTRAS = {}             # key -> {model, feature_cols, pos_idx, label, unit, threshold, model_id} (extra columns)
 _FEATURIZE = None       # H236 featurizer (built once at startup)
 _LAST_CSV = None        # flat DataFrame of the most recent prediction run (for /api/download)
 
@@ -70,31 +78,74 @@ _LAST_CSV = None        # flat DataFrame of the most recent prediction run (for 
 # ---------- startup: discover + load the champions ----------
 
 def _discover_champions():
-    """Load the 8 champion RF (H236) models from the MLTrail vault and their per-endpoint scale."""
+    """Load the deployed RF models from the MLTrail vault, per endpoint. Prefer the new H237 models
+    (`adme_<ep>_h237`, conf_recal calibration bundled) over the older H236 champions (`adme_<ep>`,
+    training-label-std fallback). Loads model + feature_cols + calibration from each model bundle."""
     reg = Registry.from_default()
     cutoffs = WEBAPP.get("cutoffs", {})
-    listing = reg.list()
-    for _, row in listing.iterrows():
+    # gather adme_ sklearn models keyed by (endpoint, features_type); prefer H237 below
+    found = {}
+    for _, row in reg.list().iterrows():
         d = reg.details(row["id"])
         name = str(d.get("experiment_name", ""))
-        if not (name.startswith("adme_") and d.get("features_type") == "H236"
-                and d.get("framework") == "sklearn"):
+        if not (name.startswith("adme_") and d.get("framework") == "sklearn"):
             continue
-        ep = name[len("adme_"):]
-        model, feature_cols = load_model(d["framework"], d["model_path"])
-        # sigma (v1) = std of the archived training-set labels (modelling space) — see wiki reminder
-        try:
-            sigma = float(reg.load_training_set(d["id"])["label"].std())
-        except Exception as ex:
-            print(f"WARN: {ep}: training-label std unavailable ({ex}); sigma=1.0", flush=True)
-            sigma = 1.0
+        ft = d.get("features_type")
+        if ft not in ("H236", "H237"):
+            continue
+        ep = name[len("adme_"):].removesuffix("_h237")
+        found.setdefault(ep, {})[ft] = d
+    for ep, by_ft in found.items():
+        d = by_ft.get("H237") or by_ft.get("H236")
+        ft = "H237" if "H237" in by_ft else "H236"
+        # the bundle carries model + trained columns + (for H237) the conf_recal calibration
+        bundle = joblib.load(d["model_path"])
+        model = bundle["model"] if isinstance(bundle, dict) else bundle
+        feature_cols = bundle.get("feature_cols") if isinstance(bundle, dict) else None
+        calib = bundle.get("calibration") if isinstance(bundle, dict) else None
+        # fallback scale (training-label std) only when no conf_recal calibration is bundled
+        sigma = None
+        if calib is None:
+            try:
+                sigma = float(reg.load_training_set(d["id"])["label"].std()) or 1.0
+            except Exception as ex:
+                print(f"WARN: {ep}: training-label std unavailable ({ex}); sigma=1.0", flush=True)
+                sigma = 1.0
         cut = cutoffs.get(ep, {})
         CHAMPIONS[ep] = {
-            "model": model, "feature_cols": feature_cols, "sigma": sigma or 1.0,
+            "model": model, "feature_cols": feature_cols, "features_type": ft,
+            "calibration": calib, "sigma": sigma,
             "transform": ENDPOINT_CFG[ep]["transform"], "unit": ENDPOINT_CFG[ep].get("unit", ""),
             "cutoff": cut.get("value"), "favorable": cut.get("favorable"), "model_id": int(d["id"]),
         }
-    print(f"> loaded {len(CHAMPIONS)} champion RF (H236) models: {sorted(CHAMPIONS)}", flush=True)
+    fts = sorted(f"{ep}:{CHAMPIONS[ep]['features_type']}" for ep in CHAMPIONS)
+    print(f"> loaded {len(CHAMPIONS)} RF models: {fts}", flush=True)
+
+
+def _load_extras():
+    """Load the config `webapp.extra_models` — MLTrail models that are NOT ADME endpoints (e.g. the
+    Px single/low activity classifier, id 19). They get their own grid column and their own CSV columns,
+    but they stay OUT of the MPO formula scope. Classification only: the column shows P(positive class)."""
+    reg = Registry.from_default()
+    for spec in WEBAPP.get("extra_models", []):
+        mid = int(spec["model_id"])
+        try:
+            d = reg.details(mid)
+            bundle = joblib.load(d["model_path"])
+        except Exception as ex:                      # a missing vault entry must not stop the ADME app
+            print(f"WARN: extra model {mid} ({spec['key']}) unavailable ({ex}); column skipped", flush=True)
+            continue
+        model = bundle["model"] if isinstance(bundle, dict) else bundle
+        EXTRAS[spec["key"]] = {
+            "model": model, "feature_cols": bundle.get("feature_cols") if isinstance(bundle, dict) else None,
+            "pos_idx": int(np.argmax(model.classes_)),      # column of the positive (highest) class label
+            "label": spec.get("label", spec["key"]), "unit": spec.get("unit", ""),
+            "threshold": float(spec.get("threshold", 0.5)),
+            "color_slope": float(spec.get("color_slope", 8.0)),
+            "features_type": d.get("features_type"), "model_id": mid,
+        }
+        print(f"> extra model {mid}: {d.get('experiment_name')} ({d.get('model_type')}, "
+              f"{d.get('features_type')}) -> column '{spec['key']}'", flush=True)
 
 
 def _ordered_endpoints():
@@ -105,16 +156,32 @@ def _ordered_endpoints():
 
 # ---------- helpers ----------
 
-def _svg(smiles, width=150, height=100):
-    """Render a compound to an inline SVG string (local, RDKit). Empty string on parse failure."""
+def _svg(smiles, width=150, height=100, bond_line_width=None):
+    """Render a compound to an inline SVG string (local, RDKit). Empty string on parse failure.
+    bond_line_width: absolute (unscaled) bond stroke — set thin for the crisp high-res hover preview."""
     mol = Chem.MolFromSmiles(str(smiles))
     if mol is None:
         return ""
     drawer = rdMolDraw2D.MolDraw2DSVG(width, height)
-    drawer.drawOptions().clearBackground = False
+    opts = drawer.drawOptions()
+    opts.clearBackground = False
+    if bond_line_width is not None:
+        opts.bondLineWidth = bond_line_width      # absolute px width...
+        opts.scaleBondWidth = False               # ...kept constant so a big canvas => thin, clean lines
     rdMolDraw2D.PrepareAndDrawMolecule(drawer, mol)
     drawer.FinishDrawing()
     return drawer.GetDrawingText()
+
+
+def _confidence(std, c):
+    """Per-prediction confidence in (0,1] from the tree-variance std (modelling space).
+    conf_recal when the model bundles a calibration: exp(-clip(recal_a + recal_b*std, 0)/rmse_cv);
+    else the training-label-std fallback exp(-std/sigma)."""
+    calib = c.get("calibration")
+    if calib and np.isfinite(calib.get("rmse_cv", np.nan)) and calib["rmse_cv"] > 0:
+        resid = np.clip(calib.get("recal_a", 0.0) + calib.get("recal_b", 0.0) * std, 0.0, None)
+        return np.exp(-resid / calib["rmse_cv"])
+    return np.exp(-std / (c.get("sigma") or 1.0))
 
 
 def _is_favorable(raw, cutoff, sign):
@@ -159,8 +226,17 @@ def _predict_all(df):
         Xv = X.to_numpy() if hasattr(X, "to_numpy") else np.asarray(X)   # drop names: trees were fitted on a plain array
         per_tree = np.stack([est.predict(Xv) for est in c["model"].estimators_])   # (n_trees, n_valid)
         raw = _INV[c["transform"]](per_tree.mean(axis=0))
-        conf = np.exp(-per_tree.std(axis=0) / c["sigma"])                          # (0, 1], mirrors uq_std_to_confidence
+        conf = _confidence(per_tree.std(axis=0), c)                                # (0, 1], conf_recal or fallback
         ep_out[ep] = (raw, conf)
+
+    # extra classifiers: value = P(positive class); confidence = decision margin |2p-1| (0 at the
+    # 0.5 boundary, 1 at a unanimous forest). NOTE: a per-tree std is useless here — the trees vote 0/1,
+    # so std ~ sqrt(p(1-p)) and carries no information beyond p itself.
+    for xk, c in EXTRAS.items():
+        X = align_features(feats, c["feature_cols"])
+        Xv = X.to_numpy() if hasattr(X, "to_numpy") else np.asarray(X)
+        prob = c["model"].predict_proba(Xv)[:, c["pos_idx"]]
+        ep_out[xk] = (prob, np.abs(2.0 * prob - 1.0))
 
     order = _ordered_endpoints()
     rows, flat = [], []
@@ -178,7 +254,19 @@ def _predict_all(df):
             else:
                 preds[ep] = {"value": None, "favorable": None, "confidence": None}
                 flat_row[f"{ep}_pred"] = None; flat_row[f"{ep}_confidence"] = None
-        rows.append({"compound": r["compound"], "smiles": smi, "svg": _svg(smi), "valid": valid, "preds": preds})
+        # extra (non-ADME) columns — same cell shape, but the value is a class probability
+        for xk, c in EXTRAS.items():
+            if valid:
+                prob = float(ep_out[xk][0][pos[key]]); conf = float(ep_out[xk][1][pos[key]])
+                preds[xk] = {"value": prob, "favorable": bool(prob >= c["threshold"]), "confidence": conf}
+                flat_row[f"{xk}_pred"] = prob; flat_row[f"{xk}_confidence"] = conf
+            else:
+                preds[xk] = {"value": None, "favorable": None, "confidence": None}
+                flat_row[f"{xk}_pred"] = None; flat_row[f"{xk}_confidence"] = None
+        # grid thumbnail (small) + a fresh high-resolution render for the hover preview (thin, clean bonds)
+        svg = _svg(smi) if valid else ""
+        svg_hi = _svg(smi, width=400, height=300, bond_line_width=1.2) if valid else ""
+        rows.append({"compound": r["compound"], "smiles": smi, "svg": svg, "svg_hi": svg_hi, "valid": valid, "preds": preds})
         flat.append(flat_row)
     return rows, pd.DataFrame(flat)
 
@@ -188,8 +276,9 @@ def _predict_all(df):
 @asynccontextmanager
 async def lifespan(app):
     global _FEATURIZE
-    _discover_champions()                 # load the champion models + per-endpoint sigma
-    _FEATURIZE = get_featurizer("H236", CONFIG)   # build the H236 featurizer once
+    _discover_champions()                 # load the deployed models + per-endpoint calibration
+    _load_extras()                        # non-ADME extra-column models (config webapp.extra_models)
+    _FEATURIZE = get_featurizer("H237", CONFIG)   # H237 featurizer (H237 columns cover H236 fallbacks)
     yield
 
 
@@ -207,8 +296,13 @@ def models():
     order = _ordered_endpoints()
     eps = [{"key": ep, "unit": CHAMPIONS[ep]["unit"], "cutoff": CHAMPIONS[ep]["cutoff"],
             "favorable": CHAMPIONS[ep]["favorable"], "transform": CHAMPIONS[ep]["transform"],
-            "model_id": CHAMPIONS[ep]["model_id"]} for ep in order]
-    return {"endpoints": eps, "palette": PALETTE}
+            "color_slope": COLOR_SLOPE, "model_id": CHAMPIONS[ep]["model_id"]} for ep in order]
+    # a probability lives on a 0-1 scale, so its fade needs a steeper slope than a log-unit endpoint
+    extras = [{"key": k, "label": c["label"], "unit": c["unit"], "cutoff": c["threshold"],
+               "favorable": ">=", "kind": "classification", "transform": "identity",
+               "color_slope": c["color_slope"], "model_id": c["model_id"]}
+              for k, c in EXTRAS.items()]
+    return {"endpoints": eps, "extras": extras, "palette": PALETTE}
 
 
 @app.post("/api/predict")

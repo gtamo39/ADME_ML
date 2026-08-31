@@ -248,8 +248,77 @@ recal scalars are ALSO mirrored into the registry `metrics` dict so `registry.de
 the artifact. Features = **H237** (4469; `MF_features['all']`); MLTrail's built-in `H237` featurizer re-derives them at
 predict time (**needs `descriptastorus` in the predict env — present in `ML`**). Run:
 `python python/ADME_build_ML.py --config config/config.yaml --deploy_RF_all_endpoints [--endpoints a,b] [--dry_run]`.
-Tests: `tests/test_deploy.py` (synthetic, fake registry — no vault write). **TODO webapp:** switch it from H236 to the
-new H237 models + read `conf_recal` from the bundle (replaces the v1 training-label-std sigma path).
+Tests: `tests/test_deploy.py` (synthetic, fake registry — no vault write).
+
+**CLI runner (2026-08-27, `python/run_nvs_cellab.py`).** Runs Cell A+B headless with crash-safe incremental saves
+(SSH-drop cost the user 40 min of interactive compute). `python python/run_nvs_cellab.py --config … --outdir
+output/results/20260827_NVS_cellab --levers baseline,s1,s5,s3,s2,nested [--n_taus N] [--taus a,b] [--resume]`.
+Writes per arm the OOF `<arm>_preddf` + `<arm>_metrics` into `metrics_dict.pkl` (consumable by the notebook's
+`endpoint_metrics_table_from_dict(d,'mdck')` — arm keys avoid 'temp' so all land in its CV category), each pred_df
+to `preddfs/<arm>.parquet`, and full training-set membership: `folds.pkl` (internal CV folds), `nvs_fold_distance.parquet`
+(NVS train at τ = distance<τ per fold), `nvs_scaffold_groups.parquet`+`arms.json` (S2), `nvs_weights.parquet` (S3),
+`train_membership.pkl`. Every arm streams to disk the instant it finishes; `--resume` skips arms already present.
+Module gained `cv_preddf` (returns the OOF frame) and `nested_distance` now returns its `preddf`; both tested. Run
+detached (screen/nohup). NVS pool for mdck is large — `all_nvs` + sweeps are the heavy part; start `baseline,s1`.
+
+**Interim mdck result (2026-08-27, ~partial run).** internal=107, NVS(Novartis-NIBR)=273,241; NVS→internal distance
+is broadly far (10th pct ≈ 0.768, i.e. max Tanimoto ≈ 0.23). Negative transfer confirmed and it is **bias, not rank**:
+`r2` (Pearson²) barely moves across arms (~0.44–0.49) while **R²det collapses** internal-only 0.474 → all-NVS 0.134
+(RMSE 0.429 → 0.551 log10). Distance lever monotone: less/closer NVS = less damage; the nearest ~1.3k (τ=0.70,
+sim>0.30) nudges r2 to 0.493 (>0.475) but R²det 0.403 still < internal-only — a tight near-shell helps ranking,
+not the bias-sensitive metric. So distance filtering cannot beat internal-only; **bias-correction is the lever that
+targets the actual failure mode.**
+
+**mdck UPDATE — a tight near-shell BEATS internal-only; bias-correction refuted (2026-08-27).** Re-running S1 on a
+tight grid found the sweet spot the coarse grid (≥0.768) had missed: R²det vs τ is an inverted-U peaking at
+**τ=0.60** (nearest ~101 NVS): internal-only 0.474 → **0.528** (RMSE 0.429 → 0.407, r2 0.475 → 0.536). τ=0.50 0.497,
+τ=0.65 0.501, τ=0.70 0.403, τ=0.768 0.231, τ=1.0 0.140. So a small raw near-shell of Novartis (~100 close analogs,
+sim>~0.4) genuinely improves mdck — distance filtering, not bias-correction, is the winning lever (my earlier
+"distance can't beat internal-only" was a coarse-grid artifact). **`shift` bias-correction HURTS** (τ0.6 0.478, τ0.65
+0.109, τ0.70 −0.085): matching medians conflates true population difference with label bias and stamps a large wrong
+offset — the close labels are already usable raw, global recalibration corrupts them. `affine` behaves the same
+(τ0.5 0.483, τ0.6 0.404, τ0.65 0.155, τ0.7 −0.203, all −0.221) — both corrections refuted. S1 window τ0.5–0.65 ALL
+beat internal-only (0.497/0.528/0.501); peak τ=0.60. **Not yet banked:** τ=0.60 was selected on the same 107
+compounds; validate with nested CV (`--levers nested --taus 0.5,0.55,0.6,0.65,0.7`) — adopt "internal + nearest-shell
+NVS (dist<~0.6, ~100 cmpd, RAW)" only if honest R²det ≳ 0.50; also get a fold-spread/bootstrap error bar (effect ~+0.05).
+
+**Model-family speed/accuracy benchmark (2026-08-27, `python/bench_models_transfer.py`; transfer: train all 273k NVS
+→ predict 107 internal mdck).** fit-time | R2_pears | R2det: **LightGBM 33s | 0.350 | −3.33**; RF-50 110s | 0.412 |
+−3.72; RF-200 (champion) 440s | 0.407 | −3.57; **ElasticNet 1397s | 0.283 | −1.46**. Conclusions: **LightGBM is ~13×
+faster than champion RF**, nonlinear, near-RF ranking → the high-throughput screening learner for the subset search
+(RF-50 a middle option; confirm finalists with RF-200). **ElasticNet is OUT** — slowest AND least accurate on the real
+matrix: correlated fingerprint features make coordinate descent converge slowly (the synthetic-data ~49s estimate was
+misleading; real 23min). All R2det strongly negative = pure NVS→internal transfer is hopeless (re-confirms NVS is only
+useful as near-shell augmentation, not standalone). RF's 200 trees are overkill (RF-50 ≈ RF-200 on ranking, 4× faster).
+`lightgbm==4.7.0` added to requirements.txt.
+
+**NVS instance-selection campaign (2026-08-27, `python/nvs_campaign.py`, unattended batch).** Autoresearch-style
+menu search for the NVS subset that maximises internal R2det, LightGBM workhorse + champion-RF cross-check, honest
+nested-CV verdict. ~22 literature-grounded strategies (instance selection + importance weighting vs negative transfer;
+NN + classifier density-ratio weighting): baselines, distance-shell `dist_<tau>`, kNN local `knn_<k>`, similarity/exp
+weighting `distw/expw`, classifier density-ratio `clfw`, support/range matching `range_*`, agreement/pseudo-label filter
+`agree_*`, within-NVS uncertainty filter `lowunc`, outlier removal `noout`, combos. Each scored by grouped-CV R2det
+(InChIKey folds, leakage-free); **nested CV** picks best-on-inner, scores on held-out outer (the trusted number, printed
+with a BEATS/does-not-beat internal-only verdict); huge-subset strategies excluded from nested (`--nested_max_nvs`).
+`NVSSubsetSearch` gained a `learner` switch (`rf`/`rf50`/`lgbm`, via `_make`) and float32 fits (halves RAM on 273k).
+Crash-safe/resumable; outputs `campaign_<ep>.csv`, `rf_check_<ep>.csv`, `summary_<ep>.json`, per-strategy preddf parquets.
+Run detached (screen). Tested on synthetic data (all strategy families + nested). Real mdck run: pending.
+
+**S5 bias-correction upgraded (2026-08-27).** The old `_bias_label` (affine on near-neighbour anchors, sim0=0.5) was
+a no-op for mdck (no NVS that close). Rewrote `_bias_label(method, sim0, min_anchors)` — per-fold, train-only
+(leakage-free): **`shift`** (default; match added-NVS MEDIAN to internal-train median — targets the constant offset,
+always computable), **`affine`** (match median + IQR — offset + scale), **`anchor`** (near-neighbour affine, falls
+back to `shift` when < min_anchors). Runner flag `--s5_methods shift,affine`; arms `S5<method>_tau*`. Decision metric =
+whether any S5 arm's R²det clears the internal-only 0.474 line. Tests: `test_bias_correction_recalibrates_to_internal_scale`.
+
+**Webapp switched to H237 + conf_recal (2026-08-26, `webapp/app.py`).** `_discover_champions` now gathers `adme_<ep>`
+sklearn models keyed by features_type and **prefers H237 over H236 per endpoint** (so it works before/after deploy
+completes). It `joblib.load`s each bundle for `model` + `feature_cols` + `calibration` in one read (`load_model`
+dropped the extra keys). Confidence via new `_confidence(std, c)` = **conf_recal** `exp(-clip(recal_a+recal_b*std,0)/rmse_cv)`
+when a calibration is bundled, else the training-label-std fallback `exp(-std/sigma)`. Featurizer switched to **H237**
+(its columns cover H236 fallbacks, so one featurizer serves both; needs `descriptastorus`, present in `ML`). Eyebrow +
+docstring updated. `_confidence` unit-tested (bounded, monotone, matches closed form, both fallbacks). Restart the app
+after deploy finishes so it picks up the new H237 models.
 
 **build_ML_data fully generic (2026-08-25).** The bespoke `build_ML_data_{solubility,logd,mdck}` are gone;
 all 8 route through `DATA._endpoint_ML(endpoint)` (aliased for every endpoint). The only per-endpoint
@@ -815,13 +884,14 @@ Predicted rows (PROTAC-PatentDB) kept in the same table, `type='thermodynamic_pr
 ## Prediction webapp — LiveDesign-style drag-drop scorer (2026-08-24, `webapp/`, v1 built)
 
 Local-only FastAPI webapp in `ADME_ML/webapp/` (mirrors `../CDD_Vault_API/webapp` skeleton). Drag-drop an
-SDF or CSV of compounds + SMILES; it scores every compound with the **8 champion RF models (H236)** in the
-MLTrail vault (`/data2/MLTrail_vault`) and shows a LiveDesign-style grid.
+SDF or CSV of compounds + SMILES; it scores every compound with the 8 champion RF models in the
+MLTrail vault (`/data2/MLTrail_vault`) and shows a LiveDesign-style grid. (Started on **H236**; since
+2026-08-26 the app prefers **H237 + `conf_recal`** per endpoint — see the H237 note below.)
 
 **Files:** `webapp/app.py` (FastAPI backend), `webapp/static/{index.html,app.js}` (drop zone + grid),
 `webapp/requirements.txt`. **Run:** `conda run -n ML python webapp/app.py` -> http://127.0.0.1:8050.
-The `ML` env has mltrail/rdkit/sklearn/pandas; only **fastapi+uvicorn** must be installed into `ML` first
-(`conda install -n ML -c conda-forge fastapi uvicorn`). Core predict path verified on public SMILES
+The `ML` env has mltrail/rdkit/sklearn/pandas; **fastapi+uvicorn are installed** (verified 2026-08-31:
+fastapi 0.141.1, uvicorn 0.52.4). Core predict path verified on public SMILES
 (2026-08-24): all 8 champions load, H236 = 4269 features, per-tree std -> confidence, inverse transforms sane.
 
 - **Model backend:** MLTrail. Champions = registry entries with `experiment_name` starting `adme_`,
@@ -849,6 +919,60 @@ The `ML` env has mltrail/rdkit/sklearn/pandas; only **fastapi+uvicorn** must be 
   user. Default formula = equal-weight `mean(d(ep)...)` over all endpoints. `/api/models` now also returns each
   endpoint `transform` (needed to build `d()`). Logic tested in `scratchpad/test_mpo.js` (14 checks: cutoff→0.5 in
   each transform space, favorable direction, `sigmoid(logd,3)` literal, weights, invalid-row→null, token guard, sort).
+- **Hover preview + per-row CSV selection (2026-08-27, `?v=2026-08-27b`).** Hovering a structure cell shows a
+  floating high-resolution preview. It is a FRESH RDKit render (`svg_hi`, 400×300, absolute `bondLineWidth=1.2`,
+  `scaleBondWidth=False`) carried per row — NOT the 150×100 thumbnail scaled up (that magnified strokes ~4.8px;
+  the fresh render is ~1.1px, thin + clean). `_svg` gained a `bond_line_width` arg.
+  Each row has a checkbox (+ a header select-all, with indeterminate state) that flags it for download; `r.selected`
+  lives in `ROWS` and survives sort/re-render. **Download is now client-side**: `toCSV(selected rows)` builds the CSV
+  in-browser (columns compound, smiles, mpo, score, then `<ep>_pred`/`<ep>_confidence`) and saves via a Blob — so it
+  respects the checkboxes and adds MPO+Score. The server `/api/download` endpoint is now unused (left as-is).
+- **Collapsible panels + row filters (2026-08-31, `?v=2026-08-31`).** The MPO block is now a `<details class="panel">`
+  and is **collapsed by default** (its `✓ applied` / `✗ error` status moved into the `<summary>`, so a bad formula is
+  visible while closed). A second panel, **Filters**, holds a LiveDesign-style term builder: one row per term =
+  `property` · `operator` (`> >= < <= = ≠`) · `value`, with "⊕ Add a term" / "⊖ Remove term" and an all-vs-any
+  (AND/OR) selector. Filterable properties = every endpoint (raw value), every `<ep>_conf` (RF confidence),
+  plus `MPO` and the manual `Score`. Everything is client-side: `activeTerms()` drops incomplete terms,
+  `passRow()` tests a row, and `renderRows()` now renders `VISIBLE` (= ROWS that pass) while keeping the ROWS index
+  in each cell's `data-i`, so sort, the Score boxes and the hover preview stay correct. A missing/unparsed value
+  fails a term. Selection follows the filter: select-all and the CSV download act on the VISIBLE rows only.
+  Filtering never re-scores — it only hides. Logic tested DOM-free by slicing the filter section out of `app.js`
+  (`scratchpad/test_filters.js`, 15 checks on synthetic rows: AND/OR, `_conf` vs value, all 6 operators,
+  incomplete terms inert, null-value rows excluded, mpo/score fields, negative thresholds, field list).
+  Static files are read per request, so a running server picks the change up without a restart.
+- **Column show/hide, an extra model column, and a color menu (2026-08-31, `?v=2026-08-31b`).** Three additions:
+  (1) **Columns panel** — a checkbox per column (Structure / Compound / Score / MPO / every model column) with
+  "show all" and "hide all endpoints". `HIDDEN` is a key set; `renderHeader()` (which replaced the old in-place
+  arrow patcher `refreshHeader`) and `renderRows()` skip a hidden key. Hiding is display-only: the column is still
+  scored, still filterable, and **still written to the CSV** (`toCSV` iterates `MODELS.columns`, never `HIDDEN`).
+  (2) **Extra (non-ADME) model column** — new config list `webapp.extra_models`, loaded by `_load_extras()`.
+  First entry = **MLTrail id 19 `Px_activity_1_12_rf_H237`** (experiment_measure `proteomics_activity`,
+  `single_task_classification`, H237, roc_auc 0.645 / pr_auc 0.761, n_train 4859, classes 3271/1588, positive =
+  `1 <= ndown <= 12`, i.e. the single/low-activity class). The column shows **P(positive)** with `favorable` at a
+  config `threshold` (0.5), and its **confidence = the decision margin |2p−1|** — a per-tree std is useless for a
+  binary forest (trees vote 0/1, so std ≈ sqrt(p(1−p)) adds nothing to p). It reuses the H237 matrix already
+  featurized for the ADME champions, so it costs one extra `predict_proba`. It is **excluded from the MPO**:
+  the MPO scope is built from `MODELS.endpoints`, while the grid/filters use `MODELS.columns` = endpoints + extras
+  (`_byKey` vs `_byCol`). It is filterable (`px_activity`, `px_activity_conf`) and exported to the CSV.
+  (3) **Colors panel** — four pickers (favorable value, unfavorable value, confidence above/below the split) over a
+  live `PAL` copy, with a reset to the SERAC config defaults (olive/azure/ember; the MPO column follows the
+  favorable color, and the legend swatches track the pickers). The config hex is upper-case, so it is lower-cased
+  at load — `<input type=color>` rejects `#0EA5CE`. The choice lasts for the page load only.
+- **Value color is a diverging FADE, not a switch (2026-08-31, `?v=2026-08-31c`).** The lower-left triangle used a
+  boolean `favorable` flag, so 9.9 and 10.1 µM looked opposite. New `gradPos(col, v)` puts the value on a 0–1
+  favorable axis = sigmoid of the distance to the triage cutoff **in modelling space** (log units for a log
+  endpoint), with the favorable inequality setting the direction — the same desirability the MPO uses. `predColor(t)`
+  then fades: palest at the cutoff (alpha 0.10) and saturating to alpha 0.90 far from it, olive above / red below.
+  Steepness = the column's `color_slope` × a `value fade` slider in the Colors panel (0.25–4, default 1).
+  `color_slope` is config: `webapp.color_slope: 2.0` for the endpoints (one log unit past the cutoff ≈ 88% of the
+  color) and **8.0 for the classification column**, whose probability moves at most 0.5 from its threshold. The
+  legend's two hard swatches became one gradient bar. Tests: `scratchpad/test_colors.js` (19 checks: 0.5 exactly at
+  the cutoff, palest fill there, monotone with no jump, direction flip for lower-is-better endpoints, alpha
+  saturation, the sharpness knob, the steeper classification slope, grey for null/uncomputable values).
+  Tests: `scratchpad/test_filters.js` now 20 checks (adds the extra column in the filter fields, MPO-scope
+  exclusion, and CSV-keeps-hidden-columns), plus a live end-to-end run on **public SMILES only** (ethanol/benzene/
+  aspirin/caffeine + a bad SMILES) against a throwaway instance on port 8051: 9 prediction columns, unparsed row
+  null. **CAUTION: a running server must be restarted to pick up `app.py`** — static files reload on their own.
 - **Confidence:** per-tree std across `rf.estimators_` → `ML_Reg.uq_std_to_confidence`. **sigma (v1) =
   per-endpoint training-label std**, taken from the champion's archived training set
   (`registry.load_training_set(mid)['label'].std()`, modelling space — consistent with the std units).
@@ -880,11 +1004,91 @@ The `ML` env has mltrail/rdkit/sklearn/pandas; only **fastapi+uvicorn** must be 
   stays as `_calibration` for the webapp (no leakage at deploy: new compounds are unseen). conformal kept as a
   free 4th column under the same scheme (user deprioritized it). Tests cover LOFO order/bounds/monotonicity + the
   <2-fold None path.
+- **InChIKey-grouped CV folds — anti-leakage (2026-08-26, `DATA._grouped_folds`, config `FOLD_GROUP_BY_INCHIKEY: true`).**
+  The confidence-vs-residual plot looked "too clean" (all 4 variants Spearman ≈ −0.71). **That equality is a math
+  identity, not leakage:** every conf variant is a strictly monotone transform of one number (`uq_std`), and Spearman
+  is invariant under monotone transforms, so all four = `−Spearman(uq_std, |resid|)`; calibration only rescales the
+  x-axis. Code audit of `ML_Reg.K_fold_by_defined_IDs` confirms `pred_y`/`uq_std`/`real_y` are genuine OOF (train/test
+  ID-disjoint; public added to TRAIN only; public InChIKey-twins of internal already dropped in
+  `get_internal_public_sets`). The one real exposure: `_endpoint_ML` dedups by SMILES only, so internal InChIKey twins
+  (same molecule, different SMILES) could split across random KFold folds and inflate the signal. Fix:
+  `select_best_combo_and_update` now builds the 5 folds **grouped by InChIKey** (unique groups KFold-split with
+  seed 42, each compound inherits its group's fold; missing `_ik` -> singleton) so twins never straddle a split.
+  Deterministic; a no-op when there are no twins. Toggle off with `FOLD_GROUP_BY_INCHIKEY: false`. Test:
+  `tests/test_build_ml_data.py::test_grouped_folds_no_inchikey_twins_across_folds`. **NOTE:** this changes CV +
+  conf_recal calibration numbers, so cached metrics pickles must be deleted to recompute, and models must be
+  **re-deployed** for the new calibration to reach MLTrail/the webapp.
+
+## NVS negative-transfer subset search (2026-08-26, `python/nvs_subset_search.py`, mdck pilot — results pending)
+
+**Motivation.** The grouped-fold `augmented_cv` R² plot (all 8 endpoints, transfer/internal-CV/augmented-CV) shows
+augmentation HELPS logd/ppb/rlm/solubility but HURTS the NVS-only endpoints (mdck/hlm/mlm/caco2): augmented < internal.
+Consistent with the 2026-07 cleaning sweep (drop predicted NVS/ADM for mdck/mlm/caco2) — NVS = Novartis-NIBR
+**predicted** labels with a **systematic upward bias** (mdck: wrong assay variant, +1.6–1.9). New question: is there a
+predictive SUBSET of NVS that beats internal-only? `NVSSubsetSearch(data, output, params, endpoint='mdck')` runs in the
+user's kernel on a built DATA/OUTPUT and tests four levers vs the internal-only + all-NVS baselines:
+- **S1 distance** (`distance_curve`): augment with NVS within a swept Tanimoto distance of the internal TRAIN fold
+  (leakage-free — distance to train rows only, per fold; quantile grid). Expect an inverted-U if a near subset helps.
+- **S2/S4 scaffold** (`scaffold_greedy`): cluster NVS by Bemis-Murcko GENERIC scaffold (top-K frequent + 'other'),
+  forward/backward greedy group selection maximizing augmented CV R².
+- **S5 bias-correction** (`biascorrect_curve`): per train fold, affine-calibrate NVS labels toward internal on
+  near-neighbour pairs (max-sim ≥ sim0; fit a+b·nvs on nearest internal-train label), then augment.
+- **S3 weighting** (`weighted_r2`): within-NVS scaffold-grouped CV → per-compound tree-variance std → RF
+  `sample_weight = exp(-std/scale)` on NVS rows. (Targets variance, not the systematic bias — expected weakest.)
+**Honesty:** `nested_distance` selects the knob on an inner CV and scores on a held-out outer fold; the naive
+selection-maximized R² is reported alongside so the optimism gap is visible. All internal folds InChIKey-grouped.
+R² = squared Pearson (matches the plot). Mechanics unit-tested on synthetic public SMILES
+(`tests/test_nvs_subset_search.py`, 6 checks — no real data).
+
+**mdck pilot RAN and finished (2026-08-28 02:40) → `output/results/20260827_NVS_cellab/`** (levers
+`baseline,s1,s5`; taus 0.5/0.6/0.65/0.7/0.768/1.0; `s5_methods shift,affine`; seed 42; 107 internal,
+273,236 NVS). Artifacts: `summary.csv` (20 arms), `metrics_dict.pkl`, `preddfs/<arm>.parquet`, `folds.pkl`,
+`nvs_fold_distance.parquet`, `train_membership.pkl`, `arms.json`, `README.txt`. Verdict is written up in the
+deploy section above: **S1 τ=0.60 wins** (R²det 0.528 vs internal-only 0.474), S5 `shift`/`affine`
+bias-correction both HURT. S2/S3/nested were NOT part of this run.
+**CAUTION — `summary.csv` bookkeeping on `--resume`:** an arm whose `preddfs/<arm>.parquet` is reused gets an
+empty `record_list`, so its `n_train` falls back to 107 and `n_nvs_median` to 0 (see `S1_tau0.700/0.768/1.000`).
+The metrics in those rows are still correct (they come from the cached OOF pred_df); only the two count columns
+are wrong. Read the true counts from `train_membership.pkl` / `nvs_fold_distance.parquet`.
+
+## Model-family benchmark at NVS scale — LightGBM is the fast option, ElasticNet is not (2026-08-31)
+
+Question: which model family makes a full-NVS subset search affordable (the champion RF needs ~7 min per full
+fit, so a tau sweep is expensive)? Two scripts:
+- **`python/bench_rf_vs_en.py`** — pure TIMING probe on a **synthetic** sparse-binary matrix of the same shape
+  (no chemistry loaded; fit time depends on shape, not values). Times RF / ElasticNet / SGD-elasticnet at
+  growing row counts and extrapolates to 273,241 rows.
+- **`python/bench_models_transfer.py`** — the REAL measurement, transfer arm: train on the ENTIRE NVS pool,
+  predict internal (`--endpoint mdck`). Reports fit seconds + R² (Pearson²) + R²det per family.
+
+**Result (mdck, 273,236 NVS train → 107 internal test; `output/results/bench_models_transfer_mdck.csv`):**
+| model | fit_time_s | R²_pears | R²det |
+|-------|-----------:|---------:|------:|
+| RF champion (200 trees) | 440.5 | 0.407 | −3.569 |
+| RF small (50 trees) | 109.9 | 0.412 | −3.719 |
+| ElasticNet (scaled) | 1397.1 | 0.283 | −1.456 |
+| LightGBM (400×63 leaves) | **33.1** | 0.350 | −3.327 |
+
+Two conclusions:
+1. **Pure NVS→internal transfer is bias, not rank** — every family holds R²_pears ≈ 0.28–0.41 while R²det is
+   ≈ −1.5 to −3.7. This is the same failure mode the subset search targets, now measured without any internal
+   training rows at all. It confirms the 2026-07 source audit (NVS mdck is the wrong assay variant, shifted +1.6–1.9).
+2. **For search throughput use LightGBM** — 33 s, ~13× faster than the champion RF, with the same ranking
+   quality. **ElasticNet is refuted as the "cheap" option**: on the real dense 273k×4469 matrix it took 1397 s
+   (~3× SLOWER than the RF) and ranked worst. The synthetic timing extrapolation in `bench_rf_vs_en.py` does not
+   survive contact with the real matrix — trust `bench_models_transfer.py`.
+New dependency: `lightgbm==4.7.0` in `requirements.txt` (installed in `ML`; offline, no telemetry).
 
 ## Open / next
 
-- Prediction webapp: install fastapi+uvicorn into `ML`, then run + eyeball the grid on a real drop file.
-- Prediction webapp: move to CV-RMSE-calibrated confidence (see REMINDER above).
+- **mdck τ=0.60 is not banked yet** — run `python python/run_nvs_cellab.py --levers nested
+  --taus 0.5,0.55,0.6,0.65,0.7` for an honest (nested-CV) number + a fold-spread/bootstrap error bar.
+  Adopt "internal + nearest-shell NVS (dist<~0.6, ~100 cmpd, RAW)" only if honest R²det ≳ 0.50.
+- Run the S2 (scaffold) and S3 (weighting) levers for mdck; then repeat the whole search on the other
+  NVS-hurt endpoints (hlm, mlm, caco2).
+- Consider swapping the subset-search fitter to **LightGBM** for throughput (13× faster, same ranking).
+- **Re-deploy** the 8 RF champions after the InChIKey-grouped folds change — CV metrics and `conf_recal`
+  both move; delete the cached metrics pickles first, then restart the webapp so it reads the new bundles.
 - Write InChIKey-dedup loader to harmonize core sets to one logS table + report true unique count.
 - Convert PharmaBench log10 nM → logS (mol/L) for merge.
 - Decide intrinsic-S0 vs apparent-pH handling (pKa conversion vs model intrinsic).

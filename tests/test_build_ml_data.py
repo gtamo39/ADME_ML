@@ -129,3 +129,30 @@ def test_endpoint_dfs_transform_filter_concat_and_raw():
         md = data.dfs['mdck']
         assert set(md[md.source == 'internal']['compound']) == {'I1', 'I3'}
         assert set(md[md.source == 'EXP']['compound']) == {'P1', 'P2'}
+
+
+def test_grouped_folds_no_inchikey_twins_across_folds():
+    """DATA._grouped_folds keeps InChIKey twins in one fold, tests each compound once, and is deterministic.
+
+    Input: 40 internal compounds paired into 20 InChIKeys (twins), plus one twin pair with a missing key.
+    Expected: folds partition the set; no molecule (shared _ik) straddles train/test; same seed -> same folds.
+    Rationale: guards the anti-leakage grouped CV (config FOLD_GROUP_BY_INCHIKEY).
+    """
+    n = 40
+    comp = [f'SRB-{i:06d}-001' for i in range(n)]
+    ik = [f'IK{i // 2}' for i in range(n)]          # each InChIKey shared by 2 consecutive compounds (twins)
+    ik[0] = ik[1] = None                            # a twin pair with a missing key -> singleton groups
+    d = DATA()
+    d.internal = pd.DataFrame({'compound': comp, '_ik': ik})
+    folds = d._grouped_folds(n_splits=5, seed=42)
+
+    # every internal compound is tested exactly once (folds partition the set)
+    assert sorted(c for _, te in folds for c in te) == sorted(comp)
+    ikmap = dict(zip(comp, ik))
+    for tr, te in folds:
+        # no molecule's InChIKey appears in both train and test of a fold
+        te_iks = {ikmap[c] for c in te if ikmap[c] is not None}
+        tr_iks = {ikmap[c] for c in tr if ikmap[c] is not None}
+        assert te_iks.isdisjoint(tr_iks)
+    # same seed reproduces identical folds
+    assert d._grouped_folds(5, 42) == folds

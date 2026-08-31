@@ -39,3 +39,4 @@ py3Dmol==2.5.3      # 3D molecule viewer (visualization only; unused in the mode
 meeko==0.7.1        # docking prep (unused in the modelling sections; top-cell import only)
 gemmi==0.7.4        # meeko runtime dependency (install explicitly if meeko used --no-deps)
 python-pptx==1.0.2   # datasets/publication slides (python/make_datasets_slide.py)
+lightgbm==4.7.0     # fast gradient-boosted trees; model-family speed/accuracy benchmark (python/bench_models_transfer.py)

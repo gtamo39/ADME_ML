@@ -244,6 +244,27 @@ class DATA():
                 'R2_det': 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum(),
                 'RMSE': (((y - p) ** 2).mean()) ** 0.5}
 
+    def _grouped_folds(self, n_splits=5, seed=42):
+        """
+        -Build n_splits CV folds over self.internal, grouped by InChIKey so every twin of a molecule (same
+         _ik, different SMILES) shares a fold — a molecule never appears in both train and test. Keeps the
+         seed-determinism: unique groups are KFold-split (shuffled, seeded), then each compound inherits its
+         group's fold. Compounds with a missing InChIKey form their own singleton group.
+        param int n_splits: number of CV folds
+        param int seed: KFold shuffle seed (group-level, so reproducible)
+        return list: [[train_ids, test_ids], ...] over internal compound ids
+        """
+        # group id = InChIKey, or the compound id itself when the InChIKey is missing (singleton group)
+        g = self.internal._ik.where(self.internal._ik.notna(), self.internal.compound)
+        comp, grp = self.internal.compound.to_numpy(), g.to_numpy()
+        uniq = pd.unique(grp)
+        # assign each unique group to a test fold, then map every compound to its group's fold
+        fold_of = {}
+        for fnum, (_, te) in enumerate(KFold(n_splits, shuffle=True, random_state=seed).split(uniq)):
+            fold_of.update({uniq[j]: fnum for j in te})
+        cfold = np.array([fold_of[x] for x in grp])
+        return [[list(comp[cfold != f]), list(comp[cfold == f])] for f in range(n_splits)]
+
     def select_best_combo_and_update(self, params, k):
         """
         -Select the best public-source combo for endpoint k and build the id splits used by the prediction
@@ -261,9 +282,14 @@ class DATA():
         # public ids for the chosen combo + all internal ids
         self.pub_ids = self.pub.compound[self.pub.origin.isin(self.combo)].tolist()
         self.int_ids = self.internal.compound.to_numpy()
-        # 5-fold CV over internal; augmented reuses the folds with public added to TRAIN only (never test)
-        self.fold_ids = [[list(self.int_ids[tr]), list(self.int_ids[te])]
-                         for tr, te in KFold(5, shuffle=True, random_state=42).split(self.int_ids)]
+        # 5-fold CV over internal; augmented reuses the folds with public added to TRAIN only (never test).
+        # Group by InChIKey (config FOLD_GROUP_BY_INCHIKEY, default on) so a molecule's twins never straddle
+        # a train/test split (avoids optimistic leakage from near-duplicate internal analogs).
+        if getattr(params, 'FOLD_GROUP_BY_INCHIKEY', True):
+            self.fold_ids = self._grouped_folds(n_splits=5, seed=42)
+        else:
+            self.fold_ids = [[list(self.int_ids[tr]), list(self.int_ids[te])]
+                             for tr, te in KFold(5, shuffle=True, random_state=42).split(self.int_ids)]
         self.fold_ids_aug = [[tr + self.pub_ids, te] for tr, te in self.fold_ids]
         # 80/20 temporal split by SRB id order
         srb = self.internal.compound.str.extract(r'(\d+)')[0].astype(float).to_numpy()

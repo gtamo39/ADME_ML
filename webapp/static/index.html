@@ -38,23 +38,68 @@
 
   .legend{display:flex;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--muted);margin:18px 0 6px}
   .legend .sw{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:-1px;margin-right:5px}
+  .legend .bar{display:inline-block;width:110px;height:11px;border-radius:2px;vertical-align:-1px;margin:0 7px;border:1px solid var(--line)}
 
   .gridwrap{margin-top:14px;overflow-x:auto}
   table.grid{border-collapse:collapse;font-family:var(--mono);font-size:12px;white-space:nowrap}
   table.grid th{position:sticky;top:0;background:var(--card);text-align:left;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);font-weight:500;padding:8px 10px;border-bottom:2px solid var(--line);vertical-align:bottom}
   table.grid th.sortable{cursor:pointer;user-select:none} table.grid th.sortable:hover{color:var(--ember)}
+  table.grid th.selcol{width:34px;text-align:center}
+  td.sel{padding:0 6px !important;text-align:center}
+  input.rowsel,#selall{width:15px;height:15px;cursor:pointer;accent-color:var(--olive)}
+  .struct svg{cursor:zoom-in}
+
+  /* floating high-resolution structure preview on hover */
+  .preview{position:fixed;z-index:60;display:none;pointer-events:none;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:10px;box-shadow:0 18px 50px -20px rgba(43,39,35,.55)}
+  .preview svg{width:360px !important;height:auto !important;display:block}
   table.grid th .ar{color:var(--ember);font-size:9px;margin-left:4px;letter-spacing:0}
   table.grid th .u{display:block;color:#a49b8d;font-size:9.5px;text-transform:none;letter-spacing:0;margin-top:2px}
 
+  /* collapsible panel shell (MPO formula, filters) */
+  details.panel{margin-top:18px;background:#fffefb;border:1px solid var(--line);border-radius:10px}
+  details.panel>summary{list-style:none;cursor:pointer;display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:12px 16px;font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+  details.panel>summary::-webkit-details-marker{display:none}
+  details.panel>summary:hover{color:var(--ember)}
+  details.panel>summary .chev{color:var(--ember);font-size:9px;transition:transform .15s}
+  details.panel[open]>summary .chev{transform:rotate(90deg)}
+  details.panel .body{padding:0 16px 14px}
+  .panel .help{font-family:var(--mono);font-size:10.5px;color:#a49b8d;margin-top:9px;line-height:1.7}
+  .panel .help code{background:var(--paper);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink)}
+
   /* MPO formula field */
-  .mpo{margin-top:18px;background:#fffefb;border:1px solid var(--line);border-radius:10px;padding:14px 16px}
-  .mpo label{display:block;font-family:var(--mono);font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:8px}
   .mpo .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
   .mpo input{flex:1;min-width:280px;font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:8px;padding:9px 11px;background:var(--paper);color:var(--ink)}
   .mpo input:focus{outline:none;border-color:var(--azure)}
-  .mpostatus{font-family:var(--mono);font-size:11px;min-width:70px} .mpostatus.ok{color:var(--olive)} .mpostatus.err{color:var(--ember)}
-  .mpo .help{font-family:var(--mono);font-size:10.5px;color:#a49b8d;margin-top:9px;line-height:1.7}
-  .mpo .help code{background:var(--paper);border:1px solid var(--line);border-radius:4px;padding:1px 5px;color:var(--ink)}
+  .mpostatus{font-family:var(--mono);font-size:11px;letter-spacing:0;text-transform:none}
+  .mpostatus.ok{color:var(--olive)} .mpostatus.err{color:var(--ember)}
+
+  /* filter term builder (one row per term) */
+  .filters .mode{display:flex;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;color:var(--muted);margin-bottom:10px}
+  .filters .term{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .filters select,.filters input{font-family:var(--mono);font-size:12px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:var(--paper);color:var(--ink)}
+  .filters select:focus,.filters input:focus{outline:none;border-color:var(--azure)}
+  .filters select.fld{min-width:220px} .filters select.op{width:66px} .filters input.val{width:120px}
+  .filters input.val.err{border-color:var(--ember);background:#fdf0ec}
+  .panel .lnk{appearance:none;border:none;background:none;cursor:pointer;font-family:var(--mono);font-size:12px;padding:4px 2px}
+  .panel .lnk:hover{text-decoration:underline}
+  .panel .rm{color:var(--ember)} .panel .add{color:var(--azure)}
+  .panel .foot{display:flex;gap:18px;align-items:center;flex-wrap:wrap;margin-top:2px}
+  .filterstatus{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:0;text-transform:none}
+  .filterstatus.on{color:var(--olive)}
+
+  /* column show/hide checkboxes */
+  .cols{display:flex;flex-wrap:wrap;gap:7px 20px}
+  .colchk{display:flex;align-items:center;gap:7px;font-family:var(--mono);font-size:11.5px;color:var(--ink);min-width:150px;cursor:pointer}
+  .colchk input{width:14px;height:14px;accent-color:var(--olive);cursor:pointer}
+
+  /* color pickers */
+  .swatches{display:flex;flex-wrap:wrap;gap:12px 24px}
+  .swatches label{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  .swatches input[type=color]{width:40px;height:26px;padding:0;border:1px solid var(--line);border-radius:6px;background:var(--paper);cursor:pointer}
+  .sharprow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:16px;font-family:var(--mono);font-size:11.5px;color:var(--muted)}
+  .sharprow input[type=range]{width:210px;accent-color:var(--olive);cursor:pointer}
+  .sharprow #sharpval{color:var(--ink);min-width:30px}
   .mpocell{font-family:var(--mono);font-size:12px;font-weight:600;color:#1f1b17;text-align:right;padding:0 10px;min-width:56px}
   table.grid td{border-bottom:1px solid var(--line);border-left:1px solid #efeadf;padding:0}
   table.grid td.meta{padding:7px 10px;vertical-align:middle}
@@ -82,7 +127,7 @@
 </head>
 <body>
 <div class="wrap">
-  <p class="eyebrow">ADME_ML · champion RF (H236) · local only</p>
+  <p class="eyebrow">ADME_ML · RF (H237) · conf_recal · local only</p>
   <h1>ADME property prediction</h1>
   <p class="lede">Drop an <b>SDF</b> or <b>CSV</b> of compounds with SMILES. Every compound is scored by the 8 champion single-task RF models in the MLTrail vault. Each endpoint cell is split on the diagonal: the <b>lower-left</b> shows the predicted value (colored by triage cutoff), the <b>upper-right</b> shows the RF confidence.</p>
 
@@ -100,11 +145,11 @@
       <span class="status" id="status">idle</span>
     </div>
 
-    <div class="mpo">
-      <label for="mpo">MPO score — weighted formula (edit to retune; the grid updates live)</label>
+    <details class="panel mpo" id="mpobox">
+      <summary><span class="chev">▶</span> MPO score — weighted formula <span class="mpostatus" id="mpostatus"></span></summary>
+      <div class="body">
       <div class="row">
         <input id="mpo" type="text" spellcheck="false" placeholder="mean(d('logd'), d('solubility'), …)">
-        <span class="mpostatus" id="mpostatus"></span>
       </div>
       <div class="help">
         <code>logd</code> = raw predicted value ·
@@ -116,13 +161,85 @@
         Helpers <code>mean(…)</code> <code>min max clamp exp log abs pow</code>.
         Example: <code>0.4*sigmoid('logd',3) + 0.3*sigmoid('solubility',10) + 0.3*sigmoid('hlm',12)</code>
       </div>
-    </div>
+      </div>
+    </details>
+
+    <details class="panel filters" id="filterbox" open>
+      <summary><span class="chev">▶</span> Filters <span class="filterstatus" id="filterstatus"></span></summary>
+      <div class="body">
+        <div class="mode">
+          <span>show a compound when it passes</span>
+          <select id="filtermode">
+            <option value="all">all terms</option>
+            <option value="any">any term</option>
+          </select>
+        </div>
+        <div id="filterrows"></div>
+        <div class="foot">
+          <button class="lnk add" id="addterm">⊕ Add a term</button>
+          <button class="lnk rm" id="clearterms">⊖ Clear all terms</button>
+        </div>
+        <div class="help">
+          A term reads <code>property</code> <code>operator</code> <code>value</code> — e.g. <code>mdck &gt; 1</code>,
+          <code>solubility &gt; 10</code>, <code>solubility_conf &gt; 0.5</code>. The grid updates on every keystroke.
+          Properties: each endpoint (raw predicted value), each <code>&lt;endpoint&gt;_conf</code> (RF confidence 0–1),
+          plus <code>MPO</code> and the manual <code>Score</code> column.
+          An incomplete term is ignored. A compound with no value for the property fails the term.
+          Filtering only HIDES rows — it never re-scores them, and the CSV download takes the visible selected rows.
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" id="colsbox">
+      <summary><span class="chev">▶</span> Columns <span class="filterstatus" id="colstatus"></span></summary>
+      <div class="body">
+        <div class="cols" id="colrows"></div>
+        <div class="foot" style="margin-top:10px">
+          <button class="lnk add" id="showallcols">⊕ Show all</button>
+          <button class="lnk rm" id="hideallcols">⊖ Hide all endpoints</button>
+        </div>
+        <div class="help">
+          Unticking a column only hides it in the grid. Hidden columns are still scored, still filterable,
+          and <b>still written to the downloaded CSV</b>.
+        </div>
+      </div>
+    </details>
+
+    <details class="panel" id="colorbox">
+      <summary><span class="chev">▶</span> Colors <span class="filterstatus" id="colorstatus"></span></summary>
+      <div class="body">
+        <div class="swatches">
+          <label>favorable value <input type="color" id="c_fav"></label>
+          <label>unfavorable value <input type="color" id="c_unfav"></label>
+          <label>confidence above split <input type="color" id="c_azure"></label>
+          <label>confidence below split <input type="color" id="c_ember"></label>
+        </div>
+        <div class="sharprow">
+          <span>value fade</span>
+          <span>smoother</span>
+          <input type="range" id="c_sharp" min="0.25" max="4" step="0.25" value="1">
+          <span>harder</span>
+          <span id="sharpval">1</span>
+        </div>
+        <div class="foot" style="margin-top:12px">
+          <button class="lnk rm" id="resetcolors">⟲ Reset to the SERAC defaults</button>
+        </div>
+        <div class="help">
+          Defaults are the SERAC palette from <code>config.yaml</code>: olive <code>#74B24A</code> (favorable),
+          azure <code>#0EA5CE</code> (confidence above the split) and ember <code>#E65D32</code> (confidence below it).
+          The MPO column follows the favorable color. A color choice lasts for this page load only.
+          <br>The value triangle <b>fades</b> instead of switching: it is pale at the triage cutoff and saturates as the
+          prediction moves away from it, in the endpoint's modelling space (per log unit for a log endpoint).
+          <code>value fade</code> scales that steepness — left is a smoother ramp, right is closer to a hard cutoff.
+          The per-column default comes from <code>webapp.color_slope</code> in the config.
+        </div>
+      </div>
+    </details>
 
     <div class="legend" id="legend" style="display:none">
-      <span><span class="sw" style="background:#74b24a"></span>favorable</span>
-      <span><span class="sw" style="background:#c94c3c"></span>unfavorable</span>
-      <span><span class="sw" style="background:#0ea5ce"></span>confidence &gt; 0.5</span>
-      <span><span class="sw" style="background:#e65d32"></span>confidence ≤ 0.5</span>
+      <span>unfavorable<span class="bar" id="l_bar"></span>favorable <em style="font-style:normal;color:#a49b8d">(pale = at the cutoff)</em></span>
+      <span><span class="sw" id="l_azure" style="background:#0ea5ce"></span>confidence &gt; 0.5</span>
+      <span><span class="sw" id="l_ember" style="background:#e65d32"></span>confidence ≤ 0.5</span>
     </div>
 
     <div class="gridwrap"><table class="grid" id="grid"></table></div>
@@ -132,6 +249,7 @@
 
   <footer id="foot">bind 127.0.0.1 · MLTrail vault</footer>
 </div>
-<script src="/static/app.js?v=2026-08-26"></script>
+<div class="preview" id="preview"></div>
+<script src="/static/app.js?v=2026-08-31c"></script>
 </body>
 </html>

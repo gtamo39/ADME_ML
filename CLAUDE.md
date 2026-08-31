@@ -198,6 +198,47 @@ If a tool would meaningfully accelerate the work but only runs as a hosted API, 
 3. Add unit tests that mirror the notebook cells
 4. Update documentation
 
+### How to run the tests (ADME_ML)
+
+- The suite uses the stdlib `unittest` module. Do not add a `pytest` dependency.
+- Run from the repo root in the `ML` env: `python -m unittest discover -s tests`
+- Build test data from a small local subset or from synthetic rows. Do not print real values.
+
+---
+
+## Project Specifics — ADME_ML
+
+### Environment
+
+- Run all Python in the **`ML` conda env**: `~/miniconda3/envs/ML/bin/python` (or `conda run -n ML python`).
+- The `ML` env has mltrail, rdkit, sklearn, lightgbm, descriptastorus, fastapi and uvicorn.
+- Chemprop has its own env. The base env stays untouched.
+
+### Structure of a runnable script
+
+- Use the class shape **`PARAMS` / `DATA` / `OUTPUT` / `MAIN`** for every new runner in `python/`.
+- `PARAMS(config_path)` reads the YAML. `DATA` methods take `params` and store state on `self`.
+- `OUTPUT` methods take `(data, params)`. `MAIN` wires the three. `argparse` lives in `MAIN` only.
+- Method bodies use `self.*` / `data.*` / `params.*`. Do not use bare globals.
+- The notebook imports the same classes, so the CLI and the notebook run identical code.
+
+### Long jobs
+
+CAUTION: An SSH drop can kill an interactive kernel and lose hours of compute.
+
+- Run a long job detached, with `screen` or `nohup`, and `tee` the log to `output/`.
+- Write each result to disk the moment it is ready. Do not hold results in memory until the end.
+- Give every long runner a `--resume` flag that skips the work already on disk.
+
+### How to report results
+
+Use a markdown table with these columns, in this order, unless the user asks for something different:
+
+`endpoint | previous unswept R²det | new swept R²det | previous unswept R² | new swept R² | what the sweep changed`
+
+- **R²det** is the coefficient of determination. It is calibration-sensitive and it is the selection metric.
+- **R²** is the squared Pearson value. It is affine-invariant, so it hides a calibration error.
+
 ---
 
 ## Communication Preferences

@@ -210,6 +210,7 @@ BEST_PUBLIC:
 ## ---- ML model training and deployment ---- ##
 MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
 METRICS_PKL_DIR: 'output/results/20260825_metrics/'   # OUTPUT.assess_predictions writes <k>.pkl here (per-endpoint arms)
+FOLD_GROUP_BY_INCHIKEY: true   # CV folds grouped by InChIKey so a molecule's twins never split across train/test (anti-leakage)
 
 # OUTPUT.deploy_all_endpoints — fit the deployable RF (internal + BEST_PUBLIC public) and register to MLTrail.
 DEPLOY:
@@ -224,6 +225,7 @@ webapp:
   port: 8050
   endpoint_order: [solubility, logd, mdck, hlm, mlm, rlm, caco2, ppb]   # column order in the grid
   confidence_split: 0.5            # confidence > split -> azure, <= split -> ember (diverging gradient)
+  color_slope: 2.0                 # value-fade steepness per modelling-space unit from the cutoff (higher = harder edge)
   cutoffs:                         # raw-unit triage cutoff + the comparison that means FAVORABLE
     solubility: {value: 10, favorable: '>='}   # uM
     logd:       {value: 3,  favorable: '<'}     # logD7.4 sweet-spot upper bound
@@ -233,4 +235,12 @@ webapp:
     caco2:      {value: 10, favorable: '>='}    # 1e-6 cm/s
     mdck:       {value: 10, favorable: '>='}    # 1e-6 cm/s
     ppb:        {value: 1,  favorable: '<'}     # % unbound
+  # Extra MLTrail models shown as their own grid column. NOT part of the MPO formula scope.
+  extra_models:
+    - key: px_activity                  # column key; also <key>_pred / <key>_conf in filters + the CSV
+      model_id: 19                      # MLTrail id: Px_activity_1_12_rf_H237 (single_task_classification, H237)
+      label: Px activity                # column header
+      unit: 'P(1 <= n_down <= 12)'      # header subtitle — probability of the single/low-activity class
+      threshold: 0.5                    # probability >= threshold counts as favorable (green)
+      color_slope: 8.0                  # steeper fade: a probability moves at most 0.5 from the threshold
 
