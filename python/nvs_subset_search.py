@@ -45,20 +45,28 @@ def _iqr(v):
 class NVSSubsetSearch:
     """Subset/label-repair search over the NVS augmentation pool for one internal endpoint."""
 
-    def __init__(self, data, output, params, endpoint='mdck', seed=42, radius=2, n_bits=2048, learner='rf'):
+    def __init__(self, data, output, params, endpoint='mdck', seed=42, radius=2, n_bits=2048, learner='rf', pool='combo'):
         """
         param DATA data: built for `endpoint` (build_ML_data + get_internal_public_sets + select_best_combo).
         param OUTPUT output: supplies make_model() (the champion RF).
         param PARAMS params: config (RF_SINGLETASK, ADME_ENDPOINTS).
         param str endpoint: endpoint key (pilot 'mdck').
         param str learner: base model — 'rf' (champion), 'rf50' (fast RF), 'lgbm' (LightGBM, high-throughput).
+        param pool: public augmentation pool — 'combo' (the selected best-combo origins, deploy default),
+                    'all' (every public compound, origin-agnostic near-shell search), or an explicit origin list.
         """
         self.data, self.output, self.params, self.k, self.seed, self.learner = data, output, params, endpoint, seed, learner
         # feature columns = modelling frame minus id/label/meta
         self.feats = [c for c in data.d.columns if c not in COL2RM]
-        # internal rows (CV target) and the NVS augmentation pool (the selected combo, public non-twins)
+        # internal rows (CV target) and the public augmentation pool
         self.internal = data.internal.reset_index(drop=True)
-        self.nvs = data.pub[data.pub.origin.isin(data.combo)].reset_index(drop=True)
+        if pool == 'all':
+            self.nvs = data.pub.reset_index(drop=True)
+        elif pool == 'combo':
+            self.nvs = data.pub[data.pub.origin.isin(data.combo)].reset_index(drop=True)
+        else:
+            origins = pool if isinstance(pool, (list, tuple, set)) else [pool]
+            self.nvs = data.pub[data.pub.origin.isin(origins)].reset_index(drop=True)
         self.int_ids, self.nvs_ids = list(self.internal.compound), list(self.nvs.compound)
         # frames indexed by compound for fast row lookup during fits
         self._byid = data.d.set_index('compound')

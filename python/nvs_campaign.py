@@ -105,6 +105,38 @@ def sel_lowunc(s, tr, tau):
     return [c for c in add if np.isfinite(s._unc[s._nvs_pos[c]]) and s._unc[s._nvs_pos[c]] < thr]
 
 
+def sel_mnn(s, tr, k):
+    """Mutual/symmetric kNN (Gowda & Krishna 1979): keep NVS j only when some internal i is BOTH among j's k
+    nearest internal-train AND has j among ITS k nearest NVS. A reciprocal, denoised local augmentation."""
+    rows = [s._int_pos[c] for c in tr]
+    sub = s._sim[rows]                                       # (n_train_internal, n_nvs)
+    kk = min(k, sub.shape[1] - 1)
+    int_to_nvs = [set(np.argpartition(-r, kk)[:kk].tolist()) for r in sub]   # each internal's k nearest NVS
+    keep = set()
+    for i in range(len(rows)):
+        for j in int_to_nvs[i]:
+            col = sub[:, j]
+            if i in np.argpartition(-col, min(k, len(col) - 1))[:k]:         # i among j's k nearest internal
+                keep.add(j)
+    return [s.nvs_ids[j] for j in keep]
+
+
+def wilson_edit(s, tr, add, k=3, delta=1.0):
+    """Wilson editing / ENN (Wilson 1972): drop each added NVS whose label disagrees by > delta with the mean
+    label of its k nearest INTERNAL-train compounds. Leakage-free label denoising (uses train internal only)."""
+    if not add:
+        return []
+    rows = [s._int_pos[c] for c in tr]
+    yint = s._byid.loc[list(tr), 'label'].to_numpy(float)
+    sub = s._sim[rows]
+    keep = []
+    for c in add:
+        nn = np.argpartition(-sub[:, s._nvs_pos[c]], min(k, len(rows) - 1))[:k]
+        if abs(float(s._byid.loc[c, 'label']) - yint[nn].mean()) < delta:
+            keep.append(c)
+    return keep
+
+
 def w_sim(s, tr, add):
     """Importance weight = max Tanimoto similarity of each NVS to the train fold."""
     rows = [s._int_pos[c] for c in tr]
@@ -136,8 +168,12 @@ def build_strategies():
     S.append(('all_nvs', lambda s, tr: (list(s.nvs_ids), None, None)))
     for tau in (0.50, 0.55, 0.60, 0.65, 0.70):
         S.append((f'dist_{tau:.2f}', lambda s, tr, _t=tau: (sel_dist(s, tr, _t), None, None)))
-    for k in (1, 5, 20, 50):
+    for k in (1, 2, 3, 5, 20, 50):
         S.append((f'knn_{k}', lambda s, tr, _k=k: (sel_knn(s, tr, _k), None, None)))
+    for k in (3, 5):
+        S.append((f'mnn_{k}', lambda s, tr, _k=k: (sel_mnn(s, tr, _k), None, None)))
+    S.append(('enn_0.60', lambda s, tr: (wilson_edit(s, tr, sel_dist(s, tr, 0.60)), None, None)))
+    S.append(('knn1_enn', lambda s, tr: (wilson_edit(s, tr, sel_knn(s, tr, 1)), None, None)))
     S.append(('distw_0.70', lambda s, tr: ((a := sel_dist(s, tr, 0.70)), w_sim(s, tr, a), None)))
     S.append(('distw_1.00', lambda s, tr: ((a := list(s.nvs_ids)), w_sim(s, tr, a), None)))
     S.append(('expw_0.70', lambda s, tr: ((a := sel_dist(s, tr, 0.70)), w_expsim(s, tr, a), None)))
@@ -151,6 +187,14 @@ def build_strategies():
     S.append(('knn20_simw', lambda s, tr: ((a := sel_knn(s, tr, 20)), w_sim(s, tr, a), None)))
     S.append(('dist060_agree', lambda s, tr: (sel_agree(s, tr, 0.60, 1.0), None, None)))
     return S
+
+
+# focused tight-selection set for the RF-vs-LightGBM head-to-head compare
+DEFAULT_COMPARE = ['internal_only', 'knn_1', 'knn_2', 'knn_3', 'dist_0.60', 'dist_0.65',
+                   'mnn_3', 'mnn_5', 'enn_0.60', 'knn1_enn', 'dist060_agree']
+
+# tight family that survived the compare -> the pool for the honest nested verdict (include internal_only as a choice)
+NESTED_TIGHT = ['internal_only', 'enn_0.60', 'dist060_agree', 'dist_0.60', 'knn_1', 'dist_0.65']
 
 
 # ---------- evaluation ----------
@@ -203,6 +247,12 @@ def main():
     ap.add_argument('--min_n', type=int, default=1000)
     ap.add_argument('--seed', type=int, default=42)
     ap.add_argument('--resume', action='store_true')
+    ap.add_argument('--compare', action='store_true',
+                    help="focused head-to-head: score --strategies under BOTH --compare_learners (R2 + R2det each)")
+    ap.add_argument('--nested_only', action='store_true',
+                    help="honest nested-CV verdict over --strategies (default the tight family) with --learner")
+    ap.add_argument('--strategies', default='', help="comma list for --compare / --nested_only (else the default set)")
+    ap.add_argument('--compare_learners', default='rf,lgbm', help="learners for --compare mode")
     args = ap.parse_args()
 
     # build the endpoint sets + the LightGBM-driven search
@@ -216,15 +266,64 @@ def main():
     output = OUTPUT(params)
     s = NVSSubsetSearch(data, output, params, endpoint=ep, seed=args.seed, learner=args.learner)
     print(f"> {ep}: internal={len(s.int_ids)} nvs={len(s.nvs_ids)} | learner={args.learner}", flush=True)
-    # within-NVS uncertainty (once) for the lowunc strategy
-    s._unc = s.nvs_uncertainty()
 
     strategies = build_strategies()
     strat_map = dict(strategies)
     folds = s._grouped_folds(s.int_ids)
 
+    # names that will actually run this session -> only pay for uncertainty if a 'lowunc' strategy needs it
+    if args.strategies:
+        run_names = args.strategies.split(',')
+    elif args.compare:
+        run_names = DEFAULT_COMPARE
+    elif args.nested_only:
+        run_names = NESTED_TIGHT
+    else:
+        run_names = [n for n, _ in strategies]
+    s._unc = s.nvs_uncertainty() if any('lowunc' in n for n in run_names) else None
+
     out = args.outdir
     os.makedirs(out, exist_ok=True)
+
+    # ---- honest nested-CV verdict over a chosen strategy pool, under --learner (RF or lgbm) ----
+    if args.nested_only:
+        base = grouped_eval(s, strat_map['internal_only'], folds)[1]      # internal-only grouped-CV R2det
+        nested = nested_select(s, strat_map, run_names)
+        summary = {'endpoint': ep, 'learner': args.learner, 'pool': run_names,
+                   'internal_only_r2det': round(base, 4), 'nested': nested}
+        json.dump(summary, open(os.path.join(out, f'nested_{args.learner}_{ep}.json'), 'w'), indent=2, default=float)
+        print(f"\n===== NESTED VERDICT ({ep}, {args.learner}) =====")
+        print(f"pool                = {run_names}")
+        print(f"internal_only R2det = {base:.3f}")
+        print(f"HONEST nested R2det = {nested['honest_r2det']:.3f}  (r2={nested['honest_r2']:.3f})")
+        print(f"fold winners        = {nested['fold_winners']}")
+        print(f"  -> {'BEATS' if nested['honest_r2det'] > base else 'does NOT beat'} internal-only ({base:.3f})")
+        print(f"\n-> {out}/nested_{args.learner}_{ep}.json")
+        return
+
+    # ---- focused head-to-head: each strategy under BOTH learners, R2 + R2det side by side ----
+    if args.compare:
+        learners = args.compare_learners.split(',')
+        rows = []
+        for name in tqdm(run_names, desc='compare'):
+            rec = {'strategy': name}
+            for L in learners:
+                s.learner = L
+                t = time.perf_counter()
+                r2, r2det, n_nvs, _ = grouped_eval(s, strat_map[name], folds)
+                rec['n_nvs'] = n_nvs
+                rec[f'{L}_r2'], rec[f'{L}_r2det'] = round(r2, 4), round(r2det, 4)
+                rec[f'{L}_sec'] = round(time.perf_counter() - t, 1)
+            rows.append(rec)
+            tqdm.write(f'  {name:16} n_nvs={rec["n_nvs"]:<6} '
+                       + '  '.join(f'{L}: R2={rec[f"{L}_r2"]:.3f} R2det={rec[f"{L}_r2det"]:.3f}' for L in learners))
+        tbl = pd.DataFrame(rows).sort_values(f'{learners[-1]}_r2det', ascending=False).reset_index(drop=True)
+        tbl.to_csv(os.path.join(out, f'compare_{ep}.csv'), index=False)
+        print(f"\n===== COMPARE (" + ep + ", augmented grouped-CV, " + '+'.join(learners) + ") =====")
+        print(tbl.to_string(index=False))
+        print(f"\n-> {out}/compare_{ep}.csv")
+        return
+
     os.makedirs(os.path.join(out, 'preddfs'), exist_ok=True)
     csv = os.path.join(out, f'campaign_{ep}.csv')
     done = set(pd.read_csv(csv)['strategy']) if (args.resume and os.path.exists(csv)) else set()

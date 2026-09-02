@@ -261,27 +261,6 @@ to `preddfs/<arm>.parquet`, and full training-set membership: `folds.pkl` (inter
 Module gained `cv_preddf` (returns the OOF frame) and `nested_distance` now returns its `preddf`; both tested. Run
 detached (screen/nohup). NVS pool for mdck is large — `all_nvs` + sweeps are the heavy part; start `baseline,s1`.
 
-**Interim mdck result (2026-08-27, ~partial run).** internal=107, NVS(Novartis-NIBR)=273,241; NVS→internal distance
-is broadly far (10th pct ≈ 0.768, i.e. max Tanimoto ≈ 0.23). Negative transfer confirmed and it is **bias, not rank**:
-`r2` (Pearson²) barely moves across arms (~0.44–0.49) while **R²det collapses** internal-only 0.474 → all-NVS 0.134
-(RMSE 0.429 → 0.551 log10). Distance lever monotone: less/closer NVS = less damage; the nearest ~1.3k (τ=0.70,
-sim>0.30) nudges r2 to 0.493 (>0.475) but R²det 0.403 still < internal-only — a tight near-shell helps ranking,
-not the bias-sensitive metric. So distance filtering cannot beat internal-only; **bias-correction is the lever that
-targets the actual failure mode.**
-
-**mdck UPDATE — a tight near-shell BEATS internal-only; bias-correction refuted (2026-08-27).** Re-running S1 on a
-tight grid found the sweet spot the coarse grid (≥0.768) had missed: R²det vs τ is an inverted-U peaking at
-**τ=0.60** (nearest ~101 NVS): internal-only 0.474 → **0.528** (RMSE 0.429 → 0.407, r2 0.475 → 0.536). τ=0.50 0.497,
-τ=0.65 0.501, τ=0.70 0.403, τ=0.768 0.231, τ=1.0 0.140. So a small raw near-shell of Novartis (~100 close analogs,
-sim>~0.4) genuinely improves mdck — distance filtering, not bias-correction, is the winning lever (my earlier
-"distance can't beat internal-only" was a coarse-grid artifact). **`shift` bias-correction HURTS** (τ0.6 0.478, τ0.65
-0.109, τ0.70 −0.085): matching medians conflates true population difference with label bias and stamps a large wrong
-offset — the close labels are already usable raw, global recalibration corrupts them. `affine` behaves the same
-(τ0.5 0.483, τ0.6 0.404, τ0.65 0.155, τ0.7 −0.203, all −0.221) — both corrections refuted. S1 window τ0.5–0.65 ALL
-beat internal-only (0.497/0.528/0.501); peak τ=0.60. **Not yet banked:** τ=0.60 was selected on the same 107
-compounds; validate with nested CV (`--levers nested --taus 0.5,0.55,0.6,0.65,0.7`) — adopt "internal + nearest-shell
-NVS (dist<~0.6, ~100 cmpd, RAW)" only if honest R²det ≳ 0.50; also get a fold-spread/bootstrap error bar (effect ~+0.05).
-
 **Model-family speed/accuracy benchmark (2026-08-27, `python/bench_models_transfer.py`; transfer: train all 273k NVS
 → predict 107 internal mdck).** fit-time | R2_pears | R2det: **LightGBM 33s | 0.350 | −3.33**; RF-50 110s | 0.412 |
 −3.72; RF-200 (champion) 440s | 0.407 | −3.57; **ElasticNet 1397s | 0.283 | −1.46**. Conclusions: **LightGBM is ~13×
@@ -302,7 +281,81 @@ weighting `distw/expw`, classifier density-ratio `clfw`, support/range matching 
 with a BEATS/does-not-beat internal-only verdict); huge-subset strategies excluded from nested (`--nested_max_nvs`).
 `NVSSubsetSearch` gained a `learner` switch (`rf`/`rf50`/`lgbm`, via `_make`) and float32 fits (halves RAM on 273k).
 Crash-safe/resumable; outputs `campaign_<ep>.csv`, `rf_check_<ep>.csv`, `summary_<ep>.json`, per-strategy preddf parquets.
-Run detached (screen). Tested on synthetic data (all strategy families + nested). Real mdck run: pending.
+Run detached (screen). Tested on synthetic data (all strategy families + nested).
+
+**Campaign extended — new strategies + RF-vs-LightGBM compare mode (2026-08-31).** Added `knn_2`/`knn_3` and three
+noisy-source-transfer strategies: `mnn_k` (mutual/symmetric kNN, Gowda & Krishna 1979 — reciprocal NN, denoised),
+`enn_0.60` (Wilson-edited near-shell, Wilson 1972 ENN — drop NVS whose label disagrees > delta with its k nearest
+INTERNAL neighbours; apt as NVS labels are predicted), `knn1_enn` (knn_1 then Wilson-edit). New `--compare` mode scores a
+focused `--strategies` list under BOTH `--compare_learners rf,lgbm`, emitting `compare_<ep>.csv` with R2 + R2det per
+learner (the augmented grouped-CV protocol = grouped_eval). Uncertainty precompute now lazy (only if a `lowunc` strategy
+runs). `python/nvs_campaign.py --endpoint mdck --compare`. Synthetic-tested (both learners, all new primitives).
+
+**Generalized near-shell search to ALL 8 endpoints (2026-08-31, `python/run_adme_nearshell.py`).** The near-shell
+question is universal (does a tight, denoised public shell beat internal-only?), not NVS-specific. `NVSSubsetSearch`
+gained a `pool` param: `'combo'` (deploy default = selected best-combo origins), **`'all'` (every public compound,
+origin-agnostic)**, or an origin list — needed because most endpoints' best combo is internal-only (empty pool). New
+driver builds the 369k H237 matrix ONCE, then loops solubility/logd/hlm/mlm/rlm/caco2/mdck/ppb: per endpoint runs
+`compare` (DEFAULT_COMPARE under RF+LightGBM) + honest `nested` (RF over NESTED_TIGHT) on the FULL public pool, writes
+`compare_<ep>.csv` + `nested_rf_<ep>.json`, and a cross-endpoint `summary_all.csv` (ep | internal_rf_r2det | best
+strategy | nested_rf_r2det | beats_internal). `--min_n 200` (keeps small experimental origins), `--resume` (skip
+endpoints already done), aggregate-only. Synthetic-tested (pool=all, compare both learners, nested).
+
+**★ NEAR-SHELL — AUTHORITATIVE RESULTS (2026-09-02). Supersedes and replaces all earlier near-shell result entries.**
+Single protocol throughout: internal CV / augmented CV / transfer from **`output/results/20260825_metrics/<ep>.pkl`**
+(`<ep>_{internal_cv,augmented_cv,ext_->_internal}_metrics`; this is the source of the notebook grouped-bar plot);
+near-shell = honest **nested** RF from `output/results/20260831_ADME_nearshell/nested_rf_<ep>.json` (strategy chosen on
+INNER folds, scored on held-out OUTER fold; InChIKey-grouped, pool='all'). Cross-check: the pkl `internal_cv` r2 matches
+the near-shell run's `internal_only` rf_r2 to 3 dp, so the columns are comparable.
+
+R2 (squared Pearson):
+| endpoint | n | transfer | internal CV | augmented CV | near-shell (nested) | best | near-shell strategy (only when winner) |
+|----------|---|----------|-------------|--------------|---------------------|------|----------------------------------------|
+| solubility | 120 | 0.574 | 0.680 | **0.738** | 0.689 | augmented | — |
+| logd | 317 | 0.608 | 0.822 | 0.812 | **0.824** | near-shell | knn_1 (128 added, 3/5 folds) |
+| mdck | 107 | 0.411 | 0.475 | 0.439 | **0.542** | near-shell | dist060_agree (85 added, 3/5 folds) |
+| hlm | 324 | 0.174 | **0.587** | 0.498 | **0.587** | internal / near-shell (tie) | internal_only (0 added, 5/5 folds) |
+| mlm | 324 | 0.288 | **0.664** | 0.554 | 0.637 | internal | — |
+| rlm | 39 | 0.176 | 0.109 | **0.298** | 0.078 | augmented | — |
+| caco2 | 95 | 0.529 | **0.765** | 0.534 | **0.765** | internal / near-shell (tie) | internal_only (0 added, 5/5 folds) |
+| ppb | 69 | 0.088 | 0.460 | **0.548** | 0.464 | augmented | — |
+
+R2det (the selection metric) — with the augmented arm's calibration gap (= pearson_r2 - r2det):
+| endpoint | internal CV | augmented CV | calib gap | near-shell (nested) | best | near-shell strategy (only when winner) |
+|----------|-------------|--------------|-----------|---------------------|------|----------------------------------------|
+| solubility | 0.678 | **0.731** | 0.007 | 0.688 | augmented | — |
+| logd | **0.820** | 0.803 | 0.009 | **0.820** | internal / near-shell (tie) | knn_1 (128 added, 3/5 folds) |
+| mdck | 0.474 | 0.134 | **0.305** | **0.539** | **near-shell** | dist060_agree (85 added, 3/5 folds) |
+| hlm | **0.576** | 0.373 | 0.125 | **0.576** | internal / near-shell (tie) | internal_only (0 added, 5/5 folds) |
+| mlm | **0.649** | 0.464 | 0.090 | 0.629 | internal | — |
+| rlm | **0.107** | -0.185 | **0.483** | 0.057 | internal | — |
+| caco2 | **0.757** | 0.285 | 0.249 | **0.757** | internal / near-shell (tie) | internal_only (0 added, 5/5 folds) |
+| ppb | 0.435 | **0.537** | 0.011 | 0.455 | augmented | — |
+
+**THE LAW — calib_gap splits endpoints by PUBLIC DATA TYPE, with no overlap:** gap ~0.01 for solubility/ppb/logd
+(**experimental** EXP public) vs 0.09-0.48 for mdck/rlm/caco2/hlm/mlm (**predicted** NVS/ADM). **Augmenting with
+EXPERIMENTAL public data works; augmenting with PREDICTED public data introduces systematic bias.** Pearson r2 is
+affine-invariant so it HIDES this (the plot's augmented bars look harmless/good); R2det charges for the offset.
+
+**Near-shell earns its place exactly ONCE.** Of 8 endpoints: **1 real win — mdck (0.134 -> 0.539 R2det** via
+`dist060_agree`, ~85 added compounds, i.e. **0.026% of the 330,768-compound pool**; all 5 outer folds chose a DENOISED
+shell, none a raw one); 2 self-declines to internal_only (hlm, caco2 — nested picked internal_only 5/5, so the "tie" is
+near-shell voluntarily adding nothing); 1 tie of no practical value (logd, +0.002); 2 losses to full experimental
+augmentation (solubility, ppb); 2 losses to internal-only (mlm -0.020, rlm -0.050).
+
+**REVISED DEPLOY POLICY:** solubility + ppb = **full augmented** (experimental public — config already correct);
+mdck = **near-shell `dist060_agree` (~85 cmpd)**, the one change vs the deployed `mdck:[NVS]` (all 330k);
+logd = internal-only (near-shell ties, not worth complexity); hlm / mlm / caco2 / rlm = **internal-only**.
+rlm needs real experimental data, not instance selection (n_int=39, internal R2det 0.107).
+
+**Durable methodological conclusions (keep, do not re-test):** (1) **bias-correction is REFUTED** — `shift` and
+`affine` recalibration of public labels HURT (matching medians conflates true population difference with label bias and
+stamps a wrong offset; close labels are usable raw). (2) **mutual-kNN (`mnn_*`) and `knn_k>1` are OUT** — they top
+Level-1 bake-offs then win ZERO nested folds (fold-noise overfitting). (3) **LightGBM is a valid 13x-faster screen**
+(rankings track champion RF), but RF's internal-only baseline is much stronger, so gains are smaller in absolute terms.
+(4) **Pure public->internal transfer is hopeless** for the predicted sources (R2det strongly negative). (5) Level-1
+argmax over many strategies is optimistically biased — always quote the nested number (rlm: argmax 0.232 vs honest
+0.057). **Open:** bootstrap CI on mdck's +0.065 before deploy.
 
 **S5 bias-correction upgraded (2026-08-27).** The old `_bias_label` (affine on near-neighbour anchors, sim0=0.5) was
 a no-op for mdck (no NVS that close). Rewrote `_bias_label(method, sim0, min_anchors)` — per-fold, train-only
