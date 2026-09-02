@@ -77,6 +77,42 @@ TEMPORAL_FRACTIONS:
   # hand-picked fast config (beat HPO trial 0 on these small temporal blocks: lower RMSE on 9/12 arms)
   chemprop_hp: {depth: 3, message_hidden_dim: 300, ffn_hidden_dim: 300, ffn_num_layers: 2, dropout: 0.1464, batch_size: 256, aggregation: sum}
 
+# --- Chemprop TRANSFER LEARNING arm (python/run_chemprop_transfer.py; run from env ML, shells out) ---
+# Public pretrain -> frozen-encoder multitask finetune on internal, evaluated on RF's EXACT folds.
+# Stage 1: multitask chemprop train on PUBLIC ONLY per grouping (never sees an internal label -> cannot
+# leak into any internal fold; paid once, reused by every endpoint/fold).
+# Stage 2: per (endpoint, fold) `--checkpoint <stage1> --freeze-encoder` on that endpoint's RF fold-TRAIN
+# compounds, keeping the SAME multitask target columns (head shape must match) so the finetune uses ALL the
+# train compounds' relevant internal labels (NaN-masked where unmeasured) -- mimics production.
+# CAUTION: RF folds differ per endpoint, so a compound in hlm's train fold can be in rlm's TEST fold.
+# One finetune per (endpoint, fold); never score several endpoints from one finetuned model.
+CHEMPROP_TRANSFER:
+  chemprop_bin: ~/miniconda3/envs/chemprop/bin/chemprop   # shelled out to, so the runner can live in env ML
+  output_dir: output/predictions_runs_chemprop_transfer
+  pretrain_dir: output/chemprop_models/transfer_pretrain  # persisted stage-1 checkpoints (reused across folds)
+  rf_metrics_dir: output/results/20260825_metrics         # RF preddf pickles -> the EXACT fold membership
+  epochs_pretrain: 30
+  epochs_finetune: 30
+  patience: 15
+  freeze_encoder: true                 # stage 2 trains only the FFN head (set false for a full finetune)
+  # precomputed descriptastorus DS_* columns are preferred; [] uses none. Chemprop recomputes only if
+  # molecule_featurizers is set instead. Flags MUST match between pretrain, finetune and predict.
+  descriptors: precomputed             # precomputed | featurizer | none
+  molecule_featurizers: [v1_rdkit_2d_normalized]   # used only when descriptors: featurizer
+  hp: {depth: 3, message_hidden_dim: 300, ffn_hidden_dim: 300, ffn_num_layers: 2, dropout: 0.1464, batch_size: 256, aggregation: sum}
+  groupings:                           # sol_logd dropped (worst grouping for both its members, 2026-07)
+    clearance: [hlm, mlm, rlm]
+    all8:      [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]
+  endpoint_grouping:                   # which stage-1 pretrain each endpoint finetunes from
+    hlm:        clearance
+    mlm:        clearance
+    rlm:        clearance
+    solubility: all8
+    logd:       all8
+    caco2:      all8
+    mdck:       all8
+    ppb:        all8
+
 # --- systematic Chemprop grouping run (python/run_Chemprop_SystematicGroups.py; env chemprop) ---
 # Trains one multitask model per grouping (augmented+internal, temporal only) and scores each member
 # endpoint on the SAME local per-endpoint temporal test as the RF run. Hyperparams read from the HPO.

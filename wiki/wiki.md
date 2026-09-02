@@ -301,6 +301,67 @@ driver builds the 369k H237 matrix ONCE, then loops solubility/logd/hlm/mlm/rlm/
 strategy | nested_rf_r2det | beats_internal). `--min_n 200` (keeps small experimental origins), `--resume` (skip
 endpoints already done), aggregate-only. Synthetic-tested (pool=all, compare both learners, nested).
 
+**★ DECISION — chemprop must use PER-ENDPOINT folds IDENTICAL to RF (2026-09-02).** Multitask grouping-CV is
+rejected for RF-vs-chemprop comparison (see the corrected Chemprop CV entry: union fold pool => different train/val
+membership per endpoint). **Every chemprop arm is evaluated per endpoint on `data.fold_ids` — the SAME fold objects the
+RF `internal_cv` arm used** — so the only variable is the model. Also decided: **drop the `sol_logd` grouping** (the
+2026-07 temporal run found it the worst grouping for both its members); use **`all8`** for solubility/logd/mdck/caco2/ppb
+and **`clearance`** for hlm/mlm/rlm, which additionally gives a broad-vs-specialist pretrain comparison on the LMs.
+**The 330k augmented chemprop arm is DROPPED** (retrains per fold, and predicted-public augmentation is already known to
+fail on calibration — see the near-shell law below).
+
+**★ BUILT + SMOKE-VALIDATED — chemprop transfer learning: public pretrain -> frozen-encoder finetune (2026-09-02, `python/run_chemprop_transfer.py`, config `CHEMPROP_TRANSFER`).**
+Attacks the calib_gap failure directly: learn structure->property from public, then RE-CALIBRATE on internal only.
+- **Stage 1 (once per grouping, the only expensive step):** multitask `chemprop train` on **PUBLIC ONLY** (clearance =
+  NVS + Biogen hlm + Biogen rlm; all8 = full public), target-columns = the grouping's endpoints. Sees NO internal label,
+  so it cannot leak into any internal fold and is reused across every fold and endpoint.
+- **Stage 2 (per endpoint, per fold):** `chemprop train --checkpoint <stage1> --freeze-encoder` (freezes the D-MPNN
+  message-passing; only the FFN head trains) on that endpoint's **RF fold-train** compounds, keeping the SAME multitask
+  target columns so the head shape matches the checkpoint — i.e. finetune on the train compounds with **ALL their
+  relevant internal labels** (hlm+mlm+rlm for clearance), NaN-masked where unmeasured. Mimics production, where a
+  compound carries every endpoint it was measured on. Predict the held-out fold, read only the target endpoint's column.
+- **⚠️ THE LEAKAGE TRAP (the one real gotcha):** RF folds differ per endpoint (hlm/mlm fold 324 compounds, rlm only 39),
+  so a compound in hlm's TRAIN fold can sit in rlm's TEST fold. Therefore **one finetune per (endpoint, fold)** — 5 per
+  endpoint, 40 total — where auxiliary labels are used ONLY for compounds in THAT endpoint's fold-train set. Never
+  finetune one model and score several endpoints from it.
+- Cheap: stage 2 trains an FFN head on 30-260 internal compounds. Descriptor flags must MATCH stage 1 at finetune AND
+  predict (chemprop v2 stores only the fitted scaler). Uncertainty: none from chemprop — **use the RF tree-variance
+  `uq_std`/conf_* stack** (user decision; it already works well).
+- Metric gap to watch: `run_Chemprop_SystematicGroups.py` reports only `_rsq` = `Statistics_tools.rsquared` = **squared
+  Pearson**, no R2det. Saved preddf parquets carry (compound, real_y, pred_y), so R2det is recoverable post-hoc via
+  `ML_Reg.get_reg_metrics_from_preddf` — every chemprop arm must report **R2det**, the selection metric.
+- Config: hyperparams from `TEMPORAL_FRACTIONS.chemprop_hp` (hidden 300 / dropout 0.1464 / bs 256), **30 epochs**,
+  precomputed descriptastorus `DS_*` via `--descriptors-columns` wherever possible (the multitask path currently
+  RECOMPUTES via `--molecule-featurizers` — needs wiring), `CHEMPROP_BIN` moved into config.
+- Deferred alternative if frozen finetuning underperforms: `chemprop fingerprint` -> frozen embeddings as features for
+  the champion RF on the same folds (keeps the RF uncertainty stack, near-zero compute, and tests embeddings +/- H237).
+**IMPLEMENTATION (chemprop 2.2.4, PARAMS/DATA/OUTPUT/MAIN, runs from env `ML` and shells out to `chemprop_bin`).**
+Folds come from `DATA.rf_folds` = the **`fold` column of the saved RF `internal_cv_preddf`**
+(`output/results/20260825_metrics/<ep>.pkl`) — identical splits BY CONSTRUCTION, no need to reproduce KFold
+ordering. Verified: rlm 5 folds (31/8 x4, 32/7) totalling 39; hlm 324; mdck 107 — all match the RF `n`.
+Public source policy resolves from `RF_SINGLETASK.augmented_sources`, so **clearance = NVS + Biogen hlm +
+Biogen rlm** exactly as intended (hlm[EXP,NVS] + mlm[NVS] + rlm[EXP,NVS]). **Precomputed descriptastorus works**:
+the 200 `DS_*` columns are byte-identical between `output/features/20260824_MF_features.parquet` (internal, joined by
+compound) and every `autoresearch/predict_adme/public_*.parquet` (public) -> passed via `--descriptors-columns` at
+pretrain AND finetune AND predict. `--smoke <ep> [--smoke_rows N --smoke_epochs E]` shrinks both stages (checkpoint
+isolated in `<gname>_smoke`, results NOT written to the summary) so the pipeline validates in seconds.
+**Smoke PASSED (rlm, 1500 rows/3ep/1 fold):** checkpoint -> freeze-encoder finetune (31 train / 8 test) -> NaN-masked
+multitask targets accepted -> predict -> r2 0.453 / R2det -1.053 (numbers meaningless, plumbing valid).
+Outputs `summary_transfer.csv` + `preddfs/<ep>_transfer_cv.parquet`; `--resume` skips finished endpoints.
+**Cost:** dominated by the 2 stage-1 pretrains (~280k rows clearance, ~370k all8, 30 epochs) — hours each; the 40
+finetunes are ~1 min each (FFN head on 31-260 rows). **CONTROL ARM ADDED (2026-09-02):** `--arms transfer,scratch` (default both).
+`scratch` = identical fold-train compounds and multitask internal labels, but NO public data and NO
+`--checkpoint`, so the whole D-MPNN trains from scratch — it isolates what the pretraining contributes.
+Stage 1 is skipped entirely when only `scratch` is requested. Summary rows are keyed by **(endpoint, arm)**
+(`--resume` respects the pair), preddfs are `<ep>_<arm>_cv.parquet`, and the run prints a `transfer` vs
+`scratch` R2det pivot with a `pretrain_gain` column. Three-way read: RF `internal_cv` (baseline) ->
+chemprop `scratch` (is chemprop better here?) -> chemprop `transfer` (does public pretraining add?).
+CAVEAT on interpretation: `transfer` trains only the FFN head (frozen encoder) while `scratch` trains every
+weight, so they differ in trainable-parameter count as well as in initialisation — it is the practical
+"pretrain+freeze vs no pretrained model" comparison, not a pure weight ablation. Set config
+`freeze_encoder: false` for a full-finetune variant that isolates freezing itself.
+Smoke PASSED for both arms (rlm, 1 fold: transfer r2 0.453, scratch r2 0.417 — plumbing only). Real run: pending.
+
 **★ NEAR-SHELL — AUTHORITATIVE RESULTS (2026-09-02). Supersedes and replaces all earlier near-shell result entries.**
 Single protocol throughout: internal CV / augmented CV / transfer from **`output/results/20260825_metrics/<ep>.pkl`**
 (`<ep>_{internal_cv,augmented_cv,ext_->_internal}_metrics`; this is the source of the notebook grouped-bar plot);
@@ -448,8 +509,14 @@ clearance→chemprop-clearance · sol/logd/mdck→chemprop-all8 · caco2/ppb→s
 **Chemprop CV (2026-07-19, RUNNING)** — added a `--cv` path to `run_Chemprop_SystematicGroups.py`
 (multitask analog of RF `eval_cv`): one shared **compound-level** K-fold split per grouping (a compound's
 graph can't split train/test), **public always in train**, pooled out-of-fold predictions per endpoint →
-`pred_<grp>_cv.parquet` + `summary_chemprop_cv.csv`, CV r² directly comparable to RF `internal_cv`/
-`augmented_cv`. Running the 2 winning groupings via `run_chemprop_cv.sh` (detached): **clearance first
+`pred_<grp>_cv.parquet` + `summary_chemprop_cv.csv`. **⚠️ CORRECTED 2026-09-02 — the original claim here
+("CV r² directly comparable to RF `internal_cv`/`augmented_cv`") is WRONG. It is NOT comparable.**
+`cv_compound_ids` is `tgt.dropna(subset=endpoints, how='all')` = the **UNION** of internal compounds with
+>=1 member endpoint measured, folded ONCE at compound level for the whole grouping. So a single endpoint's
+OOF rows are whatever subset of each union fold happens to have that endpoint measured — a DIFFERENT
+partition (and different train membership) from RF's per-endpoint 5-fold over only that endpoint's measured
+compounds (e.g. caco2: RF folds 95 caco2 compounds; all8 folds every internal compound with any of the 8).
+Train AND val membership differ, so grouping-CV vs RF numbers must not be compared. Running the 2 winning groupings via `run_chemprop_cv.sh` (detached): **clearance first
 (~10h), then all8 (~20h)**; 5 folds each, same tuned HPO hyperparams + 50 epochs as the temporal run. Fold
 models are throwaway (`persist=False`); the deploy artifacts remain the temporal `output/chemprop_models/`.
 
