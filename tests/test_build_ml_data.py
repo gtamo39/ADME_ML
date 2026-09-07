@@ -156,3 +156,25 @@ def test_grouped_folds_no_inchikey_twins_across_folds():
         assert te_iks.isdisjoint(tr_iks)
     # same seed reproduces identical folds
     assert d._grouped_folds(5, 42) == folds
+
+
+def test_build_ML_data_RF_matches_the_alias():
+    """build_ML_data_RF(params, k) must produce the same frame as the build_ML_data_<ep> alias.
+
+    Two DATA objects get the identical synthetic logd rows. One runs the alias, the other the named entry
+    point. Both frames must be equal, and the named one must not need self.params set in advance.
+    """
+    rows = [
+        {'compound': 'C1', 'smiles': CCO,  'label': 2.0, 'source': 'internal', 'origin': 'internal'},
+        {'compound': 'C2', 'smiles': BENZ, 'label': 3.1, 'source': 'EXP',      'origin': 'pub_a'},
+    ]
+    alias = _data_with('logd', rows, feat_compounds=['C1', 'C2'])
+    alias.build_ML_data_logd()
+    named = _data_with('logd', rows, feat_compounds=['C1', 'C2'])
+    named.params = None                                        # the named entry point binds params itself
+    named.build_ML_data_RF(_fake_params(), k='logd')
+
+    # the two frames are identical
+    pd.testing.assert_frame_equal(alias.ML_data['logd'], named.ML_data['logd'])
+    # the named entry point stored the params it was given
+    assert named.params is not None

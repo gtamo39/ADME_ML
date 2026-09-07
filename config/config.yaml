@@ -1,161 +1,23 @@
-SERAC_C:                    # named palette: name -> hex (quote hex; '#' is a YAML comment otherwise)
-  azure: '#0EA5CE'
-  ember: '#E65D32'
-  terracotta: '#EEA090'
-  gold: '#E8B04B'
-  olive: '#74B24A'
-  sky_blue: '#A6C8E4'
-  paper: '#E3E0DA'
+# ADME_ML — config for the ADME_build_ML.py workflow and the prediction webapp.
+#
+# SCOPE: this file holds ONLY the keys those two consumers actually read (verified by grep), plus the
+# chemprop TRANSFER blocks being ported into ADME_build_ML.py. Everything else was moved out on
+# 2026-09-03 — the full previous config is preserved verbatim at
+#   config/config_legacy_20260903.yaml
+# Legacy runners (run_Chemprop_SystematicGroups.py, temporal_fractions_*.py, adme_cleaning_sweep.py,
+# build_novartis_clusters.py, the extract/build scripts) need keys that live ONLY in that legacy file,
+# so point them at it with --config config/config_legacy_<date>.yaml.
+#
+# WHO READS WHAT
+#   ADME_build_ML.py : ADME_ENDPOINTS, ENDPOINT_PUBLIC_FILES, BEST_PUBLIC, RF_SINGLETASK,
+#                      MF_features_all_path, METRICS_PKL_DIR, FOLD_GROUP_BY_INCHIKEY, DEPLOY
+#   webapp/app.py    : ADME_ENDPOINTS, SERAC_C, webapp
+#   chemprop port    : CHEMPROP_TRANSFER, BEST_CHEMPROP_GROUPINGS
+#
+# CAUTION: PARAMS.load_params does __dict__.update(yaml), so every top-level key becomes params.<KEY>.
+# Removing a key that a method reads fails only at that call site — grep before deleting one.
 
-CHEMLIB_OVERWRITE: false
-CHEMLIB_PATH: data/chemical_libs/SERAC_lib.csv
-SOL_OVERWRITE: false
-CUTOFF_SOL: 10
-
-# --- single-task RF systematic run (python/run_RF_SingleTask_systematic.py) ---
-RF_SINGLETASK:
-  seed: 42
-  n_jobs: 32
-  cv_folds: 5
-  output_dir: output/predictions_runs
-  features_type: H236                 # H236 (MLTrail-deployable) | MFDS (needs descriptastorus + custom featurizer)
-  champion: {n_estimators: 200, max_depth: 20, max_features: 0.3, min_samples_leaf: 2}
-  register_mltrail: true
-  archive_public_in_trainset: true   # archive the FULL internal+public trainset (reproducible in isolation)
-  # per-endpoint public sources for the deployed "augmented" model (default = all available parquets).
-  # solubility: EXPERIMENTAL only — ADMETlab PREDICTED solubility HURTS (wiki 2026-07: experimental
-  # moves temporal 0.044->0.313, predicted pseudo-labels poison newest compounds). Others use all available.
-  augmented_sources:
-    solubility: [EXP]            # ADMETlab predicted solubility poisons it (wiki 2026-07)
-    mdck: [NVS]                  # ADM ablation: dropping ADMETlab lifts mdck 0.163 -> 0.321
-    ppb: [EXP, NVS]              # ADM ablation: dropping ADMETlab lifts ppb 0.149 -> 0.316
-
-# --- ADME public-data cleaning sweep (python/adme_cleaning_sweep.py) ---
-# The solubility cleaning sweep generalized to the other endpoints: clean ONLY the public augmentation
-# (EXP experimental / NVS+ADM predicted), keep the internal test FIXED, evaluate the champion RF in the
-# temporal + 5-fold-CV arms, and rank by the calibration-sensitive R²_det (NOT affine-invariant Pearson).
-# The dominant lever mirrors solubility's thermo-vs-kinetic: EXPERIMENTAL-vs-PREDICTED source matching.
-ADME_CLEAN_SWEEP:
-  endpoints: [logd, hlm, mlm, rlm, mdck, ppb, caco2]   # solubility handled by the SOL_* switch
-  predicted_cap: 40000        # subsample per PREDICTED source (NVS/ADM) for sweep tractability (seed=RF seed); EXP kept fully
-  winsor_pct: [0.01, 0.99]    # winsorize label to these quantiles (per source)
-  iqr_k: 3.0                  # per-origin Tukey fence multiplier for the IQR cleaner
-  phys_range:                 # absolute plausibility bounds in MODELLING space; public outside = unit error / impossible
-    logd:  [-6, 12]           # LogD7.4 (identity transform)
-    hlm:   [-2, 6]            # log10 µL/min/mg CLint  (0.01 .. 1e6)
-    mlm:   [-2, 6]
-    rlm:   [-2, 6]
-    mdck:  [-3, 3]            # log10 1e-6 cm/s Papp    (0.001 .. 1000)
-    ppb:   [-5, 5]            # logit10(fraction unbound)
-    caco2: [-3, 3]            # log10 1e-6 cm/s Papp (same assay family as mdck)
-
-# --- temporal fraction-split experiment (python/temporal_fractions_{rf,chemprop}.py) ---
-# Three single-cut temporal splits (train oldest 1-f, test newest f) per endpoint by SRB id, to find a
-# cut with enough test spread for a meaningful R2det. Arms per endpoint: RF internal + RF augmented +
-# (for the chemprop endpoints) chemprop augmented, on the IDENTICAL compound sets. Test compounds are
-# removed from training ENTIRELY (all tasks) — a "virtual enumerated" holdout. FULL public (NO cap).
-TEMPORAL_FRACTIONS:
-  fractions: [0.4, 0.3, 0.2]                    # newest-f held out as test (train 60/70/80)
-  output_dir: output/predictions_runs_temporal_fractions
-  # per endpoint: augmented = RF source-set(s); chemprop = grouping (or ~); cp_arms = chemprop source-set arms
-  # (LMs drop EXP-only, so RF keeps both but chemprop only EXP+NVS); cp_clusters = custom Novartis-column multitask arms
-  endpoints:
-    solubility: {augmented: ["EXP"],           chemprop: all8,      cp_arms: ["EXP"],     cp_clusters: []}
-    logd:       {augmented: ["EXP+NVS+ADM"],   chemprop: ~,         cp_arms: [],          cp_clusters: []}
-    hlm:        {augmented: ["EXP", "EXP+NVS"], chemprop: clearance, cp_arms: ["EXP+NVS"], cp_clusters: []}
-    mlm:        {augmented: ["NVS"],           chemprop: clearance, cp_arms: ["NVS"],     cp_clusters: []}
-    rlm:        {augmented: ["EXP", "EXP+NVS"], chemprop: clearance, cp_arms: ["EXP+NVS"], cp_clusters: []}
-    caco2:      {augmented: ["EXP"],           chemprop: ~,         cp_arms: [],          cp_clusters: []}
-    mdck:       {augmented: ["NVS"],           chemprop: all8,      cp_arms: ["NVS"],     cp_clusters: ["mdck_perm"]}
-    ppb:        {augmented: ["EXP+NVS"],       chemprop: ~,         cp_arms: [],          cp_clusters: ["ppb_fu"]}
-  # custom chemprop multitask arms: internal `target` (eval endpoint) + these Novartis predicted columns as
-  # auxiliary co-training tasks (built by python/build_novartis_clusters.py -> tf_novartis_<name>.parquet)
-  clusters:
-    mdck_perm: {target: mdck, novartis_cols: ["pred(LE-MDCKv2_LogPapp)", "pred(LE-MDCKv1_LogPapp)", "pred(Caco-2_LogPapp)", "pred(MDCK-MDR1_LogER)", "pred(logPAMPA)"]}
-    ppb_fu:    {target: ppb,  novartis_cols: ["pred(LogFu-Rat)", "pred(LogFu-Human)", "pred(LogFu-Mouse)", "pred(LogFu-Dog)", "pred(LogFu-Monkey)", "pred(HPLC LogFu HSA)", "pred(LogFubrain)", "pred(LogFumic)", "pred(Direct NIBR LogP)", "pred(Direct NIBR LogD7.4)"]}
-  chemprop_epochs: 30                           # fast small model for the overnight run (ensemble=1)
-  # hand-picked fast config (beat HPO trial 0 on these small temporal blocks: lower RMSE on 9/12 arms)
-  chemprop_hp: {depth: 3, message_hidden_dim: 300, ffn_hidden_dim: 300, ffn_num_layers: 2, dropout: 0.1464, batch_size: 256, aggregation: sum}
-
-# --- Chemprop TRANSFER LEARNING arm (python/run_chemprop_transfer.py; run from env ML, shells out) ---
-# Public pretrain -> frozen-encoder multitask finetune on internal, evaluated on RF's EXACT folds.
-# Stage 1: multitask chemprop train on PUBLIC ONLY per grouping (never sees an internal label -> cannot
-# leak into any internal fold; paid once, reused by every endpoint/fold).
-# Stage 2: per (endpoint, fold) `--checkpoint <stage1> --freeze-encoder` on that endpoint's RF fold-TRAIN
-# compounds, keeping the SAME multitask target columns (head shape must match) so the finetune uses ALL the
-# train compounds' relevant internal labels (NaN-masked where unmeasured) -- mimics production.
-# CAUTION: RF folds differ per endpoint, so a compound in hlm's train fold can be in rlm's TEST fold.
-# One finetune per (endpoint, fold); never score several endpoints from one finetuned model.
-CHEMPROP_TRANSFER:
-  chemprop_bin: ~/miniconda3/envs/chemprop/bin/chemprop   # shelled out to, so the runner can live in env ML
-  output_dir: output/predictions_runs_chemprop_transfer
-  pretrain_dir: output/chemprop_models/transfer_pretrain  # persisted stage-1 checkpoints (reused across folds)
-  rf_metrics_dir: output/results/20260825_metrics         # RF preddf pickles -> the EXACT fold membership
-  epochs_pretrain: 30
-  epochs_finetune: 30
-  patience: 15
-  freeze_encoder: true                 # stage 2 trains only the FFN head (set false for a full finetune)
-  # precomputed descriptastorus DS_* columns are preferred; [] uses none. Chemprop recomputes only if
-  # molecule_featurizers is set instead. Flags MUST match between pretrain, finetune and predict.
-  descriptors: precomputed             # precomputed | featurizer | none
-  molecule_featurizers: [v1_rdkit_2d_normalized]   # used only when descriptors: featurizer
-  hp: {depth: 3, message_hidden_dim: 300, ffn_hidden_dim: 300, ffn_num_layers: 2, dropout: 0.1464, batch_size: 256, aggregation: sum}
-  groupings:                           # sol_logd dropped (worst grouping for both its members, 2026-07)
-    clearance: [hlm, mlm, rlm]
-    all8:      [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]
-  endpoint_grouping:                   # which stage-1 pretrain each endpoint finetunes from
-    hlm:        clearance
-    mlm:        clearance
-    rlm:        clearance
-    solubility: all8
-    logd:       all8
-    caco2:      all8
-    mdck:       all8
-    ppb:        all8
-
-# --- systematic Chemprop grouping run (python/run_Chemprop_SystematicGroups.py; env chemprop) ---
-# Trains one multitask model per grouping (augmented+internal, temporal only) and scores each member
-# endpoint on the SAME local per-endpoint temporal test as the RF run. Hyperparams read from the HPO.
-CHEMPROP_SYSTEMATIC:
-  output_dir: output/predictions_runs_chemprop
-  epochs: 50
-  patience: 15
-  # descriptastorus RDKit-2D normalized descriptors concatenated to the learned D-MPNN representation
-  # (known accuracy boost; chemprop computes them via descriptastorus). Must be passed at BOTH train
-  # and predict in chemprop v2 (only the fitted scaler is stored). [] disables. MLTrail predict needs
-  # the SAME flag to deploy such a model (backend not yet featurizer-aware — see wiki).
-  molecule_featurizers: [v1_rdkit_2d_normalized]
-  cv_folds: 5                        # --cv: K-fold over internal compounds (public always in train), mirrors RF eval_cv
-  hpopt_config: autoresearch/predict_adme/chemprop_run/hpopt/best_config.json  # HPO best params (read at run time)
-  register_mltrail: false            # MLTrail v1 cannot PREDICT chemprop (backend stub) -> archive-only; off until decided
-  groupings:                         # grouping name -> member endpoints (from autoresearch validation)
-    sol_logd:  [solubility, logd]
-    clearance: [hlm, mlm, rlm]
-    all8:      [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]
-
-# --- public-only -> internal experiment (external-validation / domain-transfer baseline) ---
-# Train each endpoint's WINNING model on PUBLIC data ONLY (zero internal compounds in train) and predict
-# ALL internal compounds. Measures pure public->internal transfer (the floor internal data lifts us above).
-#   RF arm:       python python/run_RF_SingleTask_systematic.py --public-only --endpoints logd,caco2,ppb
-#   Chemprop arm: python python/run_Chemprop_SystematicGroups.py --public-only --groupings clearance all8
-#   combine:      python python/combine_public_to_internal.py   (assembles the winner table below)
-# winners = per-endpoint best model/grouping from the CV+temporal head-to-head; REFRESH after CV lands.
-PUBLIC_TO_INTERNAL:
-  winners:
-    solubility: {model: chemprop, grouping: all8}
-    logd:       {model: rf}
-    hlm:        {model: chemprop, grouping: clearance}
-    mlm:        {model: chemprop, grouping: clearance}
-    rlm:        {model: chemprop, grouping: clearance}
-    caco2:      {model: rf}
-    mdck:       {model: chemprop, grouping: all8}
-    ppb:        {model: rf}
-
-# --- multitask ADME regression ---
-ADME_OVERWRITE: false
-ADME_CSV: data/20260707_all_adme.csv
-ADME_ID_COL: name              # SRB-XXXXXXX id; digits give temporal recency (bigger = newer)
-ADME_SMILES_COL: smiles
+## ==================== ENDPOINT DEFINITIONS ====================
 # endpoint -> in-house target column + transform to modelling space.
 # transforms: log10 (assay value must be >0), identity (already log), logit_pct (%->fraction->logit)
 ADME_ENDPOINTS:
@@ -168,59 +30,7 @@ ADME_ENDPOINTS:
   mdck:       {col: 'mdck_Mean Papp A to B',                   transform: log10,     unit: 1e-6cm/s, filter: {col: 'mdck_Cell line', contains: MDR1}}  # MDR1-MDCK only (drop MDR2/MDR3)
   ppb:        {col: 'ppb_%Unbound',                            transform: logit_pct, unit: pct_unbound}
 
-# public-source harmonization: per-endpoint best public dataset + unit conversion to modelling space.
-# tier: direct (same units) | convert (deterministic) | scale (physiological, approximate) | none
-ADME_PUBLIC:
-  logd:  {source: tdc, name: Lipophilicity_AstraZeneca, tier: direct,  op: identity}
-  hlm:   {source: tdc, name: Clearance_Microsome_AZ,    tier: direct,  op: log10}
-  caco2: {source: tdc, name: Caco2_Wang,                tier: convert, op: log10_offset, offset: 6.0}  # cm/s -> 1e-6 cm/s
-  ppb:   {source: tdc, name: PPBR_AZ,                   tier: convert, op: pctbound_to_logit_fu}
-  hlm_biogen: {source: biogen, col: 'LOG HLM_CLint (mL/min/kg)', tier: scale, op: log_clint_bw_to_invitro, species: human}
-  rlm:        {source: biogen, col: 'LOG RLM_CLint (mL/min/kg)', tier: scale, op: log_clint_bw_to_invitro, species: rat}
-  ppb_biogen: {source: biogen, col: 'LOG PLASMA PROTEIN BINDING (HUMAN) (% unbound)', tier: convert, op: log_pctunbound_to_logit_fu}
-# physiological scaling: mL/min/kg = uL/min/mg x MPPGL(mg/g liver) x LW(g liver/kg bw) / 1000
-ADME_SCALING:
-  human: {MPPGL: 32.0, LW: 20.0}
-  rat:   {MPPGL: 45.0, LW: 40.0}
-BIOGEN_ADME_CSV: data/public_solubility/biogen_fang_adme/ADME_public_set_3521.csv
-
-# public solubility (from the predict_solubility project's harmonize_solubility, µM).
-# in-house solubility endpoint = THERMODYNAMIC (log10 µM), so augment with thermodynamic public only.
-# Cleaning sweep (wiki 2026-07-20, S2_thermo): dropping kinetic (82% of public, ~+1.8 log10 shift) lifts
-# calibrated CV R²_det 0.65->0.71, zeroes the bias (-0.05->0.00), and makes raw-µM predictions meaningful
-# (raw R²_det ~0->0.54). The physical clip removes an impossible high tail (solubility > 1 mol/L).
-SOL_HARMONIZED_CSV: data/public_solubility/harmonized_sol.csv
-SOL_PUBLIC_TYPES: [thermodynamic_experimental]   # thermo-only (was thermo+kinetic); assay-type match to internal
-SOL_MAX_LOG10_UM: 6.0            # drop physically-impossible solubility > 1 mol/L (=1e6 µM; water ~55 mol/L); ~0.9% of thermo rows
-SOL_DROP_ORIGINS: []             # optional raw-origin blocklist; [PHYS, AQUA] reproduces sweep S9_thermo_pruned (clip already removes their impossible tail)
-SOL_SUBSAMPLE_PER_TYPE: 5000     # cap per type (dedup by InChIKey first) for RF tractability; run build with 'full' to keep all thermo
-
-# ADMETlab predictions on PROTAC-DB patent compounds (63k, in our chemical space) — 2nd predictor
-# (cf. Novartis). Covers logd/caco2/mdck/ppb/solubility; NOT microsomal clearance (LM-human is a
-# 0-1 stability prob, cl-plasma is whole-body). PREDICTED, not experimental.
-ADMETLAB_CSV: data/public_solubility/protac_patent/PROTAC_Patent_Compounds.xlsx
-ADMETLAB_SUBSAMPLE: full          # int cap, or 'full' = use all ~63k PROTAC-patent compounds
-ADMETLAB_PUBLIC:                 # pred column -> in-house modelling space
-  logd:       {col: logD,  op: identity}
-  caco2:      {col: caco2, op: log10cm_s_plus6}      # log10(cm/s) -> log10(1e-6 cm/s)
-  mdck:       {col: MDCK,  op: log10cm_s_plus6}      # GAP endpoint (with Novartis)
-  ppb:        {col: PPB,   op: pctbound_to_logit_fu} # %bound -> logit(fu)
-  solubility: {col: logS,  op: logSmolL_plus6}       # log10(mol/L) -> log10(µM)
-
-# Novartis/NIBR in-silico ADME PREDICTIONS (not experimental) on ProtacDB2.0+ZINC+ChEMBL.
-# Used to test 3 roles: benchmark vs experimental, stacking features, distillation/pretraining.
-NOVARTIS_CSV: data/protacdb2.0_zinc_chembl_dataset.csv
-NOVARTIS_SUBSAMPLE: full          # int cap (PROTAC-DB kept fully + rest sampled), or 'full' = all ~273k
-NOVARTIS_PUBLIC:                  # pred column -> in-house modelling space (op as in ADME_PUBLIC)
-  logd:  {col: 'pred(Direct NIBR LogD7.4)', op: identity}
-  hlm:   {col: 'pred(hLM LogCLint)',        op: identity}
-  mlm:   {col: 'pred(mLM LogCLint)',        op: identity}   # GAP endpoint — only public signal
-  rlm:   {col: 'pred(rLM LogCLint)',        op: identity}
-  caco2: {col: 'pred(Caco-2_LogPapp)',      op: identity}   # appears log10(1e-6 cm/s); verified by benchmark
-  mdck:  {col: 'pred(LE-MDCKv2_LogPapp)',   op: identity}   # GAP — LE-MDCK proxy (not MDR1); flag
-  ppb:   {col: 'pred(LogFu-Human)',         op: logfu_to_logit}
-
-
+## ==================== PUBLIC DATA (prebuilt parquets) ====================
 # public EXP parquet(s) per endpoint (concatenated; value already in modelling space) for the generic
 # DATA._endpoint_dfs builder. solubility/logd/mdck keep their own bespoke get_*_data methods.
 ENDPOINT_PUBLIC_FILES:
@@ -242,18 +52,118 @@ BEST_PUBLIC:
   rlm:        ['Biogen:rlm', 'Novartis-NIBR']
   caco2:      ['Novartis-NIBR', 'ADMETlab-PROTAC']
   ppb:        ['TDC:PPBR_AZ']
+# Best chemprop TRANSFER grouping per endpoint — the chemprop analogue of BEST_PUBLIC above.
+# Measured 2026-09-02 (public pretrain -> frozen-encoder finetune on RF's EXACT folds; see wiki).
+# `kind: endpoint` -> tasks are internal endpoint columns; public rows for each task come from the SAME
+# config-vetted policy as RF (RF_SINGLETASK.augmented_sources), so sources are NOT restated here and cannot drift.
+# `kind: cluster`   -> tasks are the internal target + the related raw Novartis pred(...) columns held in `file`
+# (prebuilt by python/build_novartis_clusters.py); aux task names are read from that parquet's schema.
+# `r2det` = the measured honest score. `beats_rf` = does chemprop beat the best RF arm for this endpoint?
+# CAUTION: chemprop wins only 5/8. For solubility/mdck/ppb the entry records chemprop's BEST grouping but RF
+# still wins (solubility RF-augmented 0.731, mdck RF+near-shell 0.539, ppb RF-augmented 0.537) — a deploy step
+# must honour `beats_rf`, not just pick the chemprop grouping.
+BEST_CHEMPROP_GROUPINGS:
+  hlm:        {grouping: clearance,    kind: endpoint, tasks: [hlm, mlm, rlm],    r2det: 0.647, beats_rf: true}
+  mlm:        {grouping: clearance,    kind: endpoint, tasks: [hlm, mlm, rlm],    r2det: 0.673, beats_rf: true}
+  rlm:        {grouping: clearance,    kind: endpoint, tasks: [hlm, mlm, rlm],    r2det: 0.274, beats_rf: true}
+  caco2:      {grouping: permeability, kind: endpoint, tasks: [caco2, mdck],      r2det: 0.771, beats_rf: true}
+  logd:       {grouping: sol_lipo,     kind: endpoint, tasks: [solubility, logd], r2det: 0.832, beats_rf: true}
+  solubility: {grouping: all8,         kind: endpoint, tasks: [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb],
+               r2det: 0.671, beats_rf: false}     # RF full-augmented wins (0.731) — experimental public, no bias to fix
+  mdck:       {grouping: mdck_perm,    kind: cluster,  target: mdck, file: tf_novartis_mdck_perm.parquet,
+               r2det: 0.467, beats_rf: false}     # RF + near-shell dist060_agree wins (0.539)
+  ppb:        {grouping: ppb_fu,       kind: cluster,  target: ppb,  file: tf_novartis_ppb_fu.parquet,
+               r2det: 0.022, beats_rf: false}     # RF full-augmented wins (0.537) — transfer badly hurts ppb
 
+## ==================== MODELS ====================
+# --- single-task RF systematic run (python/run_RF_SingleTask_systematic.py) ---
+RF_SINGLETASK:
+  seed: 42
+  n_jobs: 32
+  cv_folds: 5
+  output_dir: output/predictions_runs
+  features_type: H236                 # H236 (MLTrail-deployable) | MFDS (needs descriptastorus + custom featurizer)
+  champion: {n_estimators: 200, max_depth: 20, max_features: 0.3, min_samples_leaf: 2}
+  register_mltrail: true
+  archive_public_in_trainset: true   # archive the FULL internal+public trainset (reproducible in isolation)
+  # per-endpoint public sources for the deployed "augmented" model (default = all available parquets).
+  # solubility: EXPERIMENTAL only — ADMETlab PREDICTED solubility HURTS (wiki 2026-07: experimental
+  # moves temporal 0.044->0.313, predicted pseudo-labels poison newest compounds). Others use all available.
+  augmented_sources:
+    solubility: [EXP]            # ADMETlab predicted solubility poisons it (wiki 2026-07)
+    mdck: [NVS]                  # ADM ablation: dropping ADMETlab lifts mdck 0.163 -> 0.321
+    ppb: [EXP, NVS]              # ADM ablation: dropping ADMETlab lifts ppb 0.149 -> 0.316
+# --- Chemprop TRANSFER LEARNING arm (python/run_chemprop_transfer.py; run from env ML, shells out) ---
+# Public pretrain -> frozen-encoder multitask finetune on internal, evaluated on RF's EXACT folds.
+# Stage 1: multitask chemprop train on PUBLIC ONLY per grouping (never sees an internal label -> cannot
+# leak into any internal fold; paid once, reused by every endpoint/fold).
+# Stage 2: per (endpoint, fold) `--checkpoint <stage1> --freeze-encoder` on that endpoint's RF fold-TRAIN
+# compounds, keeping the SAME multitask target columns (head shape must match) so the finetune uses ALL the
+# train compounds' relevant internal labels (NaN-masked where unmeasured) -- mimics production.
+# CAUTION: RF folds differ per endpoint, so a compound in hlm's train fold can be in rlm's TEST fold.
+# One finetune per (endpoint, fold); never score several endpoints from one finetuned model.
+CHEMPROP_TRANSFER:
+  chemprop_bin: ~/miniconda3/envs/chemprop/bin/chemprop   # shelled out to, so the runner can live in env ML
+  output_dir: output/predictions_runs_chemprop_transfer
+  pretrain_dir: output/chemprop_models/transfer_pretrain  # persisted stage-1 checkpoints (reused across folds)
+  rf_metrics_dir: output/results/20260825_metrics         # RF preddf pickles -> the EXACT fold membership
+  cp_metrics_dir: output/results/20260907_metrics_cp     # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
+  epochs_pretrain: 30
+  epochs_finetune: 30
+  patience: 15
+  seed: 42                             # drives --data-seed AND --pytorch-seed; the PyTorch seed also turns
+                                       # on Lightning's deterministic mode, so two identical runs give identical numbers
+  freeze_encoder: true                 # stage 2 trains only the FFN head (set false for a full finetune)
+  # precomputed descriptastorus DS_* columns are preferred; [] uses none. Chemprop recomputes only if
+  # molecule_featurizers is set instead. Flags MUST match between pretrain, finetune and predict.
+  descriptors: precomputed             # precomputed | featurizer | none
+  molecule_featurizers: [v1_rdkit_2d_normalized]   # used only when descriptors: featurizer
+  hp: {depth: 3, message_hidden_dim: 300, ffn_hidden_dim: 300, ffn_num_layers: 2, dropout: 0.1464, batch_size: 256, aggregation: sum}
+  # ENDPOINT groupings: tasks are internal endpoint columns, public from public_*/public_novartis_* parquets.
+  # sol_logd dropped (worst grouping for both its members, 2026-07). Task RELATEDNESS decides the outcome:
+  # `clearance` (one assay, 3 species) won 3/3; `all8` (8 heterogeneous properties) lost 5/5 (wiki 2026-09-02).
+  groupings:
+    clearance:    [hlm, mlm, rlm]
+    permeability: [caco2, mdck]         # same assay family (Papp A->B) — the clearance analogue for permeability
+    sol_lipo:     [solubility, logd]     # retest as a PRETRAIN block (2026-07 verdict was for multitask prediction)
+    all8:         [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]
+  # CLUSTER groupings: tasks are the internal target endpoint + related raw Novartis pred(...) columns as
+  # auxiliary co-training tasks (prebuilt by python/build_novartis_clusters.py). Aux column names are read
+  # from the parquet schema (everything except smiles/_ik), so they are not duplicated here.
+  clusters:
+    mdck_perm: {target: mdck, file: tf_novartis_mdck_perm.parquet}   # MDCKv1/v2, Caco-2, MDR1 LogER, logPAMPA
+    ppb_fu:    {target: ppb,  file: tf_novartis_ppb_fu.parquet}      # LogFu x5 species, HSA, Fubrain, Fumic, LogP/LogD
+  endpoint_grouping:                   # which stage-1 pretrain each endpoint finetunes from
+    hlm:        clearance
+    mlm:        clearance
+    rlm:        clearance
+    solubility: all8
+    logd:       all8
+    caco2:      all8
+    mdck:       all8
+    ppb:        all8
+
+## ==================== PATHS / CV POLICY ====================
 ## ---- ML model training and deployment ---- ##
 MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
 METRICS_PKL_DIR: 'output/results/20260825_metrics/'   # OUTPUT.assess_predictions writes <k>.pkl here (per-endpoint arms)
 FOLD_GROUP_BY_INCHIKEY: true   # CV folds grouped by InChIKey so a molecule's twins never split across train/test (anti-leakage)
 
+## ==================== DEPLOYMENT ====================
 # OUTPUT.deploy_all_endpoints — fit the deployable RF (internal + BEST_PUBLIC public) and register to MLTrail.
 DEPLOY:
   features_type: 'H237'          # featurizer MLTrail re-derives at predict time (needs descriptastorus)
   experiment_suffix: '_h237'     # new models land as adme_<endpoint><suffix> (champions adme_<endpoint> untouched)
 
-
+## ==================== WEBAPP ====================
+SERAC_C:                    # named palette: name -> hex (quote hex; '#' is a YAML comment otherwise)
+  azure: '#0EA5CE'
+  ember: '#E65D32'
+  terracotta: '#EEA090'
+  gold: '#E8B04B'
+  olive: '#74B24A'
+  sky_blue: '#A6C8E4'
+  paper: '#E3E0DA'
 # ---- Prediction webapp (webapp/app.py) — LiveDesign-style drag-drop scorer, LOCALHOST ONLY ----
 # Scores dropped SDF/CSV compounds with the 8 champion RF (H236) models in the MLTrail vault.
 webapp:
@@ -279,4 +189,3 @@ webapp:
       unit: 'P(1 <= n_down <= 12)'      # header subtitle — probability of the single/low-activity class
       threshold: 0.5                    # probability >= threshold counts as favorable (green)
       color_slope: 8.0                  # steeper fade: a probability moves at most 0.5 from the threshold
-

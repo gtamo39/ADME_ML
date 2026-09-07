@@ -36,6 +36,7 @@ import argparse
 import json
 import os
 import pickle
+import re
 import subprocess
 import sys
 import time
@@ -48,6 +49,7 @@ sys.path.insert(0, os.path.expanduser('~/Scripts'))
 import numpy as np
 import pandas as pd
 import yaml
+from tqdm.auto import tqdm
 
 import ML_Reg
 
@@ -68,8 +70,9 @@ class PARAMS:
         for k, v in cfg['CHEMPROP_TRANSFER'].items():
             setattr(self, k, v)
         self.chemprop_bin = os.path.expanduser(self.chemprop_bin)
+        self.best_groupings = cfg.get('BEST_CHEMPROP_GROUPINGS', {})   # per-endpoint winner (--grouping best)
         self.augmented_sources_override = cfg['RF_SINGLETASK'].get('augmented_sources') or {}
-        self.seed = cfg['RF_SINGLETASK']['seed']
+        self.seed = cfg['CHEMPROP_TRANSFER'].get('seed', 42)   # --data-seed + --pytorch-seed for every stage
         return self
 
 
@@ -108,6 +111,39 @@ class DATA:
         ids = p['compound'].to_numpy()
         return [[list(ids[p['fold'].to_numpy() != k]), list(ids[p['fold'].to_numpy() == k])]
                 for k in sorted(p['fold'].unique())]
+
+    def is_cluster(self, params, gname):
+        """A grouping name is either an endpoint grouping or a Novartis-column cluster."""
+        return gname in getattr(params, 'clusters', {})
+
+    def task_list(self, params, gname):
+        """Task (target-column) list for a grouping.
+        endpoint grouping -> its internal endpoint columns.
+        cluster grouping  -> [target endpoint] + the cluster parquet's auxiliary Novartis columns."""
+        if not self.is_cluster(params, gname):
+            return list(params.groupings[gname])
+        spec = params.clusters[gname]
+        import pyarrow.parquet as pq
+        aux = [c for c in pq.read_schema(CACHE / spec['file']).names if c not in ('smiles', '_ik')]
+        return [spec['target']] + aux
+
+    def cluster_public_rows(self, params, gname):
+        """Public pretrain rows for a cluster: the Novartis wide frame supplies BOTH the target endpoint's
+        pseudo-label and its related pred(...) auxiliary tasks; EXP rows for the target are added when they
+        exist (aux columns stay NaN there and are masked by chemprop's multitask loss)."""
+        spec = params.clusters[gname]
+        tgt_ep = spec['target']
+        keep = (['smiles'] + self.ds_cols) if self.ds_cols else ['smiles']
+        nvs = pd.read_parquet(CACHE / PUBLIC_SRC['NVS'].format(ep=tgt_ep), columns=keep + ['value'])
+        nvs = nvs.rename(columns={'value': tgt_ep}).drop_duplicates('smiles')
+        aux = pd.read_parquet(CACHE / spec['file'])
+        aux = aux.drop(columns=[c for c in ('_ik',) if c in aux.columns]).drop_duplicates('smiles')
+        rows = [nvs.merge(aux, on='smiles', how='inner')]
+        # the target's experimental public data, when it exists (well-calibrated; aux tasks NaN)
+        if 'EXP' in self.augmented_sources(tgt_ep, params):
+            e = pd.read_parquet(CACHE / PUBLIC_SRC['EXP'].format(ep=tgt_ep), columns=keep + ['value'])
+            rows.append(e.rename(columns={'value': tgt_ep}))
+        return rows
 
     def public_rows(self, params, endpoints):
         """Public pretrain rows for a grouping: EXP per-endpoint single-target rows, NVS/ADM merged wide.
@@ -158,13 +194,40 @@ class OUTPUT:
             return ['--molecule-featurizers', *params.molecule_featurizers]
         return []
 
-    def _run(self, cmd, log):
-        """Run a chemprop command, tee-ing its output to a log; raise with the log tail on failure."""
-        with open(log, 'w') as f:
-            p = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT)
-        if p.returncode != 0:
-            tail = ''.join(open(log).readlines()[-25:])
-            raise RuntimeError(f'chemprop failed ({p.returncode}); log {log}\n{tail}')
+    def _run(self, cmd, log, total_epochs=None, desc=None):
+        """Run a chemprop command, tee-ing its output to a log; raise with the log tail on failure.
+        With total_epochs set, stream the output and drive a tqdm bar off Lightning's 'Epoch N' markers
+        (the log is still written in full, so a failure tail is always available)."""
+        if not total_epochs:
+            with open(log, 'w') as f:
+                rc = subprocess.run(cmd, stdout=f, stderr=subprocess.STDOUT).returncode
+        else:
+            ansi, epat = re.compile(r'\x1b\[[0-9;]*[a-zA-Z]'), re.compile(r'Epoch (\d+)')
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            bar = tqdm(total=total_epochs, desc=desc or 'train', unit='ep', leave=False)
+            seen, buf = 0, b''
+            with open(log, 'wb') as f:
+                while True:
+                    chunk = proc.stdout.read1(4096)                   # return as soon as bytes are ready
+                    if not chunk:
+                        if proc.poll() is not None:
+                            break
+                        continue
+                    f.write(chunk)
+                    buf += chunk
+                    *parts, buf = re.split(rb'[\r\n]', buf)          # keep the incomplete tail
+                    for part in parts:
+                        m = epat.search(ansi.sub('', part.decode('utf-8', 'ignore')))
+                        if m and (e := int(m.group(1)) + 1) > seen:
+                            bar.update(e - seen); seen = e
+                proc.wait()
+            if proc.returncode == 0 and seen < total_epochs:          # clean finish -> fill to 100%
+                bar.update(total_epochs - seen)
+            bar.close()
+            rc = proc.returncode
+        if rc != 0:
+            tail = ''.join(open(log, errors='ignore').readlines()[-25:])
+            raise RuntimeError(f'chemprop failed ({rc}); log {log}\n{tail}')
 
     @staticmethod
     def _ckpt(model_dir):
@@ -187,7 +250,8 @@ class OUTPUT:
                 return ck
             except FileNotFoundError:
                 pass
-        rows = data.public_rows(params, endpoints)
+        rows = (data.cluster_public_rows(params, gname) if data.is_cluster(params, gname)
+                else data.public_rows(params, endpoints))
         pub = pd.concat(rows, ignore_index=True)
         for ep in endpoints:                                    # every target column must exist
             if ep not in pub:
@@ -210,19 +274,21 @@ class OUTPUT:
                '--target-columns', *endpoints, '--splits-column', 'splits', '-t', 'regression',
                '--metrics', 'rmse', 'mae', '--epochs', str(params.epochs_pretrain),
                '--patience', str(params.patience), '--num-workers', '0',
-               '-o', str(out), '--data-seed', str(params.seed)]
+               '-o', str(out), '--data-seed', str(params.seed), '--pytorch-seed', str(params.seed)]
         cmd += self._hp_flags(params) + self._desc_flags(params, data, set(cols))
         print(f"> [{gname}] PRETRAIN on {len(pub)} public rows, {len(endpoints)} tasks, "
               f"{params.epochs_pretrain}ep ...", flush=True)
         t = time.perf_counter()
-        self._run(cmd, self.run / f'pretrain_{gname}{tag}.log')
+        self._run(cmd, self.run / f'pretrain_{gname}{tag}.log',
+                  total_epochs=params.epochs_pretrain, desc=f'pretrain {gname}')
         ck = self._ckpt(out)
         print(f"  done in {time.perf_counter() - t:.0f}s -> {ck.relative_to(ROOT)}", flush=True)
         return ck
 
     # ---------- stage 2: frozen-encoder finetune on one RF fold ----------
 
-    def finetune_fold(self, data, params, ep, gname, endpoints, ckpt, fold, train_ids, test_ids, arm='transfer'):
+    def finetune_fold(self, data, params, ep, gname, endpoints, ckpt, fold, train_ids, test_ids, arm='transfer',
+                      bar=None):
         """Train on ep's RF fold-TRAIN compounds (using ALL their grouping labels) and predict the held-out
         fold. Returns a preddf (compound, real_y, pred_y) for ep only.
         ckpt set   -> `--checkpoint` (+ `--freeze-encoder`): the public-pretrained transfer arm.
@@ -237,30 +303,40 @@ class OUTPUT:
         if len(tr) >= 10:
             sp[rng.choice(len(tr), size=max(1, int(len(tr) * 0.1)), replace=False)] = 'val'
         ft = pd.concat([tr.assign(splits=sp), te.assign(splits='test')], ignore_index=True)
+        # cluster groupings have auxiliary tasks internal data never measures -> create them as NaN so the
+        # head shape matches the checkpoint and chemprop's multitask loss masks them
+        for t in endpoints:
+            if t not in ft.columns:
+                ft[t] = np.nan
+        if bar is not None:
+            bar.set_postfix_str(f'fold {fold}: finetune n={len(tr)}')
         cols = ['smiles', 'splits'] + endpoints + [c for c in data.ds_cols if c in ft.columns]
-        csv = self.run / f'ft_{arm}_{ep}_f{fold}.csv'
+        csv = self.run / f'ft_{arm}_{gname}_{ep}_f{fold}.csv'
         ft[cols].to_csv(csv, index=False)
-        mdir = self.run / f'ft_model_{arm}_{ep}_f{fold}'
+        mdir = self.run / f'ft_model_{arm}_{gname}_{ep}_f{fold}'
         cmd = [params.chemprop_bin, 'train', '-i', str(csv), '-s', 'smiles',
                '--target-columns', *endpoints, '--splits-column', 'splits', '-t', 'regression',
                '--metrics', 'rmse', 'mae', '--epochs', str(params.epochs_finetune),
                '--patience', str(params.patience), '--num-workers', '0',
-               '-o', str(mdir), '--data-seed', str(params.seed)]
+               '-o', str(mdir), '--data-seed', str(params.seed), '--pytorch-seed', str(params.seed)]
         # transfer arm loads the public-pretrained weights; the control trains from scratch
         if ckpt is not None:
             cmd += ['--checkpoint', str(ckpt)]
             if params.freeze_encoder:
                 cmd += ['--freeze-encoder']
         cmd += self._hp_flags(params) + self._desc_flags(params, data, set(cols))
-        self._run(cmd, self.run / f'ft_{arm}_{ep}_f{fold}.log')
+        self._run(cmd, self.run / f'ft_{arm}_{gname}_{ep}_f{fold}.log',
+                  total_epochs=params.epochs_finetune, desc=f'{arm}/{gname}/{ep} f{fold} finetune')
         # predict the held-out fold with the finetuned model
-        pin = self.run / f'ft_test_{arm}_{ep}_f{fold}.csv'
+        if bar is not None:
+            bar.set_postfix_str(f'fold {fold}: predicting {len(te)}')
+        pin = self.run / f'ft_test_{arm}_{gname}_{ep}_f{fold}.csv'
         te[['smiles'] + [c for c in data.ds_cols if c in te.columns]].to_csv(pin, index=False)
-        pout = self.run / f'ft_preds_{arm}_{ep}_f{fold}.csv'
+        pout = self.run / f'ft_preds_{arm}_{gname}_{ep}_f{fold}.csv'
         pcmd = [params.chemprop_bin, 'predict', '-i', str(pin), '-s', 'smiles',
                 '--model-path', str(self._ckpt(mdir)), '--preds-path', str(pout)]
         pcmd += self._desc_flags(params, data, set(te.columns))
-        self._run(pcmd, self.run / f'ftpred_{arm}_{ep}_f{fold}.log')
+        self._run(pcmd, self.run / f'ftpred_{arm}_{gname}_{ep}_f{fold}.log')
         preds = pd.read_csv(pout)
         # the endpoint's column: multitask predictions come back as pred_<i> or named by target
         i = endpoints.index(ep)
@@ -270,31 +346,64 @@ class OUTPUT:
         return pd.DataFrame({'compound': te['compound'].to_numpy(), 'real_y': te[ep].to_numpy(float),
                              'pred_y': preds[col].to_numpy(float), 'fold': fold})
 
+    # ---------- public -> internal (no CV, no finetune) ----------
+
+    def pretrain_only_endpoint(self, data, params, ep, gname, endpoints, ckpt):
+        """Predict EVERY internal compound that has `ep` measured, straight from the public-only pretrained
+        model. No folds and no training are needed: the checkpoint never saw an internal label, so this is a
+        clean single-block evaluation directly comparable to the RF `ext_->_internal` arm."""
+        te = data.tgt[data.tgt[ep].notna()]
+        pin = self.run / f'po_test_{gname}_{ep}.csv'
+        te[['smiles'] + [c for c in data.ds_cols if c in te.columns]].to_csv(pin, index=False)
+        pout = self.run / f'po_preds_{gname}_{ep}.csv'
+        cmd = [params.chemprop_bin, 'predict', '-i', str(pin), '-s', 'smiles',
+               '--model-path', str(ckpt), '--preds-path', str(pout)]
+        cmd += self._desc_flags(params, data, set(te.columns))     # must match the pretrain flags
+        self._run(cmd, self.run / f'po_{gname}_{ep}.log')
+        preds = pd.read_csv(pout)
+        i = endpoints.index(ep)
+        col = f'pred_{i}' if f'pred_{i}' in preds.columns else (ep if ep in preds.columns else None)
+        if col is None:
+            raise RuntimeError(f'{ep}/{gname}: no prediction column in {list(preds.columns)[:6]}')
+        oof = pd.DataFrame({'compound': te['compound'].to_numpy(), 'real_y': te[ep].to_numpy(float),
+                            'pred_y': preds[col].to_numpy(float)}).dropna(subset=['real_y', 'pred_y'])
+        m = ML_Reg.get_reg_metrics_from_preddf(oof, ntrain=len(data.tgt))
+        out = ROOT / params.output_dir
+        (out / 'preddfs').mkdir(parents=True, exist_ok=True)
+        oof.to_parquet(out / 'preddfs' / f'{ep}_pretrain_only_{gname}_cv.parquet', index=False)
+        rec = {'endpoint': ep, 'arm': 'pretrain_only', 'grouping': gname, 'n': len(oof),
+               'r2': m.get('r2'), 'r2det': m.get('r2det'), 'rmse': m.get('rmse'),
+               'spearman_rho': m.get('spearman_rho'), 'freeze_encoder': False, 'folds_run': 0}
+        tqdm.write(f"> {ep:11} [pretrain_only/{gname:12}] r2={rec['r2']}  R2det={rec['r2det']}  n={rec['n']}")
+        return rec
+
     # ---------- per-endpoint driver ----------
 
     def run_endpoint(self, data, params, ep, ckpt, gname, endpoints, folds, max_folds=None, arm='transfer'):
         """Loop ep's RF folds, pool the out-of-fold predictions, and score with R2 + R2det.
         arm 'transfer' uses the pretrained checkpoint; arm 'scratch' is the internal-only control."""
         parts = []
-        for k, (tr, te) in enumerate(folds, 1):
-            if max_folds and k > max_folds:
-                break
+        todo = folds[:max_folds] if max_folds else folds
+        bar = tqdm(total=len(todo), desc=f'{arm}/{gname}/{ep} folds', unit='fold')
+        for k, (tr, te) in enumerate(todo, 1):
             t = time.perf_counter()
-            pdf = self.finetune_fold(data, params, ep, gname, endpoints, ckpt, k, tr, te, arm=arm)
+            pdf = self.finetune_fold(data, params, ep, gname, endpoints, ckpt, k, tr, te, arm=arm, bar=bar)
             parts.append(pdf)
-            print(f"  [{arm}/{ep} fold {k}/{len(folds)}] n_train={len(tr)} n_test={len(te)} "
-                  f"({time.perf_counter() - t:.0f}s)", flush=True)
+            bar.update(1)
+            tqdm.write(f"  [{arm}/{gname}/{ep} fold {k}/{len(todo)}] n_train={len(tr)} n_test={len(te)} "
+                       f"({time.perf_counter() - t:.0f}s)")
+        bar.close()
         oof = pd.concat(parts, ignore_index=True).dropna(subset=['real_y', 'pred_y']).reset_index(drop=True)
         m = ML_Reg.get_reg_metrics_from_preddf(oof, ntrain=len(data.tgt))
         out = ROOT / params.output_dir
         (out / 'preddfs').mkdir(parents=True, exist_ok=True)
-        oof.to_parquet(out / 'preddfs' / f'{ep}_{arm}_cv.parquet', index=False)
-        rec = {'endpoint': ep, 'arm': arm, 'grouping': gname if arm == 'transfer' else '-', 'n': len(oof),
+        oof.to_parquet(out / 'preddfs' / f'{ep}_{arm}_{gname}_cv.parquet', index=False)
+        rec = {'endpoint': ep, 'arm': arm, 'grouping': gname, 'n': len(oof),
                'r2': m.get('r2'), 'r2det': m.get('r2det'), 'rmse': m.get('rmse'),
                'spearman_rho': m.get('spearman_rho'),
                'freeze_encoder': bool(params.freeze_encoder) if arm == 'transfer' else False,
                'folds_run': len(parts)}
-        print(f"> {ep:11} [{arm:8}] r2={rec['r2']}  R2det={rec['r2det']}  n={rec['n']}", flush=True)
+        tqdm.write(f"> {ep:11} [{arm:8}/{gname:12}] r2={rec['r2']}  R2det={rec['r2det']}  n={rec['n']}")
         return rec
 
     def write_outputs(self, params):
@@ -305,9 +414,10 @@ class OUTPUT:
         tbl = pd.DataFrame(self.rows)
         if fp.exists():
             prev = pd.read_csv(fp)
-            keys = set(zip(tbl['endpoint'], tbl['arm']))
-            if 'arm' in prev.columns:
-                prev = prev[[k not in keys for k in zip(prev['endpoint'], prev['arm'])]]
+            keys = set(zip(tbl['endpoint'], tbl['arm'], tbl['grouping']))
+            if {'arm', 'grouping'} <= set(prev.columns):
+                prev = prev[[k not in keys for k in
+                             zip(prev['endpoint'], prev['arm'], prev['grouping'])]]
             tbl = pd.concat([prev, tbl], ignore_index=True)
         tbl.to_csv(fp, index=False)
         return tbl, fp
@@ -322,8 +432,13 @@ def main():
     ap.add_argument('--force_pretrain', action='store_true', help="retrain stage 1 even if a checkpoint exists")
     ap.add_argument('--smoke_rows', type=int, default=2000, help="public rows for a --smoke pretrain")
     ap.add_argument('--smoke_epochs', type=int, default=3, help="epochs for both stages during --smoke")
+    ap.add_argument('--grouping', default='',
+                    help="override the pretrain grouping/cluster: a name, or 'best' to take each "
+                         "endpoint's winner from BEST_CHEMPROP_GROUPINGS "
+                         "(e.g. permeability, mdck_perm); default = config endpoint_grouping")
     ap.add_argument('--arms', default='transfer,scratch',
-                    help="transfer = public pretrain + frozen finetune; scratch = internal-only control (no pretrain)")
+                    help="transfer = public pretrain + frozen finetune; scratch = internal-only control "
+                         "(no pretrain); pretrain_only = public->internal, no folds and no finetune")
     ap.add_argument('--resume', action='store_true', help="skip endpoints already in summary_transfer.csv")
     args = ap.parse_args()
 
@@ -338,33 +453,47 @@ def main():
     fp = ROOT / params.output_dir / 'summary_transfer.csv'
     if args.resume and fp.exists():
         prev = pd.read_csv(fp)
-        done = set(zip(prev['endpoint'], prev['arm'])) if 'arm' in prev.columns else set()
+        done = (set(zip(prev['endpoint'], prev['arm'], prev['grouping']))
+                if {'arm', 'grouping'} <= set(prev.columns) else set())
 
     # a smoke run shrinks BOTH stages so the pipeline is validated in minutes, not hours
     if args.smoke:
         params.epochs_pretrain = params.epochs_finetune = args.smoke_epochs
-    print(f"> chemprop transfer | endpoints={eps} | arms={arms} | freeze_encoder={params.freeze_encoder} | "
+    print(f"> chemprop transfer | endpoints={eps} | arms={arms} | grouping={args.grouping or 'config'} | "
+          f"freeze_encoder={params.freeze_encoder} | "
           f"descriptors={params.descriptors} | hp={params.hp}"
           + (f" | SMOKE {args.smoke_rows} rows / {args.smoke_epochs} ep / 1 fold" if args.smoke else ''), flush=True)
 
     # stage 1 once per grouping — skipped entirely when only the scratch control is requested
+    # resolve the pretrain grouping per endpoint: explicit name | 'best' (config winner) | config default
+    if args.grouping == 'best':
+        gof = {e: params.best_groupings[e]['grouping'] for e in eps}
+    else:
+        gof = {e: (args.grouping or params.endpoint_grouping[e]) for e in eps}
     ckpts = {}
-    if 'transfer' in arms:
-        need = sorted({params.endpoint_grouping[e] for e in eps})
-        ckpts = {g: output.pretrain(data, params, g, params.groupings[g], force=args.force_pretrain,
-                                    n_rows=args.smoke_rows if args.smoke else None,
-                                    tag='_smoke' if args.smoke else '') for g in need}
+    if {'transfer', 'pretrain_only'} & set(arms):
+        for g in sorted(set(gof.values())):
+            ckpts[g] = output.pretrain(data, params, g, data.task_list(params, g),
+                                       force=args.force_pretrain,
+                                       n_rows=args.smoke_rows if args.smoke else None,
+                                       tag='_smoke' if args.smoke else '')
 
     # stage 2 per endpoint on RF's exact folds
     for ep in eps:
-        g = params.endpoint_grouping[ep]
+        g = gof[ep]
+        tasks = data.task_list(params, g)
         folds = data.rf_folds(params, ep)
         for arm in arms:
-            if (ep, arm) in done:
-                print(f"[skip] {ep}/{arm}: already in summary", flush=True); continue
-            rec = output.run_endpoint(data, params, ep, ckpts.get(g) if arm == 'transfer' else None,
-                                      g, params.groupings[g], folds,
-                                      max_folds=1 if args.smoke else None, arm=arm)
+            # the scratch control has no pretrain, so it is recorded once per endpoint (grouping '-')
+            gtag = g if arm in ('transfer', 'pretrain_only') else '-'
+            if (ep, arm, gtag) in done:
+                print(f"[skip] {ep}/{arm}/{gtag}: already in summary", flush=True); continue
+            if arm == 'pretrain_only':
+                rec = output.pretrain_only_endpoint(data, params, ep, g, tasks, ckpts[g])
+            else:
+                rec = output.run_endpoint(data, params, ep, ckpts.get(g) if arm == 'transfer' else None,
+                                          gtag, tasks, folds,
+                                          max_folds=1 if args.smoke else None, arm=arm)
             output.rows.append(rec)
             if not args.smoke:
                 output.write_outputs(params)

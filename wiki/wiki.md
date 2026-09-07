@@ -207,6 +207,24 @@ log10→10**p, logit→100/(1+10**-p), identity→p).
 
 ## ADME_build_ML.py — notebook↔module port (2026-08-20, in progress)
 
+**⚠️ KNOWN ISSUE — `build_MF_features` cache goes STALE on new internal data; new compounds are SILENTLY
+DROPPED (found 2026-09-04, NOT yet fixed).** `build_MF_features(params, type, date)` is an all-or-nothing cache keyed
+by the **`date` filename argument**: if `<MF_features_all_path>/<date>_MF_features.parquet` exists it is
+`read_parquet`ed WHOLESALE — nothing is recomputed, and there is NO check that its compound set still matches
+`df_all`. (Note it is ONE matrix for internal AND public together, ~369k compounds — not "public precomputed,
+internal recomputed per load".) Consequence: after a fresh CDD pull, new internal compounds have no features, and
+`_endpoint_ML` does `pd.merge(self._feats(endpoint), d, on='compound').dropna()` — an **INNER merge**, so those
+compounds vanish with no error and no warning. The only symptom is a lower-than-expected `ML_data` row count, so a
+model can be trained on a stale compound set while appearing to include the new data.
+**Workaround today:** bump the stamp — `data.build_MF_features(params, type='H237', date='<new date>')` — which forces
+a full recompute of all ~369k (descriptastorus block dominates, `n_jobs=32`); then update the hardcoded
+`output/features/20260824_MF_features.parquet` path used by the chemprop cells/runner.
+**Fix to implement (2 parts, both contained):** (1) **coverage assertion** — compare
+`set(df_all.compound) - set(MF_features['all'].compound)` and warn/raise on a shortfall, turning silent data loss into
+a visible message; (2) **incremental top-up** — featurize only the missing compounds and concat, since features are a
+pure function of SMILES, making a new CDD pull a seconds-long operation instead of a full rebuild.
+Deferred by user decision (2026-09-04) to keep focus on the chemprop port.
+
 `python/ADME_build_ML.py` mirrors `MS_build_ML.py`: `PARAMS`/`DATA`/`OUTPUT` scaffold, runs standalone
 (`--config`, `--overwrite`) AND callable from `vignettes/Multitask_adme_preds.ipynb` (`%autoreload 2`).
 Section 0 ported: `params = PARAMS(cfg).load_params()` (+ uppercase-key shim), `data = DATA();
@@ -360,7 +378,256 @@ CAVEAT on interpretation: `transfer` trains only the FFN head (frozen encoder) w
 weight, so they differ in trainable-parameter count as well as in initialisation — it is the practical
 "pretrain+freeze vs no pretrained model" comparison, not a pure weight ablation. Set config
 `freeze_encoder: false` for a full-finetune variant that isolates freezing itself.
-Smoke PASSED for both arms (rlm, 1 fold: transfer r2 0.453, scratch r2 0.417 — plumbing only). Real run: pending.
+Smoke PASSED for both arms (rlm, 1 fold: transfer r2 0.453, scratch r2 0.417 — plumbing only).
+**PROGRESS TRACKING (2026-09-02):** `OUTPUT._run(cmd, log, total_epochs, desc)` now streams the chemprop
+subprocess, drives a **tqdm epoch bar** off Lightning's `Epoch N` markers, and STILL tees the full output to the
+log (so the failure tail survives) — parsing adapted from `ML_Reg._run_chemprop_train_epoch_bar`, which
+discards its log. Bars: stage-1 `pretrain <grouping>` over epochs; per fold a transient (`leave=False`)
+`<arm>/<ep> f<k> finetune` epoch bar; and a persistent `<arm>/<ep> folds` bar whose postfix tracks the step
+(`finetune n=31` -> `predicting 8`). Per-fold and per-endpoint lines go through `tqdm.write` so they never
+clash with the bars.
+
+**REUSABLE HELPER (2026-09-04): `ML_Reg.chemprop_finetune_K_fold_by_defined_IDs`** — the two-stage transfer
+analogue of `ML_Reg.chemprop_K_fold_by_defined_IDs`, so the notebook can run the transfer arm through the same
+call shape as RF. Stage 1 pretrains multitask on a PUBLIC frame (`df_pretrain`) ONCE and caches the checkpoint
+under `pretrain_dir` (reused across calls; `force_pretrain` retrains). Stage 2 loops `ID_sets` = RF's exact
+folds: `--checkpoint` + `--freeze-encoder` finetune on the fold's train IDs, predict its held-out IDs, pool the
+5 sets into one OOF frame `[ID, real_y, pred_y, uncertainty, fold]` (checkpoint path on `.attrs`). `targets`
+gives the multitask column list and `target` the scored one; the prediction column is resolved by task INDEX
+(`pred_<j>`), not by name. `targets=None` makes both stages single-task. Missing task columns are created as
+NaN so the head shape matches the checkpoint and chemprop's loss masks them. Descriptor columns must exist in
+BOTH frames and are passed identically at pretrain/finetune/predict, because chemprop v2 stores only the fitted
+scaler. Leakage stays the CALLER's job (public must not appear in a test fold), exactly as in the RF version.
+Verified with a stub-binary smoke test (argv assertions on both stages, checkpoint reuse, single-task mode,
+`freeze_encoder=False`); helpers `_newest_chemprop_ckpt` / `_chemprop_hp_desc_flags` added alongside.
+NOTE: `~/Scripts/ML_Reg.py` lives OUTSIDE this repo, so it is not covered by this repo's git history.
+
+**LEAK-CONTROL HELPERS (2026-09-04): `fn.inchikeys_for` / `fn.drop_internal_twins` in `python/functions.py`.**
+Reusable molecule-level leak filter for any public->internal transfer arm. `inchikeys_for(df, level=)` resolves
+InChIKeys from the `autoresearch/predict_adme/_ikcache/*.parquet` files (compound -> `_ik`, 26 sources already
+computed) and falls back to `smiles_to_inchikeys` only for what the cache misses. `level='exact'` = the 27-char
+key; `level='skeleton'` = block 1 (14 chars), which also matches salts, stereoisomers, tautomers and charge
+states. `drop_internal_twins(pub, internal, level=)` returns `(pub without the twins, dropped mask)` and prints
+the count; `level='none'` disables it. Notebook cell 26 now carries a 2-line tripwire (`CP_LEAK`, default
+`'exact'`). Tested on public reference molecules (ethanol exact twin, L/D-alanine skeleton twin, benzene clean,
+unparseable SMILES stays NaN, real cache resolves without fallback).
+
+**PORTED (2026-09-04): `DATA.build_ML_data_CP(params, k, grouping, leak, n_splits, seed)` in
+`python/ADME_build_ML.py`** — the chemprop analogue of `build_ML_data_<ep>`, so the notebook no longer holds
+the dataset assembly. It sources from the WIDE `df_all` plus the 200 `DS_` descriptastorus columns of
+`MF_features['all']` (the `MF_` fingerprint columns are NOT carried), and sets on `self`: `cp_k`,
+`cp_grouping`, `cp_tasks`, `cp_ds_cols`, `cp_pub` (stage-1 PUBLIC pretrain pool: rows with >=1 grouping task
+measured), `cp_int` (stage-2 INTERNAL finetune pool: rows measured for k, other tasks masked auxiliaries),
+`cp_folds` and `cp_fold_source`. Leak control runs through `fn.drop_internal_twins` (`leak=` 'exact' default).
+Those attributes are exactly the arguments of `ML_Reg.chemprop_finetune_K_fold_by_defined_IDs`.
+**FOLD PROVENANCE IS NOW EXPLICIT** (`DATA._cp_folds`): it prints the path it reads,
+`<CHEMPROP_TRANSFER.rf_metrics_dir>/<k>.pkl`, and returns `cp_fold_source='rf:<path>'`. When that pickle is
+ABSENT it prints `NOT FOUND`, builds an INDEPENDENT InChIKey-grouped `n_splits` split over `cp_int`, and
+returns `cp_fold_source='independent'` — those folds are NOT comparable to RF fold by fold. It also warns when
+RF fold compounds are missing from `cp_int`. `DATA._grouped_folds` gained an optional `df=` argument (default
+`self.internal`) so the CP path reuses the same grouping logic; its single existing caller is unchanged.
+A cluster grouping (`mdck_perm`, `ppb_fu`) raises: `df_all` holds no raw Novartis aux column, so those still
+need `python/run_chemprop_transfer.py`. Tests: `tests/test_build_ml_data_cp.py`, 5/5 pass (pools, tasks,
+DS_-only features, leak filter, both fold sources, cluster refusal); the 18 pre-existing tests still pass.
+
+**NAMED ENTRY POINT (2026-09-04): `DATA.build_ML_data_RF(params, k=None)`** — the RF twin of
+`build_ML_data_CP`, so no caller needs `exec('data.build_ML_data_'+k+'()')`. Body is 2 lines: bind
+`self.params = params`, then `self._endpoint_ML(k or self.k)`. Notebook cells 10, 13 and 24 now call it, and
+so do `OUTPUT.assess_all_endpoints` and `OUTPUT.deploy_all_endpoints`. The per-endpoint
+`build_ML_data_<ep>` / `get_<ep>_data` aliases STAY — `run_nvs_cellab.py`, `bench_models_transfer.py`,
+`run_adme_nearshell.py` and `nvs_campaign.py` still use the getattr pattern, and `tests/test_build_ml_data.py`
+asserts all 8 exist. Test `test_build_ML_data_RF_matches_the_alias` proves the two paths give an identical
+frame. Suite: 24/24 pass.
+
+**★ PORTED (2026-09-07): `OUTPUT.assess_predictions_cp(data, outpath)` + the `ml_model` dispatch.**
+The chemprop twin of `assess_predictions`, recording into `self.metrics_results_cp[k]` and caching to
+config `CHEMPROP_TRANSFER.metrics_pkl_dir` = `output/results/20260907_metrics_cp/<k>.pkl`.
+`assess_predictions(data, outpath, ml_model='rf')` gained the argument and dispatches to it on
+`ml_model='chemprop'`; every existing RF call is unchanged because 'rf' is the default.
+DECISION: two bodies, one call surface. The RF body and the chemprop body share nothing (sklearn +
+tree-variance UQ on `data.d`/`fold_ids` vs a shelled-out two-stage run on `cp_int`/`cp_pub`/`cp_folds`;
+6 arms vs 3), so a single `if/else` method would be two methods with one name. The dispatcher is 2 lines.
+**THE 3 ARMS mirror the RF names, so the two models compare directly on the same folds:**
+- `augmented_cv` — public PRETRAIN (once) + frozen-encoder finetune per fold, predict the held-out fold.
+  Public enters TRAIN only, exactly the RF `augmented_cv` semantics.
+- `internal_cv` — the SAME folds with `df_pretrain=None`: no public data, no pretrained weights, the whole
+  D-MPNN trains from scratch. This is the honest control for what the pretraining contributes.
+- `ext_->_internal` — the public-only checkpoint predicts every internal compound. No finetune, no folds.
+Provenance rides in the result under `_grouping`, `_tasks`, `_fold_source`, `_pretrain_checkpoint`.
+NO `conf_*` columns: a plain `regression` head returns no per-row std, so there is nothing to calibrate
+(the RF arms keep their 4 conf_* variants). `endpoint_metrics_table_from_dict` works unchanged — it derives
+the rows from the `*_metrics` keys, so the `_*` provenance keys are ignored.
+**ML_Reg additions (2026-09-07):** `chemprop_predict_from_checkpoint(df, ID, ckpt, ...)` — predict a frame
+with any trained checkpoint and return `[ID, real_y, pred_y, uncertainty]`, the target column resolved by
+task INDEX. It now serves BOTH the per-fold prediction inside
+`chemprop_finetune_K_fold_by_defined_IDs` and the `ext_->_internal` arm, so the predict+parse logic exists
+once. `chemprop_finetune_K_fold_by_defined_IDs` now accepts `df_pretrain=None` to SKIP stage 1 (that is the
+`internal_cv` arm). BUG FOUND AND FIXED while testing: the finetune passed `--checkpoint None` when there
+was no checkpoint; the flag pair is now conditional.
+Tests: `tests/test_assess_predictions_cp.py`, 3/3 pass — it writes its own STUB `chemprop` script, then
+asserts the argv (1 pretrain + 2 transfer folds with `--checkpoint`/`--freeze-encoder` + 2 scratch folds
+without + 5 predicts), the 3 arms and their provenance, and the pickle round trip through the dispatcher.
+Suite: 28/28 pass.
+
+**★ REPRODUCIBILITY FIXED (2026-09-07): chemprop needs `--pytorch-seed`, NOT only `--data-seed`.**
+SYMPTOM: R2 moved between identical chemprop runs. CAUSE (`chemprop/cli/train.py:1797`): with
+`pytorch_seed=None` chemprop calls `seed = torch.seed()` — a RANDOM seed — and sets Lightning
+`Trainer(deterministic=False)`. `--data-seed` fixes only the train/val split, never the weight
+initialisation or the dropout mask. MEASURED on one 96-row all8 finetune fold, 2 runs each, comparing the
+8 task predictions of 96 molecules:
+- with `--pytorch-seed 42`: max abs difference **4e-07** (CSV rounding at 6 decimals only); checkpoint
+  val_loss identical (0.52 / 0.52).
+- without it: max abs difference **0.152** (solubility; 0.026-0.060 on the other 7 tasks); val_loss
+  differed (0.53 / 0.52).
+FIX: `--pytorch-seed <seed>` now travels with `--data-seed <seed>` in all 3 chemprop `train` command
+builders — `ML_Reg.chemprop_finetune_K_fold_by_defined_IDs` (pretrain + finetune) and the older
+single-stage `ML_Reg.chemprop_K_fold_by_defined_IDs` — plus both builders in
+`python/run_chemprop_transfer.py`. One knob: the `seed` argument now drives the split AND PyTorch.
+NOTE: the PyTorch seed also switches Lightning into deterministic mode, which makes a non-deterministic
+CUDA kernel RAISE instead of running. Verified safe on this box (torch 2.13.0+cu126, CUDA available,
+`aggregation: sum`) — 2 runs, exit 0, no "does not have a deterministic implementation" error.
+CAUTION: every chemprop number recorded BEFORE this fix carries run-to-run noise of roughly +/-0.15 in
+prediction units. Small margins between arms (caco2 0.771 vs RF 0.749, logd 0.832 vs 0.803) are inside
+that noise and need a re-run to confirm.
+ONE SEED, ONE SOURCE (2026-09-07): `CHEMPROP_TRANSFER.seed: 42` is now an explicit config key. Before, both
+chemprop paths borrowed `RF_SINGLETASK.seed`, so changing the RF seed silently changed every chemprop run.
+`run_chemprop_transfer.PARAMS.seed` and `OUTPUT.assess_predictions_cp` both read `CHEMPROP_TRANSFER.seed`
+(default 42), and `ML_Reg`'s `seed=42` default matches. All three verified to report 42.
+
+**CLUSTER GROUPINGS NOW WORK IN THE NOTEBOOK (2026-09-07).** `build_ML_data_CP` used to REFUSE
+`kind: cluster` (mdck -> `mdck_perm`, ppb -> `ppb_fu`) and send the caller to
+`python/run_chemprop_transfer.py`, which broke the 8-endpoint loop. It now reads the cluster spec from
+config `CHEMPROP_TRANSFER.clusters[<grouping>]`, loads `<ADME_CACHE>/<file>`
+(`tf_novartis_mdck_perm.parquet` = 273,638 rows x 5 aux tasks; `tf_novartis_ppb_fu.parquet` = 273,638 x 10),
+drops `_ik`, and sets `cp_tasks = [target] + aux`. ONE left merge on SMILES adds the aux columns, and then
+INTERNAL rows are blanked back to NaN.
+**WHY the blanking, found by a test:** the join is structure-based, so an internal molecule that also exists
+in the Novartis frame inherited its PREDICTED aux values into the finetune — the exact calibration bias THE
+LAW warns about, and unlike the runner, whose internal aux is always NaN. Blanking keeps the notebook arm
+identical in meaning to the recorded runner numbers (mdck_perm 0.467, ppb_fu 0.022).
+Test `test_cluster_grouping_joins_the_novartis_aux_tasks` replaces the old refusal test: it asserts the task
+order (`[target] + aux`, `_ik` never a task), aux VALUES on the public rows, and aux ALL NaN on the internal
+rows. Suite: 27/27 pass.
+
+**★ RESULT — clearance group: TRANSFER BEATS RF INTERNAL-ONLY ON ALL 3 ENDPOINTS (2026-09-02,
+`output/predictions_runs_chemprop_transfer/summary_transfer.csv`).** R2det on RF's IDENTICAL folds; pretrain
+`clearance` = 280,881 public rows, 3 tasks, 30ep, **543s (~9 min — my "hours" estimate was wrong by >10x, so
+all8 is cheap too)**; each finetune ~14s.
+| ep | RF augmented | RF internal | cp scratch | **cp transfer** | vs RF int | pretrain gain | trf calib_gap | aug calib_gap |
+|----|--------------|-------------|------------|-----------------|-----------|---------------|---------------|---------------|
+| hlm | 0.373 | 0.576 | 0.320 | **0.647** | **+0.071** | +0.327 | 0.016 | 0.125 |
+| mlm | 0.464 | 0.649 | 0.357 | **0.673** | **+0.024** | +0.316 | 0.005 | 0.090 |
+| rlm | -0.185 | 0.107 | -0.162 | **0.274** | **+0.167** | +0.436 | 0.056 | 0.483 |
+**(1) The PRETRAINING does all the work (+0.32..+0.44 R2det over the control), NOT the architecture** — chemprop
+from scratch is WORSE than RF on all three (0.320<0.576, 0.357<0.649, -0.162<0.107). Without the scratch control we
+would have wrongly credited "chemprop > RF". **(2) rlm is RESCUED** — 0.107 -> 0.274 (+0.167, 2.5x), and its scratch
+arm is r2 = **0.000** (spearman 0.135: a D-MPNN on 31 compounds learns nothing). Everything else had failed on rlm
+(RF augmented -0.185, near-shell 0.057, Level-1 argmax 0.232 = fold noise). What worked = public-pretrained encoder +
+borrowing hlm/mlm labels on those same 31 train compounds. **(3) CALIBRATION IS PRESERVED — the thesis, measured:**
+transfer calib_gap 0.016/0.005/0.056 vs RF-augmented 0.125/0.090/**0.483**. Same public data; pretrain-then-recalibrate
+keeps the representation WITHOUT inheriting the offset — exactly the fix the near-shell was crudely approximating by
+discarding 99.97% of the pool. **(4) hlm/mlm were "neutral" endpoints** where near-shell declined augmentation 5/5 folds
+and nothing had ever beaten internal-only; both now beat it. 
+**★ RESULT — all 8 endpoints: the outcome splits PERFECTLY along the grouping line (2026-09-02).**
+R2det, RF's identical folds. **`clearance` transfer wins 3/3; `all8` transfer loses 5/5.**
+| ep | grouping | RF aug | RF int | near-shell | cp scratch | cp transfer | BEST | trf - best_prior |
+|----|----------|--------|--------|------------|------------|-------------|------|------------------|
+| hlm | clearance | 0.373 | 0.576 | 0.576 | 0.320 | **0.647** | **cpTransfer** | **+0.071** |
+| mlm | clearance | 0.464 | 0.649 | 0.629 | 0.357 | **0.673** | **cpTransfer** | **+0.024** |
+| rlm | clearance | -0.185 | 0.107 | 0.057 | -0.162 | **0.274** | **cpTransfer** | **+0.167** |
+| solubility | all8 | **0.731** | 0.678 | 0.688 | 0.484 | 0.671 | RFaug | -0.060 |
+| logd | all8 | 0.803 | **0.820** | 0.820 | 0.471 | 0.783 | RFint | -0.037 |
+| caco2 | all8 | 0.285 | **0.757** | 0.757 | 0.479 | 0.749 | RFint | -0.008 (tie) |
+| mdck | all8 | 0.134 | 0.474 | **0.539** | 0.383 | 0.429 | nearshell | -0.110 |
+| ppb | all8 | **0.537** | 0.435 | 0.455 | 0.050 | -0.123 | RFaug | -0.660 |
+**THE LAW: TASK RELATEDNESS IN THE PRETRAIN DECIDES.** `clearance` = one assay in 3 species = a coherent block
+(pretrain gain +0.33/+0.32/+0.44). `all8` = solubility+lipophilicity+permeability+binding+clearance = diluted
+representation (mdck gain only +0.046) and for **ppb actively HARMFUL** — transfer -0.123 is WORSE than its own
+scratch control (0.050), gain -0.173, and it is the ONLY transfer arm with a broken calib_gap (0.220 vs 0.005-0.056
+elsewhere). Independently reproduces the 2026-07 multitask finding ("hlm/mlm/rlm want the 3-task clearance block;
+collapse to ~0 in all8") by a different mechanism — the clearance block is special, now confirmed twice.
+**PREDICTION REFUTED:** I expected transfer to beat near-shell on mdck (keeps the whole pool's representation instead
+of discarding 99.97%); it scored 0.429, BELOW both near-shell 0.539 and internal-only 0.474. Near-shell stays the
+mdck champion. Note solubility/logd/caco2 lose only NARROWLY (-0.060/-0.037/-0.008) — a specialist pretrain may flip them.
+
+**★ CURRENT BEST PER ENDPOINT (2026-09-02) — supersedes the near-shell policy for the clearance endpoints:**
+| endpoint | method | R2det |
+|----------|--------|-------|
+| hlm | **chemprop transfer (clearance pretrain + frozen finetune)** | **0.647** |
+| mlm | **chemprop transfer (clearance)** | **0.673** |
+| rlm | **chemprop transfer (clearance)** | **0.274** |
+| solubility | RF full augmented (experimental public) | 0.731 |
+| logd | RF internal-only | 0.820 |
+| caco2 | RF internal-only | 0.757 |
+| mdck | RF + near-shell `dist060_agree` (~85 cmpd) | 0.539 |
+| ppb | RF full augmented (experimental public) | 0.537 |
+
+**NEXT (proposed): specialist pretrain groupings for the all8 endpoints.** Config `CHEMPROP_SYSTEMATIC.cp_clusters`
+already defines exactly these auxiliary task sets — `mdck_perm` {target mdck; Novartis MDCKv1/v2, Caco-2, MDR1 LogER,
+logPAMPA} and `ppb_fu` {target ppb; Novartis LogFu Rat/Human/Mouse/Dog/Monkey, HPLC LogFu HSA, LogFubrain, LogFumic,
+LogP, LogD7.4}. Add a `permeability: [caco2, mdck]` grouping too. Hypothesis: a coherent permeability / free-fraction
+block behaves like `clearance` did. Cheap to test (pretrain ~9 min). Also worth: re-run the winners at the HPO-best hp
+(hidden 2400 / dropout 0.0 / bs 64) — current numbers use the older `TEMPORAL_FRACTIONS.chemprop_hp` (hidden 300),
+so they are a FLOOR not a ceiling.
+
+**★ BUILT — specialist pretrain groupings + cluster groupings (2026-09-02).** `CHEMPROP_TRANSFER` now defines two
+KINDS of pretrain block, and `--grouping <name>` overrides the per-endpoint default so several groupings can be
+compared for the same endpoint (summary is keyed by **(endpoint, arm, grouping)**; preddfs are
+`<ep>_<arm>_<grouping>_cv.parquet`; the `scratch` control is recorded once per endpoint with grouping `-`).
+- **ENDPOINT groupings** (tasks = internal endpoint columns): `clearance` [hlm,mlm,rlm], **`permeability`
+  [caco2,mdck]** (same Papp A->B assay family — the clearance analogue), **`sol_lipo`** [solubility,logd]
+  (retest as a PRETRAIN block; the 2026-07 "don't ship" verdict was for multitask PREDICTION), `all8`.
+- **CLUSTER groupings** (tasks = internal target + related raw Novartis `pred(...)` columns as auxiliary
+  co-training tasks, prebuilt in `tf_novartis_<name>.parquet` by `python/build_novartis_clusters.py`):
+  **`mdck_perm`** (6 tasks: mdck + MDCKv2/v1 LogPapp, Caco-2 LogPapp, MDR1 LogER, logPAMPA; 273,638 public rows)
+  and **`ppb_fu`** (11 tasks: ppb + LogFu Rat/Human/Mouse/Dog/Monkey, HPLC LogFu HSA, LogFubrain, LogFumic,
+  NIBR LogP/LogD7.4; 275,446 rows = Novartis + EXP ppb with aux NaN). Aux column names are read from the parquet
+  schema, so they are not duplicated in config. `DATA.task_list` / `DATA.cluster_public_rows` resolve both kinds.
+- **BUG FIXED during the smoke:** the internal frame never measures a cluster's auxiliary tasks, so selecting the
+  task columns raised `KeyError`. `finetune_fold` now materializes any missing task column as NaN — the head shape
+  then matches the checkpoint and chemprop's multitask loss masks them. Smoke PASSED for both clusters
+  (mdck/mdck_perm 6 tasks, ppb/ppb_fu 11 tasks with 10 all-NaN at finetune — the hardest case).
+Driver: **`run_cp_transfer.sh`** (repo root) runs the 4 specialist groupings back to back, `--arms transfer` only,
+per-step logs + failure-tolerant, harvests result lines into `progress_transfer.log`, prints the final pivot.
+
+**★★ FINAL — chemprop transfer is CHAMPION on 5/8 endpoints (2026-09-02, all groupings complete).** R2det, RF's
+identical folds:
+| ep | RF aug | RF int | near-shell | cp all8 | **cp best** | grouping | CHAMPION | delta |
+|----|--------|--------|------------|---------|-------------|----------|----------|-------|
+| hlm | 0.373 | 0.576 | 0.576 | - | **0.647** | clearance | **cpTransfer** | **+0.071** |
+| mlm | 0.464 | 0.649 | 0.629 | - | **0.673** | clearance | **cpTransfer** | +0.024 |
+| rlm | -0.185 | 0.107 | 0.057 | - | **0.274** | clearance | **cpTransfer** | **+0.167** |
+| caco2 | 0.285 | 0.757 | 0.757 | 0.749 | **0.771** | permeability | **cpTransfer** | +0.014 |
+| logd | 0.803 | 0.820 | 0.820 | 0.783 | **0.832** | sol_lipo | **cpTransfer** | +0.012 |
+| solubility | **0.731** | 0.678 | 0.688 | 0.671 | 0.671 | all8 | RFaug | -0.060 |
+| mdck | 0.134 | 0.474 | **0.539** | 0.429 | 0.467 | mdck_perm | nearshell | -0.072 |
+| ppb | **0.537** | 0.435 | 0.455 | -0.123 | 0.022 | ppb_fu | RFaug | -0.515 |
+
+**RELATEDNESS HYPOTHESIS CONFIRMED — specialist beats all8 in 4/5 tests:** ppb_fu **+0.145**, sol_lipo(logd)
+**+0.049**, mdck_perm +0.038, permeability(caco2) +0.022; only sol_lipo(solubility) -0.016 and
+permeability(mdck) -0.003 fail. **Designing coherent task blocks is the single highest-leverage knob** in this arm.
+
+**THE RULE THAT EMERGES: transfer wins where the public data is PREDICTED (biased) — hlm/mlm/rlm/caco2/logd;
+RF-augmented wins where it is EXPERIMENTAL (already calibrated) — solubility/ppb.** Mechanism: pretrain-then-
+recalibrate repairs a systematic offset, so it only pays when there IS one. ppb/solubility have no bias to fix
+(calib_gap 0.011/0.007), so RF simply uses their clean public data better; transfer even HURTS ppb badly (-0.515).
+**mdck is the standing exception** — near-shell 0.539 still beats the best chemprop 0.467; my prediction that
+transfer would beat near-shell there is now REFUTED TWICE (all8 0.429, mdck_perm 0.467).
+**sol_lipo HALF-REFUTES the 2026-07 "worst grouping, don't ship" verdict** — that was for multitask PREDICTION; as a
+PRETRAIN block it is the best logd result in the project (0.832) while mildly hurting solubility (-0.016). Same
+pairing, opposite conclusion, because the role changed. **For mdck the useful auxiliary signal is the Novartis
+permeability PANEL (MDCKv1/v2, MDR1 LogER, PAMPA) not caco2** — mdck_perm +0.038 vs permeability -0.003.
+
+**★ CURRENT BEST PER ENDPOINT (2026-09-02, supersedes the earlier best-per-endpoint table):**
+hlm **cp clearance 0.647** | mlm **cp clearance 0.673** | rlm **cp clearance 0.274** | caco2 **cp permeability 0.771**
+| logd **cp sol_lipo 0.832** | solubility RF full-augmented 0.731 | mdck RF + near-shell `dist060_agree` 0.539
+| ppb RF full-augmented 0.537.
+**Open:** (1) all numbers use the OLDER `TEMPORAL_FRACTIONS.chemprop_hp` (hidden 300) not the HPO-best (hidden 2400,
+dropout 0.0, bs 64) -> a FLOOR, re-run the 5 winners at HPO-best. (2) `freeze_encoder: false` full-finetune variant
+untested. (3) chemprop results are NOT in `output.metrics_results[k]` form — they live as
+`summary_transfer.csv` + `preddfs/<ep>_<arm>_<grouping>_cv.parquet` with schema [compound, real_y, pred_y, fold]
+(= RF's `<arm>_preddf` minus uq_std/conf_*). An adapter keying them as `cp_<arm>_<grouping>_preddf`/`_metrics` would
+let `endpoint_metrics_table_from_dict` and the grouped-bar cell consume them unchanged (arm name must avoid 'temp').
 
 **★ NEAR-SHELL — AUTHORITATIVE RESULTS (2026-09-02). Supersedes and replaces all earlier near-shell result entries.**
 Single protocol throughout: internal CV / augmented CV / transfer from **`output/results/20260825_metrics/<ep>.pkl`**

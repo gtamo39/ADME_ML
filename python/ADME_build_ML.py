@@ -84,6 +84,9 @@ class DATA():
         self.pub_ids = self.int_ids = None            # compound ids (select_best_combo_and_update)
         self.fold_ids = self.fold_ids_aug = None      # CV splits, internal + augmented (select_best_combo_and_update)
         self.train_temp_ids = self.test_temp_ids = None   # 80/20 temporal split (select_best_combo_and_update)
+        self.cp_k = self.cp_grouping = self.cp_tasks = self.cp_ds_cols = None   # chemprop arm (build_ML_data_CP)
+        self.cp_pub = self.cp_int = None              # chemprop pretrain / finetune pools (build_ML_data_CP)
+        self.cp_folds = self.cp_fold_source = None    # chemprop CV folds + where they came from (build_ML_data_CP)
 
     def load_df_internal_exp_all(self, params, overwrite=False):
         """
@@ -202,6 +205,113 @@ class DATA():
         cap_note = f" (cap {cap:g} raw)" if cap is not None else ""
         print(f"> ML_data['{endpoint}']: {self.ML_data[endpoint].shape[0]} rows x {self.ML_data[endpoint].shape[1]} cols{cap_note}")
 
+    def build_ML_data_RF(self, params, k=None):
+        """
+        -RF modelling frame for one endpoint: the named entry point for _endpoint_ML, so a caller does not
+         need exec('data.build_ML_data_'+k+'()'). Winsorizes the label at the config cap, merges the H237
+         features onto the labels, drops feature NaNs and non-finite labels, and dedups molecules by SMILES.
+        param class params: PARAMS instance (ADME_ENDPOINTS)
+        param str k: endpoint key (default self.k)
+        return None: (sets self.ML_data[k])
+        """
+        self.params = params
+        self._endpoint_ML(k or self.k)
+
+    def build_ML_data_CP(self, params, k=None, grouping=None, leak='exact', n_splits=5, seed=42):
+        """
+        -Chemprop analogue of build_ML_data_<ep>: build the two frames the transfer arm needs, from the WIDE
+         df_all plus the precomputed descriptastorus DS_ columns of the H237 matrix. cp_pub is the stage-1
+         PUBLIC pretrain pool (rows with >=1 grouping task measured, never an internal label). cp_int is the
+         stage-2 INTERNAL finetune pool (rows measured for k; the other grouping tasks ride along as masked
+         auxiliaries). Public molecules that also exist internally are dropped (leak control). cp_folds come
+         from RF when its pickle exists, else from an independent grouped split.
+        param class params: PARAMS instance (BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER)
+        param str k: endpoint key to score (default self.k)
+        param str grouping: pretrain grouping name (default BEST_CHEMPROP_GROUPINGS[k]['grouping'])
+        param str leak: leak-control level for fn.drop_internal_twins ('exact' | 'skeleton' | 'none')
+        param int n_splits: fold count, used only when RF's pickle is absent
+        param int seed: fold seed, used only when RF's pickle is absent
+        return None: (sets self.cp_k, cp_grouping, cp_tasks, cp_ds_cols, cp_pub, cp_int, cp_folds, cp_fold_source)
+        """
+        self.params = params
+        k = k or self.k
+        assert 'all' in self.MF_features, 'run build_MF_features(params) first'
+        cfg = params.CHEMPROP_TRANSFER
+        self.cp_k = k
+        self.cp_grouping = grouping or params.BEST_CHEMPROP_GROUPINGS[k]['grouping']
+        # a CLUSTER grouping co-trains the target endpoint with raw Novartis columns from its own parquet;
+        # an ENDPOINT grouping uses internal endpoint columns only, so df_all already holds every task
+        spec = cfg.get('clusters', {}).get(self.cp_grouping)
+        aux = None
+        if spec is not None:
+            path = os.path.join(getattr(params, 'ADME_CACHE', 'autoresearch/predict_adme'), spec['file'])
+            aux = pd.read_parquet(path).drop(columns='_ik', errors='ignore').drop_duplicates('smiles')
+            main = [spec['target']]
+        else:
+            main = list(cfg['groupings'][self.cp_grouping])
+        self.cp_tasks = main + ([c for c in aux.columns if c != 'smiles'] if aux is not None else [])
+        # chemprop's features are the 200 precomputed descriptastorus columns, not the full H237 matrix
+        self.cp_ds_cols = [c for c in self.MF_features['all'].columns if c.startswith('DS_')]
+        keep = ['compound', 'smiles', 'source', 'origin'] + main + self.cp_ds_cols
+        wide = self.df_all.merge(self.MF_features['all'][['compound'] + self.cp_ds_cols],
+                                 on='compound', how='left')[keep]
+        # one LEFT merge adds the auxiliary tasks, then INTERNAL rows are blanked again: an internal molecule
+        # that also exists in the Novartis frame must not receive its PREDICTED aux values (that is the
+        # calibration bias THE LAW warns about), and it keeps the runner's behaviour, where internal aux is NaN
+        if aux is not None:
+            wide = wide.merge(aux, on='smiles', how='left')
+            wide.loc[wide.source == 'internal', [c for c in aux.columns if c != 'smiles']] = np.nan
+        # a non-finite label (log10 of 0, logit_pct of 0/100 %) breaks chemprop's target scaler -> mask it as
+        # NaN, so the multitask loss ignores that one task and the row keeps its other labels
+        n_inf = int(np.isinf(wide[self.cp_tasks].to_numpy(dtype=float)).sum())
+        wide[self.cp_tasks] = wide[self.cp_tasks].replace([np.inf, -np.inf], np.nan)
+        # stage 1 pool: PUBLIC rows with at least one grouping task measured
+        self.cp_pub = wide[(wide.source != 'internal') & wide[self.cp_tasks].notna().any(axis=1)].reset_index(drop=True)
+        # stage 2 pool: INTERNAL rows measured for k
+        self.cp_int = wide[(wide.source == 'internal') & wide[k].notna()].reset_index(drop=True)
+        # leak control: a public molecule that also exists internally must not pretrain the model
+        self.cp_pub, _ = fn.drop_internal_twins(self.cp_pub, self.cp_int, level=leak)
+        self.cp_folds, self.cp_fold_source = self._cp_folds(params, k, n_splits, seed)
+        print(f"> CP_data '{self.cp_grouping}' for '{k}': tasks={self.cp_tasks} | DS_ features={len(self.cp_ds_cols)}")
+        print(f"  cp_pub  {len(self.cp_pub):>7} public rows   non-null: "
+              + str({t: int(self.cp_pub[t].notna().sum()) for t in self.cp_tasks}))
+        print(f"  cp_int  {len(self.cp_int):>7} internal rows non-null: "
+              + str({t: int(self.cp_int[t].notna().sum()) for t in self.cp_tasks}))
+        print(f"  cp_folds {len(self.cp_folds)} folds (train,test)="
+              f"{[(len(a), len(b)) for a, b in self.cp_folds]} | source={self.cp_fold_source}")
+        if n_inf:
+            print(f"  masked {n_inf} non-finite task value(s) as NaN (unusable label, other tasks kept)")
+
+    def _cp_folds(self, params, k, n_splits=5, seed=42):
+        """
+        -Fold ids for the chemprop transfer arm. Prefer RF's EXACT folds, recovered from the `fold` column of
+         <CHEMPROP_TRANSFER.rf_metrics_dir>/<k>.pkl, so chemprop and RF score the identical partitions and the
+         two R2det values compare directly. When that pickle does not exist, build an independent InChIKey-
+         grouped split over self.cp_int instead, and say so — those folds are NOT comparable to RF fold by fold.
+        param class params: PARAMS instance (CHEMPROP_TRANSFER.rf_metrics_dir, FOLD_GROUP_BY_INCHIKEY)
+        param str k: endpoint key
+        param int n_splits: fold count for the independent split
+        param int seed: KFold seed for the independent split
+        return tuple: ([[train_ids, test_ids], ...], source string 'rf:<path>' or 'independent')
+        """
+        path = os.path.join(params.CHEMPROP_TRANSFER['rf_metrics_dir'], f'{k}.pkl')
+        if os.path.exists(path):
+            print(f"> cp_folds: RF's EXACT folds from {path} — chemprop and RF score the identical partitions")
+            with open(path, 'rb') as fh:
+                p = pickle.load(fh)[k]['internal_cv_preddf']
+            assert 'fold' in p.columns, f'{path}: internal_cv_preddf has no fold column'
+            # every RF fold compound must exist in cp_int, else the two models score different sets
+            miss = len(set(p.compound) - set(self.cp_int.compound))
+            if miss:
+                print(f"  CAUTION: {miss} RF fold compounds are absent from cp_int — the sets are NOT identical")
+            return ([[list(p.compound[p.fold != f]), list(p.compound[p.fold == f])]
+                     for f in sorted(p.fold.unique())], f'rf:{path}')
+        # no RF pickle -> independent folds over cp_int, grouped by InChIKey (config FOLD_GROUP_BY_INCHIKEY)
+        print(f"> cp_folds: {path} NOT FOUND -> INDEPENDENT {n_splits}-fold split over cp_int (seed {seed}); "
+              f"these folds are not comparable to RF fold by fold")
+        ik = fn.inchikeys_for(self.cp_int) if getattr(params, 'FOLD_GROUP_BY_INCHIKEY', True) else None
+        return self._grouped_folds(n_splits, seed, df=self.cp_int.assign(_ik=ik)), 'independent'
+
     def get_internal_public_sets(self, k, min_n=1000):
         """
         -Split endpoint k's modelling frame (self.ML_data[k]) into internal vs public sets and rank the
@@ -244,19 +354,21 @@ class DATA():
                 'R2_det': 1 - ((y - p) ** 2).sum() / ((y - y.mean()) ** 2).sum(),
                 'RMSE': (((y - p) ** 2).mean()) ** 0.5}
 
-    def _grouped_folds(self, n_splits=5, seed=42):
+    def _grouped_folds(self, n_splits=5, seed=42, df=None):
         """
-        -Build n_splits CV folds over self.internal, grouped by InChIKey so every twin of a molecule (same
+        -Build n_splits CV folds over a frame, grouped by InChIKey so every twin of a molecule (same
          _ik, different SMILES) shares a fold — a molecule never appears in both train and test. Keeps the
          seed-determinism: unique groups are KFold-split (shuffled, seeded), then each compound inherits its
          group's fold. Compounds with a missing InChIKey form their own singleton group.
         param int n_splits: number of CV folds
         param int seed: KFold shuffle seed (group-level, so reproducible)
-        return list: [[train_ids, test_ids], ...] over internal compound ids
+        param dataframe df: frame with compound + _ik columns (default self.internal)
+        return list: [[train_ids, test_ids], ...] over the frame's compound ids
         """
+        d = self.internal if df is None else df
         # group id = InChIKey, or the compound id itself when the InChIKey is missing (singleton group)
-        g = self.internal._ik.where(self.internal._ik.notna(), self.internal.compound)
-        comp, grp = self.internal.compound.to_numpy(), g.to_numpy()
+        g = d._ik.where(d._ik.notna(), d.compound)
+        comp, grp = d.compound.to_numpy(), g.to_numpy()
         uniq = pd.unique(grp)
         # assign each unique group to a test fold, then map every compound to its group's fold
         fold_of = {}
@@ -298,9 +410,10 @@ class DATA():
         self.train_temp_ids, self.test_temp_ids = list(order[:cut]), list(order[cut:])
 
 
-# config-driven per-endpoint aliases so the notebook's exec('data.<step>_'+k+'()') pattern works.
+# config-driven per-endpoint aliases, kept for the older exec('data.<step>_'+k+'()') callers in python/.
 # BOTH steps are fully generic for EVERY endpoint: get_<ep>_data -> _endpoint_dfs (public files +
 # transform + filter from config), build_ML_data_<ep> -> _endpoint_ML (label cap from config label_cap_raw).
+# New code calls the named entry points instead: build_ML_data_RF(params, k) and build_ML_data_CP(params, k).
 for _ep in ('solubility', 'logd', 'hlm', 'mlm', 'rlm', 'caco2', 'mdck', 'ppb'):
     setattr(DATA, f'get_{_ep}_data',      lambda self, params, _e=_ep: self._endpoint_dfs(params, _e))
     setattr(DATA, f'build_ML_data_{_ep}', lambda self, _e=_ep: self._endpoint_ML(_e))
@@ -317,6 +430,7 @@ class OUTPUT():
         self.cfg = params.RF_SINGLETASK            # champion hyperparameters + seed + n_jobs
         self.model = self.make_model(False)        # default sklearn champion RF (K_fold clones it per fold)
         self.metrics_results = {}                  # endpoint -> {<arm>_preddf, <arm>_metrics, ...}
+        self.metrics_results_cp = {}               # endpoint -> the same, for the chemprop arms (assess_predictions_cp)
         self.res_origin_powerset = None            # public-origin combinatorial scan (run_origin_powerset)
 
     def make_model(self, use_cuml=False, n_bins=32):
@@ -359,7 +473,7 @@ class OUTPUT():
                                      .sort_values('R2_pears', ascending=False).reset_index(drop=True))
         return self.res_origin_powerset
 
-    def assess_predictions(self, data, outpath):
+    def assess_predictions(self, data, outpath, ml_model='rf'):
         """
         -Compute (or load if outpath already exists) the 6 prediction arms for endpoint data.k and store them
          in self.metrics_results[data.k]. Arms: ext->internal, internal_cv, augmented_cv, internal_temp,
@@ -369,8 +483,12 @@ class OUTPUT():
          pooled augmented_cv calibration is stored under '_calibration' for the webapp. On first compute, pickle.
         param DATA data: the endpoint's built sets (k, d, internal, pub_ids, int_ids, fold_ids, ...)
         param str outpath: pickle cache path (load if present, else compute + save)
+        param str ml_model: 'rf' (this body) or 'chemprop' (dispatch to assess_predictions_cp)
         return dict: (also stored in self.metrics_results[data.k])
         """
+        # the chemprop arms need a pretrain stage and different data, so they live in their own method
+        if ml_model == 'chemprop':
+            return self.assess_predictions_cp(data, outpath)
         k = data.k
         if not os.path.exists(outpath):
             r = {}
@@ -413,8 +531,85 @@ class OUTPUT():
             print(f"> loaded metrics_results['{k}'] <- {outpath}")
         return self.metrics_results[k]
 
+    def _record_cp(self, r, arm, pred_df, ntrain):
+        """Store one chemprop arm: the pred_df, its regression metrics and the absolute residual. No conf_*
+        columns — a plain `regression` head gives no per-row std, so there is nothing to calibrate."""
+        pred_df['residuals'] = abs(pred_df['pred_y'] - pred_df['real_y'])
+        r[arm + '_preddf'] = pred_df
+        r[arm + '_metrics'] = ML_Reg.get_reg_metrics_from_preddf(pred_df, ntrain=ntrain)
+        m = r[arm + '_metrics']
+        print(f"  [{arm}] r2det={m['r2det']:.3f} r2={m['r2']:.3f} rmse={m['rmse']:.3f} n_test={len(pred_df)}", flush=True)
+        return r
+
+    def assess_predictions_cp(self, data, outpath):
+        """
+        -Compute (or load if outpath already exists) the 3 chemprop arms for endpoint data.cp_k and store them
+         in self.metrics_results_cp[data.cp_k]. The arms mirror the RF ones of the same name, so the two
+         models compare directly on data.cp_folds:
+           augmented_cv   — public PRETRAIN + frozen-encoder finetune per fold, predict the held-out fold
+                            (public enters TRAIN only, exactly like the RF augmented_cv arm).
+           internal_cv    — the same folds with NO pretrain: every fold trains from scratch on internal only.
+           ext_->_internal— the public-only pretrain checkpoint predicts every internal compound, no finetune.
+         The stage-1 checkpoint is built once and shared by the 5 folds and by ext_->_internal; it never sees
+         an internal label. Provenance (grouping, tasks, fold source, checkpoint) is stored under '_*' keys.
+         No conf_* columns: chemprop's regression head returns no per-row std.
+        param DATA data: a DATA with build_ML_data_CP already run (cp_k, cp_int, cp_pub, cp_folds, cp_tasks)
+        param str outpath: pickle cache path (load if present, else compute + save)
+        return dict: (also stored in self.metrics_results_cp[data.cp_k])
+        """
+        k = data.cp_k
+        if os.path.exists(outpath):
+            with open(outpath, 'rb') as f:
+                loaded = pickle.load(f)
+            self.metrics_results_cp[k] = loaded[k] if isinstance(loaded, dict) and k in loaded else loaded
+            print(f"> loaded metrics_results_cp['{k}'] <- {outpath}")
+            return self.metrics_results_cp[k]
+
+        cfg = data.params.CHEMPROP_TRANSFER
+        # descriptor flags must be identical at pretrain, finetune and predict (v2 stores only the scaler)
+        desc = data.cp_ds_cols if cfg['descriptors'] == 'precomputed' else None
+        mfeat = cfg['molecule_featurizers'] if cfg['descriptors'] == 'featurizer' else None
+        run = os.path.join(cfg['output_dir'], f'{data.cp_grouping}_{k}')
+        kw = dict(target=k, targets=data.cp_tasks, descriptor_cols=desc, molecule_featurizers=mfeat,
+                  hp=cfg['hp'], epochs=cfg['epochs_finetune'], patience=cfg['patience'],
+                  seed=cfg.get('seed', 42), v=True)
+        cp_bin = os.path.expanduser(cfg['chemprop_bin'])
+        r = {'_grouping': data.cp_grouping, '_tasks': list(data.cp_tasks), '_fold_source': data.cp_fold_source}
+
+        # augmented_cv: public pretrain (once) -> frozen finetune per fold -> predict the held-out fold
+        print(f"> [{k}/{data.cp_grouping}] augmented_cv: transfer on {len(data.cp_folds)} folds", flush=True)
+        aug = ML_Reg.chemprop_finetune_K_fold_by_defined_IDs(
+            data.cp_int, 'compound', data.cp_folds, cp_bin, data.cp_pub,
+            epochs_pretrain=cfg['epochs_pretrain'], freeze_encoder=cfg['freeze_encoder'],
+            pretrain_dir=os.path.join(cfg['pretrain_dir'], data.cp_grouping),
+            workdir=os.path.join(run, 'augmented_cv'), **kw)
+        ckpt = aug.attrs['pretrain_checkpoint']
+        r['_pretrain_checkpoint'] = ckpt
+        r = self._record_cp(r, 'augmented_cv', aug, len(data.cp_int))
+
+        # internal_cv: the same folds with df_pretrain=None, so no public data and no pretrained weights
+        print(f"> [{k}] internal_cv: from scratch, internal only", flush=True)
+        r = self._record_cp(r, 'internal_cv', ML_Reg.chemprop_finetune_K_fold_by_defined_IDs(
+            data.cp_int, 'compound', data.cp_folds, cp_bin, None,
+            workdir=os.path.join(run, 'internal_cv'), **kw), len(data.cp_int))
+
+        # ext_->_internal: the public-only checkpoint predicts every internal compound (no finetune, no folds)
+        print(f"> [{k}] ext_->_internal: public-only checkpoint on {len(data.cp_int)} internal compounds", flush=True)
+        r = self._record_cp(r, 'ext_->_internal', ML_Reg.chemprop_predict_from_checkpoint(
+            data.cp_int, 'compound', ckpt, cp_bin, k, targets=data.cp_tasks, descriptor_cols=desc,
+            molecule_featurizers=mfeat, workdir=os.path.join(run, 'ext_to_internal')), len(data.cp_pub))
+
+        self.metrics_results_cp[k] = r
+        os.makedirs(os.path.dirname(outpath), exist_ok=True)
+        with open(outpath, 'wb') as f:
+            pickle.dump(self.metrics_results_cp, f)
+        print(f"> saved metrics_results_cp -> {outpath} ({len(self.metrics_results_cp)} endpoint(s): "
+              f"{list(self.metrics_results_cp)})")
+        return r
+
     def assess_all_endpoints(self, data, params, endpoints=None, min_n=1000):
         """
+        -used in CLI: python/ADME_build_ML.py --assess_RF_all_endpoints
         -Run the full single-task RF assessment for every endpoint: build the ML frame, split internal vs
          public, select the BEST_PUBLIC combo, and compute-or-load the 6 prediction arms. One pickle per
          endpoint is written under params.METRICS_PKL_DIR (<dir>/<k>.pkl); results collect in
@@ -428,7 +623,7 @@ class OUTPUT():
         eps = endpoints or list(params.ADME_ENDPOINTS)
         for k in eps:
             # build the modelling frame (features from MF_features['all']) + integrity check
-            getattr(data, f'build_ML_data_{k}')()
+            data.build_ML_data_RF(params, k=k)
             assert stats_tools.check_ML_data(data.ML_data[k], extra_meta_cols=('source', 'origin'), verbose=False)
             # split internal vs public + pick the BEST_PUBLIC combo and id splits
             data.get_internal_public_sets(k, min_n=min_n)
@@ -503,7 +698,7 @@ class OUTPUT():
         summaries = []
         for k in (endpoints or list(params.ADME_ENDPOINTS)):
             # build the modelling frame (features from MF_features['all']) + integrity check
-            getattr(data, f'build_ML_data_{k}')()
+            data.build_ML_data_RF(params, k=k)
             assert stats_tools.check_ML_data(data.ML_data[k], extra_meta_cols=('source', 'origin'), verbose=False)
             # split internal vs public + pick the BEST_PUBLIC combo and id splits
             data.get_internal_public_sets(k, min_n=min_n)
