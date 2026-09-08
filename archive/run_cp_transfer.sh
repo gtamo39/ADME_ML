@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Chemprop transfer arm — specialist pretrain groupings, run one after the other.
 #
+# SUPERSEDED 2026-09-07: the live path is ADME_build_ML.py (build_ML_data_CP + assess_predictions_cp).
+# Both this wrapper and the runner it calls live in archive/. Kept only to reproduce the recorded sweep.
+#
 # Tests the "task relatedness decides" hypothesis: `clearance` (one assay, 3 species) beat RF on 3/3
 # endpoints, while `all8` (8 heterogeneous properties) lost 5/5. Each step below pretrains a COHERENT
 # block on public data, then frozen-encoder finetunes on RF's exact folds.
@@ -9,8 +12,8 @@
 # depend on the grouping. Results accumulate keyed by (endpoint, arm, grouping), so an endpoint ends up
 # with several groupings side by side. Each step is --resume, so a rerun skips finished work.
 #
-#   bash run_cp_transfer.sh                        # foreground, in a screen
-#   setsid nohup bash run_cp_transfer.sh >/dev/null 2>&1 &    # fully detached
+#   bash archive/run_cp_transfer.sh                # foreground, in a screen
+#   setsid nohup bash archive/run_cp_transfer.sh >/dev/null 2>&1 &    # fully detached
 set -u
 ROOT=/home/gtamo/ADME_ML; cd "$ROOT"
 ML_PY=$HOME/miniconda3/envs/ML/bin/python
@@ -24,7 +27,7 @@ run_step(){
   local name=$1 eps=$2 grp=$3
   step "--- START $name : endpoints=$eps grouping=$grp"
   local t0=$SECONDS
-  $ML_PY python/run_chemprop_transfer.py --config config/config.yaml \
+  $ML_PY archive/run_chemprop_transfer.py --config config/config.yaml \
       --endpoints "$eps" --grouping "$grp" --arms transfer --resume \
       >"$LOGDIR/run_${name}.log" 2>&1
   local rc=$?

@@ -48,16 +48,21 @@ def _output(tmp):
     return OUTPUT(types.SimpleNamespace(RF_SINGLETASK=RF_CFG))
 
 
-def _data(tmp):
-    """DATA with cp_* built from the synthetic wide frame, plus a CHEMPROP_TRANSFER config."""
-    d = cp._data_with_wide()
+def _cp_params(tmp):
+    """Fake PARAMS whose CHEMPROP_TRANSFER points at the stub binary and at scratch dirs under tmp."""
     prm = cp._fake_params(tmp)
     prm.CHEMPROP_TRANSFER.update({
         'chemprop_bin': _stub_bin(tmp)[0], 'output_dir': os.path.join(tmp, 'runs'),
         'pretrain_dir': os.path.join(tmp, 'pretrain'), 'epochs_pretrain': 2, 'epochs_finetune': 2,
         'patience': 1, 'freeze_encoder': True, 'descriptors': 'precomputed',
         'molecule_featurizers': ['v1_rdkit_2d_normalized'], 'hp': {'depth': 3}})
-    d.build_ML_data_CP(prm, k='logd', leak='none', n_splits=2)
+    return prm
+
+
+def _data(tmp):
+    """DATA with cp_* built from the synthetic wide frame."""
+    d = cp._data_with_wide()
+    d.build_ML_data_CP(_cp_params(tmp), k='logd', leak='none', n_splits=2)
     return d
 
 
@@ -111,3 +116,27 @@ def test_pickle_round_trip_and_dispatch():
         assert open(os.environ['FAKE_CP_LOG']).read().strip() == ''            # nothing ran; it came from the pickle
         assert second['_grouping'] == first['_grouping']
         assert np.allclose(second['augmented_cv_preddf'].pred_y, first['augmented_cv_preddf'].pred_y)
+
+
+def test_assess_all_endpoints_cp_loops_and_collects():
+    """assess_all_endpoints_cp must build each endpoint's pools, write one pickle each, and collect them.
+
+    Two endpoints share the sol_lipo grouping here, so the stage-1 pretrain must run ONCE and be reused by
+    the second endpoint (the argv log shows one pretrain, not two).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        data = cp._data_with_wide()
+        prm = _cp_params(tmp)
+        prm.BEST_CHEMPROP_GROUPINGS['solubility'] = 'sol_lipo'
+        prm.METRICS_PKL_CP_DIR = os.path.join(tmp, 'cp_pkl')
+        data.build_ML_data_CP(prm, k='logd', leak='none', n_splits=2)     # binds data.params
+        out = _output(tmp)
+        r = out.assess_all_endpoints_cp(data, prm, endpoints=['logd', 'solubility'], leak='none', n_splits=2)
+
+        # both endpoints are collected, keyed by endpoint
+        assert sorted(r) == ['logd', 'solubility'] == sorted(out.metrics_results_cp)
+        # one pickle per endpoint
+        assert sorted(os.listdir(os.path.join(tmp, 'cp_pkl'))) == ['logd.pkl', 'solubility.pkl']
+        # the shared sol_lipo pretrain ran once, so only 1 of the train calls has no --checkpoint
+        trains = [a for a in open(os.environ['FAKE_CP_LOG']).read().splitlines() if a.startswith('train')]
+        assert sum('--checkpoint' not in a for a in trains) == 1 + 4, trains   # 1 pretrain + 4 scratch folds

@@ -128,31 +128,63 @@ class DATA():
 
     def build_MF_features(self, params, type='H237', date='20260824', n_jobs=32):
         """
-        -Build (or load if present) the molecular-feature matrix for EVERY compound in self.df_all (all
-         endpoints, internal + public). 'H237' = H236 fingerprints/physchem/MACCS/AtomPair + ~200 descriptastorus
-         DS_ descriptors; 'H236' = the fingerprint block only. Cached to
-         params.MF_features_all_path/<date>_MF_features.parquet; stored in self.MF_features['all'].
+        -Build the molecular-feature matrix for EVERY compound in self.df_all, in two parts.
+         PUBLIC compounds are CACHED at params.MF_features_all_path/<date>_MF_features_public.parquet, because
+         their SMILES never change; the cache is topped up for any public compound it does not carry yet.
+         INTERNAL compounds are ALWAYS RECOMPUTED, because every CDD pull adds new ones and a cached matrix
+         would silently miss them (the inner merge in _endpoint_ML then drops those rows without a word).
+         The two blocks concatenate into self.MF_features['all'], and a coverage assertion proves that every
+         df_all compound has features. 'H237' = H236 fingerprints/physchem/MACCS/AtomPair + ~200
+         descriptastorus DS_ descriptors; 'H236' = the fingerprint block only.
         param class params: PARAMS instance (MF_features_all_path)
         param str type: 'H237' | 'H236'
-        param str date: filename stamp for the cache parquet
+        param str date: filename stamp for the public cache parquet
         param int n_jobs: processes for the H237 descriptor block
         return None: (self.MF_features['all'] — compound + feature columns)
         """
         os.makedirs(params.MF_features_all_path, exist_ok=True)
-        path = os.path.join(params.MF_features_all_path, f'{date}_MF_features.parquet')
-        if os.path.exists(path):
-            self.MF_features['all'] = pd.read_parquet(path)
+        pub_path = os.path.join(params.MF_features_all_path, f'{date}_MF_features_{type}_public.parquet')
+        is_int = self.df_all['source'] == 'internal'
+        pub_ids = set(self.df_all.loc[~is_int, 'compound'])
+        # public block: read the cache, or derive it once from the legacy all-compound parquet, or compute it
+        legacy = os.path.join(params.MF_features_all_path, f'{date}_MF_features.parquet')
+        if os.path.exists(pub_path):
+            pub = pd.read_parquet(pub_path)
+        elif os.path.exists(legacy):
+            pub = pd.read_parquet(legacy)
+            pub = pub[pub['compound'].isin(pub_ids)].reset_index(drop=True)
+            pub.to_parquet(pub_path)
+            print(f'> MF public cache derived from {legacy}: {len(pub)} public compounds -> {pub_path}')
         else:
-            smi = self.df_all[['compound', 'smiles']]
-            if type == 'H237':
-                self.MF_features['all'] = rdkit_tools.compute_H237_features(smi, n_jobs=n_jobs, v=True)
-            elif type == 'H236':
-                self.MF_features['all'] = rdkit_tools.compute_H236_features(smi, v=True)
-            else:
-                raise ValueError(f"unknown feature type {type!r} (use 'H237' or 'H236')")
-            self.MF_features['all'].to_parquet(path)
+            pub = self._compute_MF(self.df_all.loc[~is_int, ['compound', 'smiles']], type, n_jobs)
+            pub.to_parquet(pub_path)
+        # top up the public cache for public compounds it does not hold yet (a new public file was added)
+        new_pub = self.df_all.loc[~is_int & ~self.df_all['compound'].isin(set(pub['compound'])),
+                                  ['compound', 'smiles']]
+        if len(new_pub):
+            pub = pd.concat([pub, self._compute_MF(new_pub, type, n_jobs)], ignore_index=True)
+            pub.to_parquet(pub_path)
+            print(f'> MF public cache topped up with {len(new_pub)} new public compounds')
+        # internal block: ALWAYS recomputed, so the newest CDD pull is always covered
+        internal = self._compute_MF(self.df_all.loc[is_int, ['compound', 'smiles']], type, n_jobs)
+        assert set(internal.columns) == set(pub.columns), (
+            f'internal and public feature columns differ — the public cache holds another feature version; '
+            f'delete {pub_path} and rebuild')
+        self.MF_features['all'] = pd.concat([pub, internal[pub.columns]], ignore_index=True)
+        # coverage: a missing compound would be dropped silently by the inner merge in _endpoint_ML
+        missing = len(set(self.df_all['compound']) - set(self.MF_features['all']['compound']))
+        assert not missing, f'{missing} df_all compounds have no MF features'
         print(f"> MF features ({type}) [all]: {self.MF_features['all'].shape[0]} compounds x "
-              f"{self.MF_features['all'].shape[1] - 1} features -> {path}")
+              f"{self.MF_features['all'].shape[1] - 1} features "
+              f"(public {len(pub)} cached | internal {len(internal)} recomputed)")
+
+    def _compute_MF(self, smi, type, n_jobs):
+        """Compute one feature block from a [compound, smiles] frame ('H237' or 'H236')."""
+        if type == 'H237':
+            return rdkit_tools.compute_H237_features(smi, n_jobs=n_jobs, v=True)
+        if type == 'H236':
+            return rdkit_tools.compute_H236_features(smi, v=True)
+        raise ValueError(f"unknown feature type {type!r} (use 'H237' or 'H236')")
 
     def _feats(self, endpoint):
         """Return the endpoint's own feature matrix if built, else the unified MF_features['all'] (from build_MF_features)."""
@@ -227,7 +259,7 @@ class DATA():
          from RF when its pickle exists, else from an independent grouped split.
         param class params: PARAMS instance (BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER)
         param str k: endpoint key to score (default self.k)
-        param str grouping: pretrain grouping name (default BEST_CHEMPROP_GROUPINGS[k]['grouping'])
+        param str grouping: pretrain grouping name (default BEST_CHEMPROP_GROUPINGS[k])
         param str leak: leak-control level for fn.drop_internal_twins ('exact' | 'skeleton' | 'none')
         param int n_splits: fold count, used only when RF's pickle is absent
         param int seed: fold seed, used only when RF's pickle is absent
@@ -238,7 +270,7 @@ class DATA():
         assert 'all' in self.MF_features, 'run build_MF_features(params) first'
         cfg = params.CHEMPROP_TRANSFER
         self.cp_k = k
-        self.cp_grouping = grouping or params.BEST_CHEMPROP_GROUPINGS[k]['grouping']
+        self.cp_grouping = grouping or params.BEST_CHEMPROP_GROUPINGS[k]
         # a CLUSTER grouping co-trains the target endpoint with raw Novartis columns from its own parquet;
         # an ENDPOINT grouping uses internal endpoint columns only, so df_all already holds every task
         spec = cfg.get('clusters', {}).get(self.cp_grouping)
@@ -285,16 +317,16 @@ class DATA():
     def _cp_folds(self, params, k, n_splits=5, seed=42):
         """
         -Fold ids for the chemprop transfer arm. Prefer RF's EXACT folds, recovered from the `fold` column of
-         <CHEMPROP_TRANSFER.rf_metrics_dir>/<k>.pkl, so chemprop and RF score the identical partitions and the
+         <METRICS_PKL_RF_DIR>/<k>.pkl, so chemprop and RF score the identical partitions and the
          two R2det values compare directly. When that pickle does not exist, build an independent InChIKey-
          grouped split over self.cp_int instead, and say so — those folds are NOT comparable to RF fold by fold.
-        param class params: PARAMS instance (CHEMPROP_TRANSFER.rf_metrics_dir, FOLD_GROUP_BY_INCHIKEY)
+        param class params: PARAMS instance (METRICS_PKL_RF_DIR, FOLD_GROUP_BY_INCHIKEY)
         param str k: endpoint key
         param int n_splits: fold count for the independent split
         param int seed: KFold seed for the independent split
         return tuple: ([[train_ids, test_ids], ...], source string 'rf:<path>' or 'independent')
         """
-        path = os.path.join(params.CHEMPROP_TRANSFER['rf_metrics_dir'], f'{k}.pkl')
+        path = os.path.join(params.METRICS_PKL_RF_DIR, f'{k}.pkl')
         if os.path.exists(path):
             print(f"> cp_folds: RF's EXACT folds from {path} — chemprop and RF score the identical partitions")
             with open(path, 'rb') as fh:
@@ -398,7 +430,8 @@ class DATA():
         # Group by InChIKey (config FOLD_GROUP_BY_INCHIKEY, default on) so a molecule's twins never straddle
         # a train/test split (avoids optimistic leakage from near-duplicate internal analogs).
         if getattr(params, 'FOLD_GROUP_BY_INCHIKEY', True):
-            self.fold_ids = self._grouped_folds(n_splits=5, seed=42)
+            self.fold_ids = self._grouped_folds(n_splits=params.RF_SINGLETASK.get('cv_folds', 5),
+                                                seed=params.RF_SINGLETASK['seed'])
         else:
             self.fold_ids = [[list(self.int_ids[tr]), list(self.int_ids[te])]
                              for tr, te in KFold(5, shuffle=True, random_state=42).split(self.int_ids)]
@@ -443,7 +476,7 @@ class OUTPUT():
 
     def predict_and_record(self, d, result_df, exp_name='default', ids=None, col_to_rm=None, use_cuml=False):
         """Run one CV/holdout arm: predict via ML_Reg.K_fold_by_defined_IDs (with tree-variance UQ), then
-        store the pred_df + regression metrics + absolute residual. The confidence columns are added later,
+        store the pred_dasss + absolute residual. The confidence columns are added later,
         endpoint-wide, by assess_predictions (calibrated on the augmented_cv arm)."""
         # pick the backend for this arm (cuRF on request, else the default sklearn model)
         mdl = self.make_model(True) if use_cuml else self.model
@@ -612,10 +645,10 @@ class OUTPUT():
         -used in CLI: python/ADME_build_ML.py --assess_RF_all_endpoints
         -Run the full single-task RF assessment for every endpoint: build the ML frame, split internal vs
          public, select the BEST_PUBLIC combo, and compute-or-load the 6 prediction arms. One pickle per
-         endpoint is written under params.METRICS_PKL_DIR (<dir>/<k>.pkl); results collect in
+         endpoint is written under params.METRICS_PKL_RF_DIR (<dir>/<k>.pkl); results collect in
          self.metrics_results. Requires data.df_all + data.MF_features['all'] to be built first.
         param DATA data: a DATA with load_combine_dfs + build_MF_features already run
-        param class params: PARAMS instance (ADME_ENDPOINTS, BEST_PUBLIC, METRICS_PKL_DIR)
+        param class params: PARAMS instance (ADME_ENDPOINTS, BEST_PUBLIC, METRICS_PKL_RF_DIR)
         param list endpoints: endpoints to run (default: all params.ADME_ENDPOINTS)
         param int min_n: public-origin minimum-count filter (get_internal_public_sets)
         return dict: self.metrics_results (endpoint -> arm results)
@@ -628,9 +661,36 @@ class OUTPUT():
             # split internal vs public + pick the BEST_PUBLIC combo and id splits
             data.get_internal_public_sets(k, min_n=min_n)
             data.select_best_combo_and_update(params, k)
-            # compute-or-load the 6 arms -> <METRICS_PKL_DIR>/<k>.pkl
-            self.assess_predictions(data, os.path.join(params.METRICS_PKL_DIR, f'{k}.pkl'))
+            # compute-or-load the 6 arms -> <METRICS_PKL_RF_DIR>/<k>.pkl
+            self.assess_predictions(data, os.path.join(params.METRICS_PKL_RF_DIR, f'{k}.pkl'))
         return self.metrics_results
+
+    def assess_all_endpoints_cp(self, data, params, endpoints=None, leak='exact', n_splits=5, seed=42):
+        """
+        -used in CLI: python/ADME_build_ML.py --assess_CP_all_endpoints
+        -Chemprop twin of assess_all_endpoints: for every endpoint, build the two chemprop pools on RF's exact
+         folds and compute-or-load the 3 arms (augmented_cv / internal_cv / ext_->_internal). One pickle per
+         endpoint is written under params.METRICS_PKL_CP_DIR (<dir>/<k>.pkl); results collect
+         in self.metrics_results_cp. Requires data.df_all + data.MF_features['all'] to be built first.
+         CAUTION: this trains 11 chemprop models per endpoint (1 pretrain + 5 transfer folds + 5 scratch
+         folds), so run it detached. The pretrain is cached per GROUPING, so endpoints that share a grouping
+         (hlm/mlm/rlm, solubility/logd) pretrain once between them.
+        param DATA data: a DATA with load_combine_dfs + build_MF_features already run
+        param class params: PARAMS instance (ADME_ENDPOINTS, BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER, METRICS_PKL_CP_DIR)
+        param list endpoints: endpoints to run (default: all params.ADME_ENDPOINTS)
+        param str leak: leak-control level for build_ML_data_CP ('exact' | 'skeleton' | 'none')
+        param int n_splits: fold count, used only for an endpoint whose RF pickle is absent
+        param int seed: fold seed, used only for an endpoint whose RF pickle is absent
+        return dict: self.metrics_results_cp (endpoint -> arm results)
+        """
+        eps = endpoints or list(params.ADME_ENDPOINTS)
+        out = params.METRICS_PKL_CP_DIR
+        for k in eps:
+            # build the pretrain/finetune pools + the folds (RF's own whenever its pickle exists)
+            data.build_ML_data_CP(params, k=k, leak=leak, n_splits=n_splits, seed=seed)
+            # compute-or-load the 3 arms -> <METRICS_PKL_CP_DIR>/<k>.pkl
+            self.assess_predictions_cp(data, os.path.join(out, f'{k}.pkl'))
+        return self.metrics_results_cp
 
     def deploy_endpoint(self, data, params, registry, k, dry_run=False):
         """
@@ -718,7 +778,11 @@ if __name__ == "__main__":
     ap.add_argument('--config', default='config/config.yaml', help="path to the YAML config")
     ap.add_argument('--overwrite', action='store_true', help="re-pull df_all from CDD Vault and re-cache")
     ap.add_argument('--assess_RF_all_endpoints', action='store_true',
-                    help="assess the champion RF on every endpoint -> <METRICS_PKL_DIR>/<k>.pkl")
+                    help="assess the champion RF on every endpoint -> <METRICS_PKL_RF_DIR>/<k>.pkl")
+    ap.add_argument('--assess_CP_all_endpoints', action='store_true',
+                    help="assess the chemprop transfer arms on every endpoint -> <METRICS_PKL_CP_DIR>/<k>.pkl")
+    ap.add_argument('--leak', default='exact', choices=['exact', 'skeleton', 'none'],
+                    help="chemprop leak control: drop public molecules that also exist internally")
     ap.add_argument('--deploy_RF_all_endpoints', action='store_true',
                     help="fit + deploy the RF (internal + BEST_PUBLIC) for every endpoint and register to MLTrail")
     ap.add_argument('--dry_run', action='store_true', help="deploy: fit + calibrate but do not register to MLTrail")
@@ -734,7 +798,7 @@ if __name__ == "__main__":
     data = DATA()
     data.load_df_internal_exp_all(params, overwrite=args.overwrite)
 
-    if args.assess_RF_all_endpoints or args.deploy_RF_all_endpoints:
+    if args.assess_RF_all_endpoints or args.assess_CP_all_endpoints or args.deploy_RF_all_endpoints:
         # build the unified dataset + all-compound H237 features (shared by assess + deploy)
         data.load_combine_dfs(params)
         data.build_MF_features(params)
@@ -742,9 +806,15 @@ if __name__ == "__main__":
         eps = [e.strip() for e in args.endpoints.split(',')] if args.endpoints else None
 
     if args.assess_RF_all_endpoints:
-        # assess the RF on every endpoint -> <METRICS_PKL_DIR>/<k>.pkl
+        # assess the RF on every endpoint -> <METRICS_PKL_RF_DIR>/<k>.pkl
         output.assess_all_endpoints(data, params, endpoints=eps, min_n=args.min_n)
-        print(f"> done: assessed {len(output.metrics_results)} endpoint(s) -> {params.METRICS_PKL_DIR}")
+        print(f"> done: assessed {len(output.metrics_results)} endpoint(s) -> {params.METRICS_PKL_RF_DIR}")
+
+    if args.assess_CP_all_endpoints:
+        # assess the chemprop transfer arms on every endpoint -> <METRICS_PKL_CP_DIR>/<k>.pkl
+        output.assess_all_endpoints_cp(data, params, endpoints=eps, leak=args.leak)
+        print(f"> done: assessed {len(output.metrics_results_cp)} endpoint(s) -> "
+              f"{params.METRICS_PKL_CP_DIR}")
 
     if args.deploy_RF_all_endpoints:
         # fit + deploy the RF (internal + BEST_PUBLIC) for every endpoint and register to MLTrail

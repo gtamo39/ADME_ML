@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Chemprop TRANSFER LEARNING arm: public pretrain -> frozen-encoder multitask finetune on internal.
+"""ARCHIVED 2026-09-07 — SUPERSEDED by ADME_build_ML.py (DATA.build_ML_data_CP +
+OUTPUT.assess_predictions_cp). Arms map: transfer -> augmented_cv, scratch -> internal_cv,
+pretrain_only -> ext_->_internal. Kept to reproduce the recorded grouping sweep only.
+
+Chemprop TRANSFER LEARNING arm: public pretrain -> frozen-encoder multitask finetune on internal.
 
 Attacks the calibration failure of plain augmentation head-on: learn structure->property from the large
 public corpus, then RE-CALIBRATE on internal data only.
@@ -27,9 +31,9 @@ Uncertainty is NOT taken from chemprop — the RF tree-variance conf_* stack is 
 
 Run from env `ML` (shells out to the configured chemprop binary):
   screen -S cptransfer
-  ~/miniconda3/envs/ML/bin/python python/run_chemprop_transfer.py --config config/config.yaml \
+  ~/miniconda3/envs/ML/bin/python archive/run_chemprop_transfer.py --config config/config.yaml \
       --smoke rlm            # single (endpoint, fold) smoke test first
-  ~/miniconda3/envs/ML/bin/python python/run_chemprop_transfer.py --config config/config.yaml --resume
+  ~/miniconda3/envs/ML/bin/python archive/run_chemprop_transfer.py --config config/config.yaml --resume
 """
 from __future__ import annotations
 import argparse
@@ -73,6 +77,7 @@ class PARAMS:
         self.best_groupings = cfg.get('BEST_CHEMPROP_GROUPINGS', {})   # per-endpoint winner (--grouping best)
         self.augmented_sources_override = cfg['RF_SINGLETASK'].get('augmented_sources') or {}
         self.seed = cfg['CHEMPROP_TRANSFER'].get('seed', 42)   # --data-seed + --pytorch-seed for every stage
+        self.rf_metrics_dir = cfg['METRICS_PKL_RF_DIR']        # renamed 2026-09-08 (was CHEMPROP_TRANSFER.rf_metrics_dir)
         return self
 
 

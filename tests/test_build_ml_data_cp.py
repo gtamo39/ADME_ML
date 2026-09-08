@@ -21,12 +21,12 @@ NAPH = 'c1ccc2ccccc2c1'   # public, and NOT one of the internal molecules
 
 
 def _fake_params(rf_dir):
-    """Minimal PARAMS stand-in: a sol_lipo grouping over [solubility, logd] and an rf_metrics_dir."""
+    """Minimal PARAMS stand-in: endpoint -> grouping map, the sol_lipo catalogue entry, dirs under rf_dir."""
     return types.SimpleNamespace(
-        BEST_CHEMPROP_GROUPINGS={'logd': {'grouping': 'sol_lipo', 'kind': 'endpoint', 'tasks': ['solubility', 'logd']},
-                                 'mdck': {'grouping': 'mdck_perm', 'kind': 'cluster', 'target': 'mdck'}},
-        CHEMPROP_TRANSFER={'groupings': {'sol_lipo': ['solubility', 'logd']}, 'rf_metrics_dir': rf_dir,
+        BEST_CHEMPROP_GROUPINGS={'logd': 'sol_lipo', 'mdck': 'mdck_perm'},
+        CHEMPROP_TRANSFER={'groupings': {'sol_lipo': ['solubility', 'logd']},
                            'clusters': {'mdck_perm': {'target': 'mdck', 'file': 'tf_fake_cluster.parquet'}}},
+        METRICS_PKL_RF_DIR=rf_dir, METRICS_PKL_CP_DIR=os.path.join(rf_dir, 'cp'),
         ADME_CACHE=rf_dir, FOLD_GROUP_BY_INCHIKEY=True)
 
 
@@ -96,7 +96,7 @@ def test_leak_filter_drops_internal_twins():
 
 
 def test_folds_from_rf_pickle():
-    """When <rf_metrics_dir>/<k>.pkl exists, cp_folds must be RF's exact folds and the source must say so."""
+    """When <METRICS_PKL_RF_DIR>/<k>.pkl exists, cp_folds must be RF's exact folds and the source says so."""
     with tempfile.TemporaryDirectory() as td:
         _write_rf_pkl(td, 'logd', ['I_1', 'I_2', 'I_3', 'I_4'], [0, 1, 0, 1])
         data = _data_with_wide()
@@ -151,3 +151,24 @@ def test_cluster_grouping_joins_the_novartis_aux_tasks():
         assert data.cp_int[['LE_MDCKv2_LogPapp', 'Caco_2_LogPapp']].isna().all().all()
         # cp_int still holds every internal row measured for mdck
         assert sorted(data.cp_int.compound) == ['I_1', 'I_2', 'I_4', 'I_5']
+
+
+def test_real_config_verdicts_resolve_to_a_catalogue_entry():
+    """Every BEST_CHEMPROP_GROUPINGS value must name a real CHEMPROP_TRANSFER grouping or cluster.
+
+    The block used to restate `tasks` / `target` / `file` and carry `r2det` / `beats_rf`. It is now a bare
+    endpoint -> grouping-name map: the catalogue defines the tasks and the wiki holds the measurements, so
+    this invariant is all that must hold. Reads the live config.
+    """
+    import yaml
+    cfg = yaml.safe_load(open('config/config.yaml'))
+    cat = set(cfg['CHEMPROP_TRANSFER']['groupings']) | set(cfg['CHEMPROP_TRANSFER']['clusters'])
+
+    # no entry points at a grouping that does not exist
+    unknown = {ep: g for ep, g in cfg['BEST_CHEMPROP_GROUPINGS'].items() if g not in cat}
+    assert not unknown, unknown
+    # every endpoint is mapped, and each value is a bare grouping NAME (no measurements in the config)
+    assert set(cfg['BEST_CHEMPROP_GROUPINGS']) == set(cfg['ADME_ENDPOINTS'])
+    assert all(isinstance(g, str) for g in cfg['BEST_CHEMPROP_GROUPINGS'].values())
+    # the retired duplicate mapping is gone (it contradicted the verdicts)
+    assert 'endpoint_grouping' not in cfg['CHEMPROP_TRANSFER']

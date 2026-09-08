@@ -207,15 +207,107 @@ log10→10**p, logit→100/(1+10**-p), identity→p).
 
 ## ADME_build_ML.py — notebook↔module port (2026-08-20, in progress)
 
-**⚠️ KNOWN ISSUE — `build_MF_features` cache goes STALE on new internal data; new compounds are SILENTLY
-DROPPED (found 2026-09-04, NOT yet fixed).** `build_MF_features(params, type, date)` is an all-or-nothing cache keyed
-by the **`date` filename argument**: if `<MF_features_all_path>/<date>_MF_features.parquet` exists it is
-`read_parquet`ed WHOLESALE — nothing is recomputed, and there is NO check that its compound set still matches
-`df_all`. (Note it is ONE matrix for internal AND public together, ~369k compounds — not "public precomputed,
-internal recomputed per load".) Consequence: after a fresh CDD pull, new internal compounds have no features, and
-`_endpoint_ML` does `pd.merge(self._feats(endpoint), d, on='compound').dropna()` — an **INNER merge**, so those
-compounds vanish with no error and no warning. The only symptom is a lower-than-expected `ML_data` row count, so a
-model can be trained on a stale compound set while appearing to include the new data.
+**★ FIXED (2026-09-07) — `build_MF_features` now SPLITS the cache: public cached, internal always recomputed.**
+THE BUG (found 2026-09-04): the builder was an all-or-nothing cache keyed by the `date` filename argument. If
+`<MF_features_all_path>/<date>_MF_features.parquet` existed it was `read_parquet`ed WHOLESALE, nothing was
+recomputed, and NOTHING checked that its compound set still matched `df_all`. One matrix held internal AND
+public together (369,138 compounds x 4,470 cols; 4,263 int8 + 206 double; 255 MB on disk, ~2.2 GB in memory).
+So every internal compound added by a new CDD pull was absent from the matrix, and `_endpoint_ML`'s
+`pd.merge(...).dropna()` is an INNER merge — those rows were dropped with NO warning. The only symptom was a
+low `ML_data` row count.
+THE FIX, per the user's own proposal ("a separate MF cache only for public data and recompute the one for
+internal data"):
+- PUBLIC block -> cached at `<date>_MF_features_<type>_public.parquet`. Public SMILES never change.
+- INTERNAL block -> ALWAYS recomputed from `df_all`. A few hundred compounds, so it costs seconds.
+- INCREMENTAL TOP-UP: a public compound the cache does not hold yet is computed alone and appended, so adding
+  a public file never forces a 369k rebuild.
+- LEGACY MIGRATION: when the public cache is absent but `<date>_MF_features.parquet` exists, the public rows
+  are SLICED out of it and saved. This runs once and avoids recomputing the whole public block.
+- COVERAGE ASSERTION: after assembly, every `df_all` compound must have features, so a silent drop is now a
+  loud failure. A column-set mismatch between the cached public block and the fresh internal block also
+  raises, instead of concatenating into NaN columns.
+- `DATA._compute_MF(smi, type, n_jobs)` extracted, so both blocks share one code path.
+Tests: `tests/test_mf_features.py`, 7/7 pass, with the real H237 block replaced by a counting stub — cold
+start, warm start, a NEW INTERNAL compound picked up (the bug), a new public compound topped up, the legacy
+derive, the column mismatch, and the unknown-type error. Suite: 36/36 pass.
+CAUTION — STILL STALE: `python/run_chemprop_transfer.py:90` hardcodes the LEGACY
+`output/features/20260824_MF_features.parquet` and LEFT-joins its `DS_` columns onto the internal targets, so
+a new internal compound gets NaN descriptors there. That runner is the legacy CLI path; the notebook path is
+fixed. Do not point it at the public cache — that file holds no internal row, so the join would return all
+NaN. Fixing it needs an on-the-fly internal `DS_` compute in its own `DATA.load_internal`. MOOT as of 2026-09-07:
+`run_chemprop_transfer.py` is SUPERSEDED (see below), so the stale join is no longer on any live path.
+
+**DECISION (2026-09-07): `python/run_chemprop_transfer.py` is SUPERSEDED by `ADME_build_ML.py`.** Every
+chemprop computation now runs through `DATA.build_ML_data_CP` + `OUTPUT.assess_predictions_cp`. The arms map
+one to one: runner `transfer` -> `augmented_cv`, runner `scratch` -> `internal_cv`, runner `pretrain_only` ->
+`ext_->_internal`. Cluster groupings (`mdck_perm`, `ppb_fu`) work in the module path too, and both paths now
+pass `--pytorch-seed`, so the module path is strictly the better one.
+MOVED 2026-09-07 (`git mv`, so the history follows): `python/run_chemprop_transfer.py` and
+`run_cp_transfer.sh` both now live in **`archive/`**. Every usage path inside them was updated, and both carry
+a SUPERSEDED header naming the module path that replaced them. Nothing imports either, so no code broke; the
+wrapper still `cd`s to the repo root, so `bash archive/run_cp_transfer.sh` would still reproduce the recorded
+grouping sweep. KEPT UNTOUCHED: everything under `output/predictions_runs_chemprop_transfer/` and
+`output/chemprop_models/transfer_pretrain/` (the checkpoints `assess_predictions_cp` reuses). The last of those holds
+`summary_transfer.csv`, which is the PROVENANCE for every grouping number in the champion table and for the
+relatedness law — deleting it would orphan those wiki claims.
+ONE CAPABILITY GAP: the runner scored several groupings PER ENDPOINT and keyed its summary by
+(endpoint, arm, grouping). `assess_predictions_cp` stores `metrics_results_cp[<endpoint>]`, so two groupings
+for one endpoint overwrite each other in memory; only the caller-chosen `outpath` separates them on disk.
+A grouping sweep (needed for the deferred HPO-best re-run) wants the grouping in the key. Not changed yet.
+
+**`OUTPUT.assess_all_endpoints_cp(data, params, endpoints, leak, n_splits, seed)` (2026-09-07)** — the
+chemprop twin of `assess_all_endpoints`, so the 8-endpoint chemprop run is one call instead of a notebook
+loop. Per endpoint: `build_ML_data_CP` then `assess_predictions_cp` -> one pickle at
+`CHEMPROP_TRANSFER.cp_metrics_dir/<k>.pkl`, collecting into `self.metrics_results_cp`.
+`n_splits`/`seed` pass through to `build_ML_data_CP` and matter only for an endpoint whose RF pickle is
+absent. NEW CLI, beside the RF one: `python/ADME_build_ML.py --assess_CP_all_endpoints [--leak
+exact|skeleton|none] [--endpoints a,b]`. CAUTION: 11 chemprop trainings per endpoint (1 pretrain + 5
+transfer folds + 5 scratch folds), so run it detached; the pretrain is cached per GROUPING, so hlm/mlm/rlm
+share one and solubility/logd share one — 6 pretrains for all 8 endpoints, not 8.
+Test `test_assess_all_endpoints_cp_loops_and_collects` proves the loop collects both endpoints, writes one
+pickle each, and reuses a shared grouping's pretrain (the stub argv shows ONE pretrain for two endpoints).
+Suite: 37/37 pass.
+
+**CONFIG KEY RENAME (2026-09-08): the two metrics directories are now ONE pair of top-level keys.**
+`METRICS_PKL_DIR` and `CHEMPROP_TRANSFER.rf_metrics_dir` held the SAME path (`output/results/20260825_metrics`)
+for two different reasons — the RF output directory, and the fold source chemprop reads. One value, two keys,
+so a change to one would silently break the apples-to-apples fold link. Now:
+- `METRICS_PKL_RF_DIR: 'output/results/20260825_metrics'` — where `assess_predictions` writes the 6 RF arms,
+  AND the fold source `DATA._cp_folds` reads (the `fold` column of `<k>.pkl`).
+- `METRICS_PKL_CP_DIR: 'output/results/20260907_metrics_cp'` — where `assess_predictions_cp` writes the 3
+  chemprop arms (was `CHEMPROP_TRANSFER.cp_metrics_dir`).
+`CHEMPROP_TRANSFER` no longer carries either directory. Updated: `python/ADME_build_ML.py` (17 references —
+`_cp_folds`, `assess_all_endpoints`, `assess_all_endpoints_cp`, both CLI help strings, both done-prints),
+6 notebook cells (the hardcoded `'output/results/20260825_metrics/'+k+'.pkl'` string is gone from cells 10,
+13 and 26), and both chemprop test fixtures. `archive/run_chemprop_transfer.py` reads
+`cfg['METRICS_PKL_RF_DIR']` into its own `self.rf_metrics_dir`, so the archived runner still loads.
+Verified: `PARAMS` reports both new keys, the old `METRICS_PKL_DIR` attribute is gone, `CHEMPROP_TRANSFER`
+holds neither directory, the RF directory still holds its 8 pickles, and no stale reference remains outside
+`config_legacy_20260903.yaml`. Suite: 37/37 pass.
+
+**SUPERSEDED, same day — see the LEAN CONFIG entry below: the user decided never to run
+`run_RF_SingleTask_systematic.py` again, so the 5 keys only it read WERE removed. The reasoning below is kept
+because it records which modules the removal breaks.**
+**(earlier) DECISION (2026-09-08): `RF_SINGLETASK` stays in full, and `python/run_RF_SingleTask_systematic.py`
+is not archived.** The question was whether the block could be deleted now that `ADME_build_ML.py` replaced the
+systematic CLI. Two facts say no:
+1. `champion` / `seed` / `n_jobs` are REQUIRED by the live path — `OUTPUT.__init__` does
+   `self.cfg = params.RF_SINGLETASK` and `make_model` builds every RF arm, the deployed model and the webapp
+   model from them. Deleting the block breaks `ADME_build_ML.py` at once.
+2. `run_RF_SingleTask_systematic.py` is not only a CLI: it is a shared LIBRARY imported by SIX live modules —
+   `python/adme_train_counts.py`, `python/raw_units_experiment.py`, `python/sanitize_solubility.py`,
+   `python/temporal_eval.py`, `tests/test_rf_systematic.py`, `tests/test_chemprop_systematic.py`. Archiving it
+   would break all six, unlike the chemprop runner, which nothing imported. So the 5 keys only it reads
+   (`output_dir`, `features_type`, `register_mltrail`, `archive_public_in_trainset`, `augmented_sources`) stay
+   too, and `cv_folds` is read by both cleaning sweeps.
+WHAT WAS DONE instead — two config comments were WRONG and are corrected:
+- the `RF_SINGLETASK` header named the old CLI as the consumer; it now says which keys the live path needs and
+  which belong to the systematic runner.
+- the `BEST_CHEMPROP_GROUPINGS` header claimed endpoint-grouping public rows come from
+  `RF_SINGLETASK.augmented_sources`. TRUE for the archived runner, FALSE for `DATA.build_ML_data_CP`, which
+  takes its public rows from the WIDE `df_all` — so the real source is `ENDPOINT_PUBLIC_FILES`.
+Suite: 37/37 pass.
+
 **Workaround today:** bump the stamp — `data.build_MF_features(params, type='H237', date='<new date>')` — which forces
 a full recompute of all ~369k (descriptastorus block dominates, `n_jobs=32`); then update the hardcoded
 `output/features/20260824_MF_features.parquet` path used by the chemprop cells/runner.
@@ -1480,3 +1572,86 @@ New dependency: `lightgbm==4.7.0` in `requirements.txt` (installed in `ML`; offl
 - Convert PharmaBench log10 nM → logS (mol/L) for merge.
 - Decide intrinsic-S0 vs apparent-pH handling (pKa conversion vs model intrinsic).
 - Manually fetch Wiki-pS0 SI (bRo5 anchor).
+
+
+## ★ LEAN CONFIG — three consumers only (2026-09-08)
+
+**DECISION (user):** `python/run_RF_SingleTask_systematic.py` will never run again. `config/config.yaml` now
+serves exactly THREE consumers — `python/ADME_build_ML.py`, `vignettes/Multitask_adme_preds.ipynb`, and
+`webapp/app.py`. Every key is read by at least one of them, verified by grep.
+
+**Top-level keys: all 13 KEPT** (nothing was removable). The map is now in the config header:
+- `ADME_build_ML.py` — ADME_ENDPOINTS, ENDPOINT_PUBLIC_FILES, BEST_PUBLIC, RF_SINGLETASK,
+  BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER, MF_features_all_path, METRICS_PKL_RF_DIR, METRICS_PKL_CP_DIR,
+  FOLD_GROUP_BY_INCHIKEY, DEPLOY
+- the notebook — ADME_ENDPOINTS, CHEMPROP_TRANSFER, METRICS_PKL_RF_DIR, METRICS_PKL_CP_DIR, SERAC_C, webapp
+- `webapp/app.py` — ADME_ENDPOINTS, SERAC_C, webapp (exactly three; nothing else)
+
+**`RF_SINGLETASK` trimmed 9 keys -> 4:** kept `seed`, `n_jobs`, `cv_folds`, `champion`. Removed
+`output_dir`, `features_type`, `register_mltrail`, `archive_public_in_trainset`, `augmented_sources` — all
+read only by the retired runner. `cv_folds` + `seed` were made LIVE at the same time:
+`select_best_combo_and_update` used to hardcode `_grouped_folds(n_splits=5, seed=42)` and now reads
+`RF_SINGLETASK['cv_folds']` / `['seed']` (same values, so no result changes).
+
+**★ THE PUBLIC-SOURCE POLICY MOVED, AND THAT FIXED A BUG.** `RF_SINGLETASK.augmented_sources` held the vetted
+per-endpoint policy but the LIVE path never read it — only the retired runner did. Meanwhile
+`ENDPOINT_PUBLIC_FILES`, which is what actually builds `df_all`, CONTRADICTED it: it pulled in
+`public_admetlab_mdck.parquet` and `public_admetlab_ppb.parquet` (63,136 rows each, origin
+`ADMETlab-PROTAC`) that the policy says to drop.
+- RF was PROTECTED: `select_best_combo_and_update` filters to `BEST_PUBLIC[k]` origins (mdck ->
+  `Novartis-NIBR`, ppb -> `TDC:PPBR_AZ`), so ADMETlab never entered an RF arm. RF numbers are unaffected.
+- CHEMPROP WAS NOT: `build_ML_data_CP` takes every public row (`wide.source != 'internal'`) with NO origin
+  filter, so the notebook path pretrained mdck and ppb on those 63k ADMETlab rows — the ablations say
+  dropping them lifts mdck 0.163 -> 0.321 and ppb 0.149 -> 0.316. The archived runner DID filter, so the
+  notebook was also not comparable to the recorded mdck_perm 0.467 / ppb_fu 0.022.
+FIX: the two files were removed from `ENDPOINT_PUBLIC_FILES`, which is the only key the live path reads for
+public sources, and the ablation numbers moved into its comment. caco2 KEEPS ADMETlab — it is the one endpoint
+where that source helps (`BEST_PUBLIC` lists it). One edit removed the duplication AND enforced the policy.
+CAUTION: mdck and ppb chemprop results MUST be recomputed; their `df_all` public pool is now smaller.
+
+**Notebook repair:** cell 38 (the superseded temporal-fraction chemprop cell) read
+`params.TEMPORAL_FRACTIONS`, a key dropped in the 2026-09-03 trim, so it would have raised. It now reads
+`CHEMPROP_TRANSFER['hp']` / `['epochs_finetune']` / `['chemprop_bin']` — values VERIFIED identical to the
+retired ones (hp dict equal, 30 == 30, same binary path), so nothing changes behaviourally.
+
+**VERIFIED end to end:** every `params.<KEY>` in `ADME_build_ML.py` and in every notebook cell resolves;
+`OUTPUT` builds the champion RF; `--help` works; the webapp was STARTED on a scratch port and `GET /`
+returned **200, 16,709 bytes**, having loaded its 8 RF champions plus the extra Px model. Suite: 37/37 pass.
+`tests/test_rf_systematic.py` and `tests/test_chemprop_systematic.py` test the retired scripts and will fail
+once those are deleted — delete the tests with them.
+
+**BEST_CHEMPROP_GROUPINGS TRIMMED + `endpoint_grouping` DELETED (2026-09-08).** Audit of which fields the
+live code reads:
+- `CHEMPROP_TRANSFER.groupings` / `.clusters` are the CATALOGUE (a grouping name -> its task list, or ->
+  target + cluster parquet). `DATA.build_ML_data_CP` resolves every task list from here.
+- `BEST_CHEMPROP_GROUPINGS` is the VERDICT (which catalogue entry won each endpoint). The code reads exactly
+  ONE field from it: `['grouping']` (ADME_build_ML.py:273).
+REMOVED from each verdict: `kind`, `tasks`, `target`, `file` — all UNREAD and all duplicates of the catalogue,
+so they could drift into a lie. Verified the catalogue resolves to the identical task lists the deleted
+`tasks:` fields had claimed. KEPT: `grouping` (functional), `r2det` (the measured honest score) and
+`beats_rf` (the deploy gate — NOTHING honours it yet; a deploy step must, because chemprop wins only 5/8).
+`kind` became unnecessary when `build_ML_data_CP` gained its cluster branch: a grouping is a cluster exactly
+when its name is in `CHEMPROP_TRANSFER.clusters`.
+**`CHEMPROP_TRANSFER.endpoint_grouping` DELETED — it was dead AND WRONG.** Read by nothing (zero references
+in code, notebook or webapp), and it CONTRADICTED the verdicts: it mapped caco2/logd/mdck/ppb all to `all8`,
+the pre-sweep default, while the verdicts say permeability / sol_lipo / mdck_perm / ppb_fu. Dead-and-wrong is
+the worst combination, because a reader takes it for the live mapping.
+New guard test `test_real_config_verdicts_resolve_to_a_catalogue_entry` reads the LIVE config and asserts the
+invariant that replaced the duplication: every verdict names a real catalogue entry, all 8 endpoints have a
+verdict, each verdict holds exactly {grouping, r2det, beats_rf}, and `endpoint_grouping` is gone.
+Re-verified: webapp `GET /` -> 200 (16,709 bytes, 8 champions + the Px extra), every `params.<KEY>` in
+`ADME_build_ML.py` resolves. Suite: 38/38 pass.
+
+**BEST_CHEMPROP_GROUPINGS IS NOW A BARE MAP (2026-09-08).** `r2det` and `beats_rf` were removed: a measured
+score in a config goes stale in silence, and both are already in the champion table above. The block is now
+`endpoint -> grouping name` (8 scalar lines), and `DATA.build_ML_data_CP` reads
+`params.BEST_CHEMPROP_GROUPINGS[k]` directly instead of `[k]['grouping']`.
+CAUTION for a future deploy step: `beats_rf` was the only machine-readable gate saying chemprop wins just 5/8
+(solubility, mdck and ppb still go to RF). A deploy step must now compare the LIVE numbers in
+`METRICS_PKL_RF_DIR` vs `METRICS_PKL_CP_DIR` — which is the better design anyway, because those cannot go
+stale — and must never read this mapping as "ship chemprop". The caution is written into the config header.
+The guard test paid for itself immediately: a truncated search pattern mangled the ppb line into
+`ppb: ppb_fud wins (0.537) ...`, and `test_real_config_verdicts_resolve_to_a_catalogue_entry` failed on it at
+once. Repaired; the test now also asserts every value is a plain string.
+Re-verified: all 8 endpoints resolve to the same task lists as before, webapp `GET /` -> 200 (16,709 bytes),
+suite 38/38 pass.

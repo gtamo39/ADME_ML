@@ -1,18 +1,17 @@
 # ADME_ML — config for the ADME_build_ML.py workflow and the prediction webapp.
 #
-# SCOPE: this file holds ONLY the keys those two consumers actually read (verified by grep), plus the
-# chemprop TRANSFER blocks being ported into ADME_build_ML.py. Everything else was moved out on
-# 2026-09-03 — the full previous config is preserved verbatim at
+# SCOPE: THREE consumers, nothing else. Every key below is read by at least one of them (verified by grep);
+# every key only a retired script read was removed. The full pre-2026-09-03 config is preserved verbatim at
 #   config/config_legacy_20260903.yaml
-# Legacy runners (run_Chemprop_SystematicGroups.py, temporal_fractions_*.py, adme_cleaning_sweep.py,
-# build_novartis_clusters.py, the extract/build scripts) need keys that live ONLY in that legacy file,
-# so point them at it with --config config/config_legacy_<date>.yaml.
+# Point any legacy runner at that file with --config config/config_legacy_20260903.yaml.
 #
 # WHO READS WHAT
-#   ADME_build_ML.py : ADME_ENDPOINTS, ENDPOINT_PUBLIC_FILES, BEST_PUBLIC, RF_SINGLETASK,
-#                      MF_features_all_path, METRICS_PKL_DIR, FOLD_GROUP_BY_INCHIKEY, DEPLOY
-#   webapp/app.py    : ADME_ENDPOINTS, SERAC_C, webapp
-#   chemprop port    : CHEMPROP_TRANSFER, BEST_CHEMPROP_GROUPINGS
+#   python/ADME_build_ML.py            : ADME_ENDPOINTS, ENDPOINT_PUBLIC_FILES, BEST_PUBLIC, RF_SINGLETASK,
+#                                        BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER, MF_features_all_path,
+#                                        METRICS_PKL_RF_DIR, METRICS_PKL_CP_DIR, FOLD_GROUP_BY_INCHIKEY, DEPLOY
+#   vignettes/Multitask_adme_preds.ipynb: ADME_ENDPOINTS, BEST_PUBLIC, RF_SINGLETASK, METRICS_PKL_RF_DIR,
+#                                        METRICS_PKL_CP_DIR, SERAC_C, webapp
+#   webapp/app.py                      : ADME_ENDPOINTS, SERAC_C, webapp
 #
 # CAUTION: PARAMS.load_params does __dict__.update(yaml), so every top-level key becomes params.<KEY>.
 # Removing a key that a method reads fails only at that call site — grep before deleting one.
@@ -30,18 +29,29 @@ ADME_ENDPOINTS:
   mdck:       {col: 'mdck_Mean Papp A to B',                   transform: log10,     unit: 1e-6cm/s, filter: {col: 'mdck_Cell line', contains: MDR1}}  # MDR1-MDCK only (drop MDR2/MDR3)
   ppb:        {col: 'ppb_%Unbound',                            transform: logit_pct, unit: pct_unbound}
 
-## ==================== PUBLIC DATA (prebuilt parquets) ====================
+## ============ PUBLIC DATA (prebuilt parquets) + PER-ENDPOINT SELECTIONS ============
+## The two BEST_* keys below are SELECTIONS, one per endpoint: which public origins the RF augments with,
+## and which chemprop pretrain grouping wins. Their definitions live in the MODELS section further down.
 # public EXP parquet(s) per endpoint (concatenated; value already in modelling space) for the generic
 # DATA._endpoint_dfs builder. solubility/logd/mdck keep their own bespoke get_*_data methods.
+# THIS IS THE PUBLIC-SOURCE POLICY. df_all takes its public rows from exactly these files, so a file left
+# out here can never reach an RF arm or a chemprop pretrain. It replaced RF_SINGLETASK.augmented_sources on
+# 2026-09-08, which the live path never read (only the retired systematic runner did).
+# ADMETlab PREDICTED values are excluded for solubility, mdck and ppb — measured ablations:
+#   solubility  experimental-only moves temporal 0.044 -> 0.313 (predicted pseudo-labels poison the newest
+#               compounds; wiki 2026-07)
+#   mdck        dropping ADMETlab lifts 0.163 -> 0.321
+#   ppb         dropping ADMETlab lifts 0.149 -> 0.316
+# caco2 KEEPS ADMETlab: it is the one endpoint where that source helps (BEST_PUBLIC lists it).
 ENDPOINT_PUBLIC_FILES:
   solubility: [public_solubility.parquet]
   logd:  [public_logd.parquet]
-  mdck:  [public_novartis_mdck.parquet, public_admetlab_mdck.parquet]
+  mdck:  [public_novartis_mdck.parquet]
   hlm:   [public_hlm.parquet, public_novartis_hlm.parquet]
   mlm:   [public_novartis_mlm.parquet]
   rlm:   [public_rlm.parquet, public_novartis_rlm.parquet]
   caco2: [public_caco2.parquet, public_novartis_caco2.parquet, public_admetlab_caco2.parquet]
-  ppb:   [public_ppb.parquet, public_novartis_ppb.parquet, public_admetlab_ppb.parquet]
+  ppb:   [public_ppb.parquet, public_novartis_ppb.parquet]
 
 BEST_PUBLIC:
   solubility: ['thermodynamic:ChEMBL','thermodynamic:AQUA','thermodynamic:PHYS']
@@ -54,46 +64,40 @@ BEST_PUBLIC:
   ppb:        ['TDC:PPBR_AZ']
 # Best chemprop TRANSFER grouping per endpoint — the chemprop analogue of BEST_PUBLIC above.
 # Measured 2026-09-02 (public pretrain -> frozen-encoder finetune on RF's EXACT folds; see wiki).
-# `kind: endpoint` -> tasks are internal endpoint columns; public rows for each task come from the SAME
-# config-vetted policy as RF (RF_SINGLETASK.augmented_sources), so sources are NOT restated here and cannot drift.
-# `kind: cluster`   -> tasks are the internal target + the related raw Novartis pred(...) columns held in `file`
-# (prebuilt by python/build_novartis_clusters.py); aux task names are read from that parquet's schema.
-# `r2det` = the measured honest score. `beats_rf` = does chemprop beat the best RF arm for this endpoint?
+# endpoint -> the stage-1 pretrain grouping that WON it. The value names an entry of
+# CHEMPROP_TRANSFER.groupings or CHEMPROP_TRANSFER.clusters below, and that entry alone defines the tasks, so
+# nothing can drift. Public rows come from the WIDE df_all, so their sources are ENDPOINT_PUBLIC_FILES above.
+# The MEASUREMENTS live in the wiki, not here (a score in a config goes stale in silence): see the champion
+# table in wiki/wiki.md for each endpoint's r2det, which model wins, and by how much.
+# CAUTION: chemprop wins only 5/8. For solubility, mdck and ppb the entry names chemprop's BEST grouping but
+# RF still wins, so a deploy step must compare the LIVE numbers in METRICS_PKL_RF_DIR vs METRICS_PKL_CP_DIR —
+# never assume this mapping means "ship chemprop".
 # CAUTION: chemprop wins only 5/8. For solubility/mdck/ppb the entry records chemprop's BEST grouping but RF
 # still wins (solubility RF-augmented 0.731, mdck RF+near-shell 0.539, ppb RF-augmented 0.537) — a deploy step
 # must honour `beats_rf`, not just pick the chemprop grouping.
 BEST_CHEMPROP_GROUPINGS:
-  hlm:        {grouping: clearance,    kind: endpoint, tasks: [hlm, mlm, rlm],    r2det: 0.647, beats_rf: true}
-  mlm:        {grouping: clearance,    kind: endpoint, tasks: [hlm, mlm, rlm],    r2det: 0.673, beats_rf: true}
-  rlm:        {grouping: clearance,    kind: endpoint, tasks: [hlm, mlm, rlm],    r2det: 0.274, beats_rf: true}
-  caco2:      {grouping: permeability, kind: endpoint, tasks: [caco2, mdck],      r2det: 0.771, beats_rf: true}
-  logd:       {grouping: sol_lipo,     kind: endpoint, tasks: [solubility, logd], r2det: 0.832, beats_rf: true}
-  solubility: {grouping: all8,         kind: endpoint, tasks: [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb],
-               r2det: 0.671, beats_rf: false}     # RF full-augmented wins (0.731) — experimental public, no bias to fix
-  mdck:       {grouping: mdck_perm,    kind: cluster,  target: mdck, file: tf_novartis_mdck_perm.parquet,
-               r2det: 0.467, beats_rf: false}     # RF + near-shell dist060_agree wins (0.539)
-  ppb:        {grouping: ppb_fu,       kind: cluster,  target: ppb,  file: tf_novartis_ppb_fu.parquet,
-               r2det: 0.022, beats_rf: false}     # RF full-augmented wins (0.537) — transfer badly hurts ppb
+  hlm:        clearance
+  mlm:        clearance
+  rlm:        clearance
+  caco2:      permeability
+  logd:       sol_lipo
+  solubility: all8
+  mdck:       mdck_perm
+  ppb:        ppb_fu
 
 ## ==================== MODELS ====================
-# --- single-task RF systematic run (python/run_RF_SingleTask_systematic.py) ---
+# --- champion RF hyperparameters ---
+# Every key here is read by ADME_build_ML.py: `champion` / `seed` / `n_jobs` build every RF arm, the deployed
+# model and the webapp model (OUTPUT.__init__ -> make_model); `cv_folds` + `seed` size the internal CV
+# (select_best_combo_and_update). The systematic-runner knobs (output_dir, features_type, register_mltrail,
+# archive_public_in_trainset, augmented_sources) were REMOVED on 2026-09-08 — see ENDPOINT_PUBLIC_FILES for
+# where the public-source policy now lives.
 RF_SINGLETASK:
   seed: 42
   n_jobs: 32
   cv_folds: 5
-  output_dir: output/predictions_runs
-  features_type: H236                 # H236 (MLTrail-deployable) | MFDS (needs descriptastorus + custom featurizer)
   champion: {n_estimators: 200, max_depth: 20, max_features: 0.3, min_samples_leaf: 2}
-  register_mltrail: true
-  archive_public_in_trainset: true   # archive the FULL internal+public trainset (reproducible in isolation)
-  # per-endpoint public sources for the deployed "augmented" model (default = all available parquets).
-  # solubility: EXPERIMENTAL only — ADMETlab PREDICTED solubility HURTS (wiki 2026-07: experimental
-  # moves temporal 0.044->0.313, predicted pseudo-labels poison newest compounds). Others use all available.
-  augmented_sources:
-    solubility: [EXP]            # ADMETlab predicted solubility poisons it (wiki 2026-07)
-    mdck: [NVS]                  # ADM ablation: dropping ADMETlab lifts mdck 0.163 -> 0.321
-    ppb: [EXP, NVS]              # ADM ablation: dropping ADMETlab lifts ppb 0.149 -> 0.316
-# --- Chemprop TRANSFER LEARNING arm (python/run_chemprop_transfer.py; run from env ML, shells out) ---
+# --- Chemprop TRANSFER LEARNING arm (ADME_build_ML.py: build_ML_data_CP + assess_predictions_cp) ---
 # Public pretrain -> frozen-encoder multitask finetune on internal, evaluated on RF's EXACT folds.
 # Stage 1: multitask chemprop train on PUBLIC ONLY per grouping (never sees an internal label -> cannot
 # leak into any internal fold; paid once, reused by every endpoint/fold).
@@ -106,8 +110,6 @@ CHEMPROP_TRANSFER:
   chemprop_bin: ~/miniconda3/envs/chemprop/bin/chemprop   # shelled out to, so the runner can live in env ML
   output_dir: output/predictions_runs_chemprop_transfer
   pretrain_dir: output/chemprop_models/transfer_pretrain  # persisted stage-1 checkpoints (reused across folds)
-  rf_metrics_dir: output/results/20260825_metrics         # RF preddf pickles -> the EXACT fold membership
-  cp_metrics_dir: output/results/20260907_metrics_cp     # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
   epochs_pretrain: 30
   epochs_finetune: 30
   patience: 15
@@ -133,20 +135,14 @@ CHEMPROP_TRANSFER:
   clusters:
     mdck_perm: {target: mdck, file: tf_novartis_mdck_perm.parquet}   # MDCKv1/v2, Caco-2, MDR1 LogER, logPAMPA
     ppb_fu:    {target: ppb,  file: tf_novartis_ppb_fu.parquet}      # LogFu x5 species, HSA, Fubrain, Fumic, LogP/LogD
-  endpoint_grouping:                   # which stage-1 pretrain each endpoint finetunes from
-    hlm:        clearance
-    mlm:        clearance
-    rlm:        clearance
-    solubility: all8
-    logd:       all8
-    caco2:      all8
-    mdck:       all8
-    ppb:        all8
 
 ## ==================== PATHS / CV POLICY ====================
 ## ---- ML model training and deployment ---- ##
 MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
-METRICS_PKL_DIR: 'output/results/20260825_metrics/'   # OUTPUT.assess_predictions writes <k>.pkl here (per-endpoint arms)
+METRICS_PKL_RF_DIR: 'output/results/20260825_metrics'    # OUTPUT.assess_predictions writes <k>.pkl here (6 RF arms).
+                                                        # ALSO the fold source for chemprop: DATA._cp_folds reads the
+                                                        # `fold` column of <k>.pkl, so both models score identical folds.
+METRICS_PKL_CP_DIR: 'output/results/20260907_metrics_cp'   # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
 FOLD_GROUP_BY_INCHIKEY: true   # CV folds grouped by InChIKey so a molecule's twins never split across train/test (anti-leakage)
 
 ## ==================== DEPLOYMENT ====================
