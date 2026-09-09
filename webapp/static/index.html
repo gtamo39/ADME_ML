@@ -34,7 +34,19 @@
   .btn{appearance:none;border:none;cursor:pointer;font-family:var(--mono);font-size:13px;letter-spacing:.04em;padding:10px 18px;border-radius:9px;background:var(--olive);color:#fff;transition:filter .15s}
   .btn:hover{filter:brightness(1.06)} .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .btn[disabled]{background:#cdc7ba;cursor:default;filter:none}
-  .status{font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .status{font-family:var(--mono);font-size:12px;color:var(--muted);display:inline-flex;align-items:center;gap:9px}
+  /* scoring progress bar: a tqdm-style pill driven by the NDJSON stream from /api/predict.
+     Track = a pale tint of the fill; fill = azure with 45-degree stripes that drift while active. */
+  .prog{display:none;align-items:center;gap:9px}
+  .prog.on{display:inline-flex}
+  .prog .track{width:190px;height:14px;flex:none;border-radius:99px;background:#eaf6fb;overflow:hidden}
+  .prog .fill{display:block;width:0;height:100%;border-radius:99px;background-color:var(--azure);
+    background-image:linear-gradient(45deg,rgba(255,255,255,.28) 25%,transparent 25%,transparent 50%,
+                     rgba(255,255,255,.28) 50%,rgba(255,255,255,.28) 75%,transparent 75%,transparent);
+    background-size:16px 16px;animation:stripe .7s linear infinite;transition:width .25s ease-out}
+  .prog .pct{font-family:var(--mono);font-size:11px;color:var(--azure);min-width:30px;text-align:right}
+  @keyframes stripe{to{background-position:16px 0}}
+  @media (prefers-reduced-motion:reduce){.prog .fill{animation:none}}
 
   .legend{display:flex;gap:20px;flex-wrap:wrap;font-family:var(--mono);font-size:11px;color:var(--muted);margin:18px 0 6px}
   .legend .sw{display:inline-block;width:11px;height:11px;border-radius:2px;vertical-align:-1px;margin-right:5px}
@@ -109,12 +121,28 @@
   .cid{color:var(--ink);font-weight:500;max-width:180px;white-space:normal;word-break:break-word}
   input.score{font-family:var(--mono);font-size:12px;width:66px;border:1px solid var(--line);border-radius:6px;padding:5px 6px;background:#fffefb;color:var(--ink)}
 
-  /* diagonal-split endpoint cell: top-right = confidence, bottom-left = predicted value */
+  /* diagonal endpoint cell: top-right = confidence, bottom-left = predicted value.
+     The confidence fills the cell; the value is masked out ACROSS the diagonal, so --blend sets the
+     width of the gradient band (0% = the old hard split). `to top right` puts the band's 50% line on
+     the top-left -> bottom-right diagonal; `to bottom right` would use the other diagonal. */
   .epcell{position:relative;width:98px;height:58px}
   .epcell .half{position:absolute;inset:0}
-  .epcell .conf{clip-path:polygon(0 0,100% 0,100% 100%)}   /* upper-right triangle */
-  .epcell .pred{clip-path:polygon(0 0,0 100%,100% 100%)}   /* lower-left triangle */
-  .epcell .divider{position:absolute;inset:0;pointer-events:none;background:linear-gradient(to bottom right,transparent calc(50% - .5px),rgba(43,39,35,.18) calc(50% - .5px),rgba(43,39,35,.18) calc(50% + .5px),transparent calc(50% + .5px))}
+  /* DEFAULT = CURVED: a quarter-ellipse arc centred on the bottom-left corner. Radius 80% is
+     deliberate — a quarter ellipse of radius r covers (pi/4)r^2 of the box, so 80% gives 50.3% and
+     the value still owns half the cell. The x2.4 matches the straight mask's perceived band width.
+     This is the DEFAULT rather than a .shape-curved rule, so a cell is never left unmasked (an
+     unmasked value layer would cover the confidence half completely). */
+  .epcell .pred{
+    -webkit-mask-image:radial-gradient(80% 80% at 0% 100%,#000 calc(100% - var(--blend,10%)*2.4),transparent calc(100% + var(--blend,10%)*2.4));
+            mask-image:radial-gradient(80% 80% at 0% 100%,#000 calc(100% - var(--blend,10%)*2.4),transparent calc(100% + var(--blend,10%)*2.4))}
+  /* STRAIGHT override: a linear band along the top-left -> bottom-right diagonal. `to top right` is
+     the corner keyword that puts the band on THAT diagonal; `to bottom right` uses the other one. */
+  .shape-straight .epcell .pred{
+    -webkit-mask-image:linear-gradient(to top right,#000 calc(50% - var(--blend,10%)),transparent calc(50% + var(--blend,10%)));
+            mask-image:linear-gradient(to top right,#000 calc(50% - var(--blend,10%)),transparent calc(50% + var(--blend,10%)))}
+  /* hairline: straight split only (an arc has no straight line to trace); fades as the band widens */
+  .epcell .divider{display:none}
+  .shape-straight .epcell .divider{display:block;position:absolute;inset:0;pointer-events:none;opacity:var(--divop,1);background:linear-gradient(to top right,transparent calc(50% - .5px),rgba(43,39,35,.18) calc(50% - .5px),rgba(43,39,35,.18) calc(50% + .5px),transparent calc(50% + .5px))}
   .epcell b{position:absolute;font-weight:600;color:#1f1b17}
   .epcell .cv{top:3px;right:6px;font-weight:400;font-size:10px;color:#3a352f}
   .epcell .pv{bottom:3px;left:6px;font-size:12px}
@@ -129,7 +157,7 @@
 <div class="wrap">
   <p class="eyebrow">ADME_ML · RF (H237) · conf_recal · local only</p>
   <h1>ADME property prediction</h1>
-  <p class="lede">Drop an <b>SDF</b> or <b>CSV</b> of compounds with SMILES. Every compound is scored by the 8 champion single-task RF models in the MLTrail vault. Each endpoint cell is split on the diagonal: the <b>lower-left</b> shows the predicted value (colored by triage cutoff), the <b>upper-right</b> shows the RF confidence.</p>
+  <p class="lede">Drop an <b>SDF</b> or <b>CSV</b> of compounds with SMILES. Every compound is scored by the 8 champion models in the MLTrail vault — a single-task RF, or the chemprop transfer model where it wins. Each endpoint cell fades across the diagonal: the <b>lower-left</b> shows the predicted value (colored by triage cutoff), the <b>upper-right</b> shows the confidence, which always comes from the RF model.</p>
 
   <div class="card">
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose or drop files">
@@ -143,6 +171,7 @@
       <button class="btn" id="download" disabled>Download CSV</button>
       <button class="btn ghost" id="clear">Clear</button>
       <span class="status" id="status">idle</span>
+      <span class="prog" id="prog"><span class="track"><span class="fill" id="progfill"></span></span><span class="pct" id="progpct"></span></span>
     </div>
 
     <details class="panel mpo" id="mpobox">
@@ -215,6 +244,18 @@
           <label>confidence below split <input type="color" id="c_ember"></label>
         </div>
         <div class="sharprow">
+          <span>cell split</span>
+          <select id="c_shape">
+            <option value="curved">curved</option>
+            <option value="straight">straight diagonal</option>
+          </select>
+          <span>blend</span>
+          <span>hard</span>
+          <input type="range" id="c_blend" min="0" max="40" step="2" value="10">
+          <span>soft</span>
+          <span id="blendval">10%</span>
+        </div>
+        <div class="sharprow">
           <span>value fade</span>
           <span>smoother</span>
           <input type="range" id="c_sharp" min="0.25" max="4" step="0.25" value="1">
@@ -232,6 +273,11 @@
           prediction moves away from it, in the endpoint's modelling space (per log unit for a log endpoint).
           <code>value fade</code> scales that steepness — left is a smoother ramp, right is closer to a hard cutoff.
           The per-column default comes from <code>webapp.color_slope</code> in the config.
+          <br><code>cell split</code> chooses the shape of the boundary between the value and the confidence:
+          <b>curved</b> is an arc through the cell, <b>straight diagonal</b> is the classic corner-to-corner split.
+          Both keep about half the cell for each reading. <code>blend</code> sets how wide the two colors mix
+          across that boundary: <b>hard</b> (0%) gives a crisp edge, <b>soft</b> spreads it into a wide gradient.
+          The straight split also draws a hairline, which fades out as the band widens.
         </div>
       </div>
     </details>
@@ -250,6 +296,7 @@
   <footer id="foot">bind 127.0.0.1 · MLTrail vault</footer>
 </div>
 <div class="preview" id="preview"></div>
-<script src="/static/app.js?v=2026-08-31c"></script>
+<!-- the "/" route rewrites v= to app.js's mtime, so an edit is never served from cache -->
+<script src="/static/app.js?v=auto"></script>
 </body>
 </html>

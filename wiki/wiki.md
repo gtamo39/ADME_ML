@@ -1655,3 +1655,466 @@ The guard test paid for itself immediately: a truncated search pattern mangled t
 once. Repaired; the test now also asserts every value is a plain string.
 Re-verified: all 8 endpoints resolve to the same task lists as before, webapp `GET /` -> 200 (16,709 bytes),
 suite 38/38 pass.
+
+**README — how to run the models (2026-09-08).** New section `## Running the models —
+python/ADME_build_ML.py` documents the single entry point: the two assess commands, the arm table
+(RF 6 arms vs chemprop 3, and which chemprop arm mirrors which RF arm), the flag table, the deploy
+command, and the notebook equivalent. Every flag was checked against `--help`; every method in the
+notebook snippet was checked to exist; the output directories are named by CONFIG KEY
+(`METRICS_PKL_RF_DIR` / `METRICS_PKL_CP_DIR`), never hardcoded, because those paths get re-dated.
+**RECORDED THERE AS AN ORDERING RULE:** run `--assess_RF_all_endpoints` BEFORE
+`--assess_CP_all_endpoints`. Chemprop recovers its folds from `<METRICS_PKL_RF_DIR>/<k>.pkl`; if that
+file is absent it silently falls back to an independent InChIKey-grouped split (printed as
+`NOT FOUND -> INDEPENDENT`, and `cp_fold_source == 'independent'`), which is NOT comparable to RF fold
+by fold. Also recorded: a fresh RF run draws NEW folds, so every chemprop number measured on the old
+folds stops being comparable and both must be re-run.
+NOTE on the current state: the config keys were re-pointed to `output/results/20260909_metrics_rf` and
+`..._cp`, which do NOT exist yet, while the existing pickles sit at `20260825_metrics` (8 RF) and
+`20260907_metrics_cp` (8 CP). So the next run recomputes BOTH from scratch on new folds — consistent
+with the ENDPOINT_PUBLIC_FILES policy change (mdck/ppb lost their ADMETlab rows), which invalidated the
+old mdck/ppb numbers anyway.
+Also corrected in the README: the old instruction to run the vignette notebook from the `chemprop` env.
+The module path runs in `ML` and shells out to `CHEMPROP_TRANSFER.chemprop_bin`.
+
+
+## ★ CHEMPROP DEPLOY — built 2026-09-08
+
+**`ML_Reg.chemprop_fit_transfer(df, chemprop_bin, df_pretrain, target, targets, ...)`** — fits the
+DEPLOYABLE chemprop model: public pretrain (cached per grouping) then frozen-encoder finetune on EVERY row
+of `df`, no folds and no held-out block, so the shipped model sees every internal label. Returns
+`{model_dir, checkpoint, pretrain_checkpoint, n_train, tasks, descriptor_cols}`. `df_pretrain=None` ships a
+from-scratch model. Both stages pass `--pytorch-seed`, so a shipped model is reproducible.
+
+**`OUTPUT.deploy_endpoint_cp` / `OUTPUT.deploy_all_endpoints_cp`** — the twins of `deploy_endpoint` /
+`deploy_all_endpoints`, plus CLI `--deploy_CP_all_endpoints` (honours `--endpoints`, `--leak`, `--dry_run`).
+Registers `adme_<k>_cp` with `framework='chemprop'`, `features_type='smiles+DS'`, `target_columns=<tasks>`,
+passing the model DIRECTORY — the convention already in the vault for `adme_mt_*` (ids 15, 16), where MLTrail
+stores a directory rather than a joblib bundle. Idempotent: it overwrites the existing `adme_<k>_cp` version.
+
+**A `deploy_meta.json` is written INSIDE the model dir**, because a directory artifact cannot carry a Python
+bundle the way the RF joblib does. It holds everything a predictor needs: `tasks`, `target_index` (the scored
+task's position — a multitask model returns one column per task), `descriptor_cols` (the DS_ list, which MUST
+match at predict time because chemprop v2 stores only the scaler), `transform`, `unit`, `n_train`,
+`freeze_encoder`, `seed`, `pretrain_checkpoint`, and `confidence: 'from the RF model of this endpoint'`.
+
+**NO confidence calibration on the chemprop side** — a plain `regression` head returns no per-row std. This
+is why RF must stay deployed for ALL 8 endpoints even where chemprop supplies the value: `conf_recal` comes
+from RF tree variance. The user's own framing, and it is recorded in the meta file and the model comment.
+
+`deploy_all_endpoints_cp` still calls `build_ML_data_CP`, so it prints a fold report it does not use; the
+deploy fit ignores `cp_folds` entirely. `n_splits` / `seed` are passthroughs for that report only.
+
+Tests: 2 added to `tests/test_assess_predictions_cp.py` (stub binary, `dry_run`): the deploy fit is exactly
+2 trainings — one pretrain WITHOUT `--checkpoint`, one finetune WITH it and `--freeze-encoder` — no fold
+splitting, `n_train == len(cp_int)`, `deploy_meta.json` self-describing, and a shared grouping pretrains once
+across two endpoints. Suite: 40/40 pass.
+
+## Internal set — 326 NAMES but only 325 unique STRUCTURES (2026-09-09)
+
+Symptom: after `--assess_RF_all_endpoints`, the union of internal compounds over the 8
+`internal_cv_preddf` frames is **325**, not the 326 rows of the CDD pull
+(`data/20260707_all_adme.csv`).
+
+Cause: **two internal compound names carry one identical SMILES string.**
+`DATA._endpoint_ML` ends with `drop_duplicates('smiles', keep='first')`, so one of the pair
+always goes away. The rule was written for an internal-vs-public clash, and it also fires
+internal-vs-internal. 325 is therefore the correct row count for a structure-keyed model:
+identical SMILES give identical H237 features, so keeping both would put the same molecule in
+two CV folds.
+
+**`build_MF_features` is NOT the cause.** The public-cache / internal-recompute split works:
+`internal ids with features = 326/326`, `internal feature rows with any NaN = 0`, and the log
+line reads `public 368812 cached | internal 326 recomputed`.
+
+The twin pair disagrees on the measured value for solubility, logd, mlm and mdck, and it agrees
+for hlm. `keep='first'` therefore picks one measurement at random. **DECIDED 2026-09-09: keep the
+current behaviour.** One compound of 326 is not worth a change to the dedup rule. Do not report 326
+as the internal count; 325 is correct for a structure-keyed model. A mean over duplicate SMILES
+(`groupby('smiles').label.mean()`) stays available if the duplicate count ever grows.
+
+Separate, smaller loss: mdck goes 109 labelled -> 108 finite -> 107 unique (one non-finite
+label plus the twin).
+
+## ★ WEBAPP CHAMPION SPLIT — value from the winner, confidence always from RF (2026-09-09)
+
+**Deployed.** The 8 chemprop transfer models reached MLTrail as `adme_<ep>_cp`
+(`framework='chemprop'`, `features_type='smiles+DS'`), ids **28–35**:
+
+| id | endpoint | grouping | tasks | n_train |
+|----|----------|----------|-------|---------|
+| 28 | hlm | clearance | 3 | 325 |
+| 29 | mlm | clearance | 3 | 325 |
+| 30 | rlm | clearance | 3 | 39 |
+| 31 | logd | sol_lipo | 2 | 318 |
+| 32 | solubility | all8 | 8 | 121 |
+| 33 | caco2 | permeability | 2 | 95 |
+| 34 | mdck | mdck_perm | 6 | 108 |
+| 35 | ppb | ppb_fu | 11 | 69 |
+
+CAUTION on the pretrain cache: 4 of the 6 cached stage-1 checkpoints were built BEFORE the
+63,136 ADMETlab mdck/ppb rows left `ENDPOINT_PUBLIC_FILES`. `all8`, `permeability`, `mdck_perm`
+and `ppb_fu` were therefore retrained with the new `--force_pretrain` flag (27, 25, 17, 17 min);
+`clearance` and `sol_lipo` never held an mdck/ppb task, so they reused the cache. **Rule: after any
+change to `ENDPOINT_PUBLIC_FILES`, deploy with `--force_pretrain`.**
+
+### The split, in `config/config.yaml` under `webapp.value_model`
+
+The **VALUE** comes from whichever model wins the augmented arm. The **CONFIDENCE** always comes
+from `adme_<ep>_h237`, because a chemprop `regression` head returns no per-row std. RF therefore
+stays deployed for all 8 endpoints regardless of the map.
+
+| endpoint | value model | r² | note |
+|---|---|---|---|
+| solubility | chemprop (all8) | 0.755 | vs RF 0.680 |
+| logd | chemprop (sol_lipo) | 0.842 | vs RF 0.822 |
+| hlm | chemprop (clearance) | 0.616 | vs RF 0.587 |
+| mlm | chemprop (clearance) | 0.662 | RF internal 0.664 — a 0.002 margin, inside the noise |
+| rlm | chemprop (clearance) | 0.527 | vs RF 0.109 |
+| mdck | **rf** | — | near-shell `dist060_agree` 0.542 WINS but has no deploy path |
+| caco2 | **rf** | — | near-shell `dist060_agree` 0.765 WINS but has no deploy path |
+| ppb | rf (all public) | 0.548 | RF wins outright |
+
+Selection ran on **r²** (squared Pearson) at the user's instruction, not on the project's usual
+r²det. r² is affine-invariant, so a champion picked this way can carry a constant offset in raw
+units. Re-derive on r²det before trusting the raw displayed value near a triage cutoff.
+
+### How it works — `webapp/app.py`
+
+- `_discover_champions()` unchanged: loads the RF bundle for every endpoint (value + confidence).
+- **`_discover_cp_values()`** (new): for every endpoint the config sends to chemprop, finds
+  `adme_<ep>_cp`, resolves its checkpoint with `mltrail.backends.resolve_checkpoint`, and reads
+  **`deploy_meta.json`** from the model directory for the task list, target index and DS_ columns.
+- `_predict_all()`: after the RF loop, a 6-line block replaces `ep_out[ep][0]` (the value) and
+  keeps `ep_out[ep][1]` (the RF confidence) untouched.
+- MLTrail's own `backends.chemprop_predict` is **NOT** used — it sends SMILES only, and these
+  models need their 200 DS_ descriptor columns. `ML_Reg.chemprop_predict_from_checkpoint` is used
+  instead, the same call the assess arms use, so the webapp and the metrics agree.
+- `/api/models` now returns `value_model`, `value_model_id` and `confidence_model_id` per endpoint.
+
+Verified 2026-09-09 by an A/B run on 5 public reference SMILES (ethanol, benzene, toluene,
+caffeine, naphthalene), flipping solubility from chemprop to rf and holding everything else:
+solubility's value changed, every other value stayed bit-identical, and **every confidence stayed
+bit-identical across both runs** — proof the confidence never depends on the value model.
+Cost: ~34 s for 5 compounds, because each of the 5 chemprop endpoints is its own CLI subprocess.
+
+**Open:** chemprop extrapolates past the assay range. On ethanol it returned 1.4e7 µM solubility,
+while RF stopped at 1.48e4 µM — the `label_cap_raw: 15000` winsorization ceiling a tree cannot pass.
+Real input is bRo5, so this is unlikely in practice, but a display clip to the assay range is worth
+adding. Also still open: a **near-shell deploy path**, needed before mdck and caco2 can use their
+actual champions.
+
+## Webapp cell — curved gradient split + a streamed progress bar (2026-09-09)
+
+**1. Tunable gradient split — CURVED by default.** The endpoint cell no longer meets at a hard
+edge. The confidence color fills the cell as the base layer, and the value layer is masked out
+across the boundary. Two shapes, chosen by `cell split` in the Colors panel:
+
+```css
+/* DEFAULT — curved: a quarter-ellipse arc centred on the bottom-left corner */
+.epcell .pred{mask-image:radial-gradient(80% 80% at 0% 100%,
+    #000 calc(100% - var(--blend,10%)*2.4), transparent calc(100% + var(--blend,10%)*2.4))}
+/* override — straight: the classic corner-to-corner diagonal */
+.shape-straight .epcell .pred{mask-image:linear-gradient(to top right,
+    #000 calc(50% - var(--blend,10%)), transparent calc(50% + var(--blend,10%)))}
+```
+
+**Radius 80% is not arbitrary.** A quarter ellipse of normalized radius r covers (pi/4)r^2 of the
+box, so r=0.8 gives **50.3%** — the value keeps half the cell, exactly as the diagonal gave it, so
+the two readings stay balanced and both numbers sit in unambiguous regions up to blend ~18%.
+The x2.4 factor matches the straight mask's perceived band width, so one slider serves both shapes.
+
+`--blend` is the band half-width; a `blend` slider (0–40%, default 10%) drives it, plus `--divop`,
+which fades the straight split's hairline as the band widens (`1 - blend/12`). **Blend 0% on the
+straight shape reproduces the original hard two-triangle split exactly**, so nothing is lost.
+Everything lives in CSS custom properties plus one `.shape-straight` class on `<html>`, so changing
+either control needs no row re-render — only `renderColors()`.
+
+CAUTION: the CURVED mask is the bare `.epcell .pred` rule, NOT a `.shape-curved` rule. If it were
+class-gated and the class went missing, the value layer would render unmasked and cover the
+confidence half completely. The default must be a masked state.
+
+CAUTION on the corner keyword: **`to top right`** puts the band's 50% line on the top-left ->
+bottom-right diagonal, matching the old `clip-path` triangles. `to bottom right` uses the OTHER
+diagonal. Verified 2026-09-09 with headless Chrome, rendering the clip-path reference beside
+`to top right`, `to bottom right` and an explicit `30.62deg`: `to top right` and the explicit angle
+match the reference exactly, `to bottom right` does not. **This also found a pre-existing bug** —
+the old `.divider` used `to bottom right`, so its hairline sat on the wrong diagonal. Now fixed.
+
+Headless-Chrome gotcha: `--window-size` is CSS pixels and `--force-device-scale-factor` multiplies
+the output image. A window too short silently clips the page and makes cells look collapsed —
+size the window to the CSS layout, not to the wanted image.
+
+**2. Scoring progress bar (a spinner first, then replaced).** A spinner cannot show progress, so
+`/api/predict` now **streams**. It returns newline-delimited JSON: one `{"label","done","total"}`
+line per finished stage, then a final `{"result": {...}}` line (or `{"error": ...}`). `_predict_all`
+became the generator **`_predict_iter`**, which yields `("step", label, done, total)` after each
+model and `("done", rows, flat_df)` once; `_predict_all` is now a thin drain of it, so any other
+caller is unchanged. Stages = 1 featurize + 1 per RF model + 1 per chemprop override + 1 per extra
++ 1 render = **16** at the current config. The response carries
+`Cache-Control: no-transform` and `X-Accel-Buffering: no` so nothing buffers the stream away.
+
+The front end reads the stream with a `ReadableStream` + `TextDecoder` line splitter
+(`readNdjson`) and drives a tqdm-style striped pill: pale-azure track, `var(--azure)` fill with
+45-degree white stripes drifting on a 0.7 s loop, plus a percent readout. `prefers-reduced-motion`
+stops the drift.
+
+Measured 2026-09-09 on 5 public reference SMILES — the bar is real, not a guess:
+`featurizing` + all 8 RF stages land inside **0.3 s** (9/16), then each of the 5 chemprop stages
+takes **~6.2 s**, total **31 s**. That shape is exactly why per-column progress was worth the change.
+
+**The stale-cache trap (hit 2026-09-09).** `index.html` carried a HAND-EDITED cache-bust token
+(`app.js?v=2026-08-31c`). Changing app.js without bumping it left the browser running the OLD
+app.js against the NEW streaming API, which failed as
+`SyntaxError: Unexpected non-whitespace character after JSON at position 49` — `res.json()` choking
+on the second NDJSON line — and showed no progress bar at all. **Fixed for good:** the `/` route
+now reads index.html, rewrites `v=` to app.js's own **mtime**, and returns `Cache-Control:
+no-store`. The token on disk reads `?v=auto` so nobody hand-edits it again.
+
+Verification without a CDP client (no websocket lib in env `ML`, and installing one needs
+permission): the `readNdjson` splitter was extracted from app.js with a regex and run in node
+against the REAL streamed bytes at chunk sizes [1e9], [7], [49], [1,2,3,5,8,13] and [199,3] —
+16 steps and the result recovered in every case, including a split at byte 49, the exact position
+in the reported error. A self-driving same-origin copy of the page under headless Chrome did NOT
+work: `--virtual-time-budget` fast-forwards timers but not the server's real work, so the shot
+lands before the bar turns on.
+
+CAUTION for anyone editing the bar markup: `.fill` is a `<span>` inside `.track`, which is a plain
+block, **not** a flex container. A non-replaced inline element ignores `width` and `height`, so the
+fill painted nothing until `display:block` was added. `.track` itself only works because
+`.prog.on` is `inline-flex`, which blockifies its own children.
+
+The page lede also changed: it said "the 8 champion single-task RF models", which stopped being
+true when 5 endpoints moved to chemprop values.
+
+## Round-trip deployment check — notebook cells + tests (2026-09-09)
+
+Purpose: prove the DEPLOYED models are wired correctly end to end. The internal set went through
+the webapp, and the 22-column export landed at `tmp/20260909_pred_internal.csv` (326 rows, one per
+internal compound; columns `compound, smiles, mpo, score, <ep>_pred, <ep>_confidence` x8, plus
+`px_activity_*`).
+
+CAUTION: this is **NOT a generalization estimate.** Every deployed model was fitted on EVERY
+internal row, so a high R² only proves the plumbing — the id join, the raw units, the transform,
+and the chemprop task index. The value of the check is a LOW number: that means something broke.
+
+Two cells in `vignettes/Multitask_adme_preds.ipynb`:
+
+- **`01a26a07`** joins the export to `data.df_internal_exp_all` on `name` == `compound` (the webapp
+  carries the uploaded id column through), then per endpoint applies the SAME steps the training
+  path applies — the config `filter` (mdck keeps MDR1 only) and `label_cap_raw` winsorization — and
+  scores in **MODELLING space** with `ML_Reg.get_reg_metrics_from_preddf`, so the numbers are
+  directly comparable to every other arm. It leaves a tidy `rt_long`
+  `[compound, endpoint, real_y, pred_y, conf, resid]` and prints `rt_metrics`:
+  `unit | value_model | bias | R2_det | R2_pears | RMSE | N`. `value_model` comes straight from
+  `webapp.value_model`, so the table says which model produced each column. `bias =
+  mean(pred - real)` is included because it is exactly what R²_pears cannot see.
+- **`eb77e860`** draws the 4x2 panel, one endpoint per panel: RF confidence vs |residual|, with a
+  Spearman rho in each title and a binned-mean trend line. The confidence always comes from RF even
+  where chemprop supplies the value, so this asks whether ONE confidence ranks the residuals of
+  BOTH model families.
+
+Tables use `print(df.round(3).to_string())`, matching the notebook's existing convention.
+`.style` is NOT available — `jinja2` is absent from env `ML`, and it was not installed.
+
+`tests/test_roundtrip_cells.py` (5 tests) execs those two cells **by cell id** against synthetic
+frames that mimic the real column names — the raw CDD columns from
+`ADME_ENDPOINTS[<ep>]['col']` plus the webapp's 22 columns. No real structure or value is ever
+read. Fixtures deliberately inject 5 non-MDR1 mdck rows, one `hlm` value of 0 (log10 -> -inf) and
+three saturated solubility values, so the filter, the non-finite drop and the cap are each proven
+to reach the metric. The truth is drawn in MODELLING space and inverted to raw, because a raw-space
+draw left `logit_pct` almost no spread and made a correct cell look broken. Suite is now 45/45.
+
+## Round-trip result — why confidence is NOT high on training data (2026-09-09)
+
+Round-trip metrics on the internal set (326/326 matched, all 8 endpoints, MODELLING space):
+R²det 0.71–0.89, bias |0.002|–0.224, largest bias caco2 +0.224. As expected for predicting on
+training data. But the confidences sit mid-range (0.4–0.7), not near 1. **That is correct, for
+three separate reasons.**
+
+**1. Tree variance measures DISAGREEMENT, not memorization.** The champion RF keeps sklearn's
+default `bootstrap=True`, so each tree draws n rows with replacement and a given row is absent from
+a tree with probability (1-1/n)^n -> **0.367**. Of 200 trees, about **73 never saw any given
+training compound**. `min_samples_leaf: 2` also stops a tree that DID see it from reproducing it
+exactly. So the per-row std stays well above 0 for a training compound: observed p10 of `uq_std`
+runs 0.16–0.35 across endpoints. Tree-variance UQ is a chemical-space-support score, not a
+training-membership flag.
+
+**2. The calibration is anchored to HELD-OUT error, so it has a hard ceiling.**
+`conf_recal = exp(-clip(a + b*std, 0) / rmse_cv)`, and `a`, `b`, `rmse_cv` are all fitted on the
+augmented-CV arm. Even at std = 0 the confidence cannot exceed `exp(-a/rmse_cv)`. Deployed
+calibration (from MLTrail metrics) against the observed std spread:
+
+| endpoint | recal_b | ceiling (std=0) | best real (p10 std) | typical (median std) |
+|---|---|---|---|---|
+| solubility | 0.89 | 1.00 | 1.00 | 0.60 |
+| logd | 0.81 | 1.00 | 0.73 | 0.50 |
+| mlm | 1.13 | 1.00 | 0.69 | 0.43 |
+| hlm | 0.75 | 0.80 | 0.58 | 0.44 |
+| mdck | 0.67 | 0.77 | 0.55 | 0.49 |
+| caco2 | 0.64 | 0.72 | 0.56 | 0.51 |
+| ppb | 0.33 | 0.71 | 0.54 | 0.47 |
+| **rlm** | **-1.24** | **0.22** | 0.37 | 0.40 |
+
+A confidence of 1 on a compound the model trained on would make the score useless at deploy time,
+which is the whole purpose. Pessimism here is by design.
+
+**3. For 5 of 8 endpoints the internal rows are a rounding error in the training set.** Deployed
+RF `n_train`: hlm 276,975 | mlm 273,948 | rlm 276,659 | caco2 330,862 | mdck 273,348 vs
+logd 4,516 | solubility 5,008 | ppb 1,520. The 325 internal hlm compounds are **0.1%** of that
+model's training data, so it never "memorized" them in any useful sense. This also explains caco2's
++0.224 bias: a forest fitted on 330k mostly-public rows shrinks the internal predictions toward the
+public mean.
+
+### ★ rlm's confidence is UNVALIDATED (corrected 2026-09-09)
+
+An earlier version of this entry called rlm's confidence "anti-calibrated". **That overstated the
+evidence.** The measured facts:
+
+- `rlm` is the only endpoint with a **negative** recal slope (`recal_b = -1.24` deployed, -1.34 in
+  the assess pickle), so its `conf_recal` RISES as tree disagreement rises — backwards from the
+  mechanism's intent.
+- But the underlying relationship it fits is **not measurable**:
+  `spearman(uq_std, |resid|)` on the augmented-CV arm is **-0.19 with p = 0.24, n = 39.** The slope
+  is a noise fit to a non-relationship, not a real inversion.
+- Every other endpoint has a positive and mostly significant association, so the mechanism works
+  there: solubility +0.80 (p=5e-28) | mlm +0.44 | logd +0.42 | mdck +0.35 (p=2e-4) |
+  caco2 +0.27 (p=0.009) | hlm +0.25 (p=5e-6) | **ppb +0.20 (p=0.1, borderline, n=69)**.
+- Both rlm readings are non-significant in either direction — CV rho -0.17 (p=0.3), round trip
+  rho +0.11 (p=0.5) — and only **4** rlm compounds land above the 0.5 split in the CV arm.
+
+CAUTION on a trap this exposed: the 5 per-fold rlm slopes are ALL negative (-0.96 to -1.52), which
+looks like confirmation but is NOT independent evidence — each fold's fit shares ~31 of the same 39
+rows. Consistency across LOFO folds says nothing when n is this small.
+
+Conclusion: **rlm's confidence carries no validated information, in either direction.** With 39
+measurements it cannot be settled. Root cause of the slope itself:
+`ML_Reg.calibrate_confidence_params` uses plain `np.polyfit(s, resid, 1)` with NO non-negativity
+constraint, although its own docstring says "nonneg least-squares fit"; `apply_confidences` clips
+the PRODUCT `a + b*std` at 0, never the slope.
+
+**Preferred fix** (better than blindly clamping `recal_b >= 0`, which would impose a prior):
+fall back to `conf_rmse` — which uses no slope at all — when the std/|resid| association is not
+significant. `ML_Reg.py` is outside this repo, so this waits for explicit permission.
+
+### The CV arm CANNOT see a deploy-calibration defect — only the round trip can
+
+`assess_predictions` gives the CV arms their `conf_*` via `ML_Reg.apply_confidences_lofo`, so each
+fold is scored by a calibration fitted on the OTHER folds. The DEPLOYED confidence instead uses the
+single pooled `_calibration` bundled into the model. They are different fits, so a fault in the
+pooled fit is invisible in the CV panel. On the augmented-CV arm all 8 endpoints split the right way
+(bigger RMSE on the low-confidence side), rlm included:
+
+| endpoint | rho | RMSE low / n | RMSE high / n |
+|---|---|---|---|
+| solubility | -0.79 | 0.917 / 50 | 0.206 / 70 |
+| logd | -0.41 | 0.672 / 158 | 0.336 / 159 |
+| mlm | -0.43 | 0.567 / 232 | 0.248 / 92 |
+| mdck | -0.34 | 0.656 / 55 | 0.398 / 52 |
+| caco2 | -0.27 | 0.748 / 39 | 0.571 / 56 |
+| hlm | -0.24 | 0.473 / 253 | 0.277 / 71 |
+| rlm | -0.17 (p=0.3) | 0.787 / 35 | 0.364 / **4** |
+| ppb | -0.11 (p=0.4) | 0.338 / 57 | 0.269 / 12 |
+
+**That is the argument for keeping the round trip.** It is the only check that exercises the
+confidence a user actually sees.
+
+### What the round trip can and cannot prove
+
+- CAN prove: the plumbing is right — id join, raw units, transform, chemprop task index.
+- CAN prove: the confidence RANKING works, and works across model families. 5 of the 8 endpoints
+  take their VALUE from chemprop while the confidence comes from RF, and rho is still strongly
+  negative there (solubility -0.46, mlm -0.47, logd -0.34). **RF confidence is substantially
+  model-agnostic** — it scores chemical-space support, which both families share.
+- CANNOT prove: the confidence's absolute SCALE. These residuals are training-set residuals, so
+  they are smaller than the held-out errors the calibration targets.
+
+Minor: caco2's binned trend line turns back up in the top bin — that bin holds very few compounds.
+
+### Panel upgrade — a split at the config confidence cut (2026-09-09)
+
+Cell `eb77e860` now draws a dashed vertical rule at `webapp.confidence_split` (0.5, the SAME cut
+the webapp colours on, read from config rather than hardcoded) and boxes the **RMSE + n of each
+half** in the upper corners: left = least confident (`conf < cut`), right = most confident
+(`conf >= cut`). This turns the eyeballed trend into a number a person can quote.
+
+Read it as a pass/fail: a working confidence puts the BIGGER RMSE on the LEFT. On the CV
+arm all 8 endpoints pass, rlm included — see the corrected rlm entry above for why that does NOT
+clear the deployed rlm calibration.
+
+`tests/test_roundtrip_cells.py` grew to 7 tests: the cut must come from config, exactly one
+vertical rule must sit at it, both halves must be annotated, the two n values must partition the
+panel's points exactly, and each printed RMSE must equal sqrt(mean(resid^2)) over its own half.
+A third panel cell (`560d161e`) runs the same view on the CV pred_dfs, topping up
+`output.metrics_results` from `METRICS_PKL_RF_DIR` so it never depends on which endpoint ran last,
+and switching a panel off with a 'not available' title when an arm is missing. Suite 50/50.
+
+## How the DEPLOYED confidence is built — the 6-fit recipe (2026-09-09)
+
+Worked example: 1000 internal compounds, plus whatever public rows `BEST_PUBLIC` selects.
+`OUTPUT.deploy_endpoint` does **6 model fits**, not 1.
+
+**Fits 1-5 — the calibration run.** Split the 1000 internal compounds into 5 folds of 200 (grouped
+by InChIKey). Each fit trains on 800 internal + **ALL** public rows, then predicts its held-out 200
+internal compounds. For each held-out compound, record the tree spread (`uq_std`) and the true
+error. Every compound is held out exactly once, so this yields **1000 rows and leaves nobody out.**
+The 5 fold models are then DISCARDED — only their predictions matter.
+
+**Learn 3 numbers from those 1000 rows** (`calibrate_confidence_params`):
+- `recal_a`, `recal_b` — a straight line `|error| ~ a + b*std`
+- `rmse_cv` — the RMSE of the 1000 held-out predictions
+
+**Fit 6 — the shipped model.** One new forest on ALL 1000 internal + the public rows, nothing held
+out. The joblib bundle stores the forest AND those 3 numbers together.
+
+**At predict time** the 200 trees each score the new compound:
+`value = mean(trees)`, `std = spread(trees)`,
+`confidence = exp(-clip(recal_a + recal_b*std, 0) / rmse_cv)`.
+
+### No compound is set aside for calibration
+
+There is NO separate calibration hold-out. Every internal compound is used TWICE — once to learn
+the std/error rule through its held-out prediction, and once to train the shipped forest. That is
+the point of using CV rather than a single hold-out split.
+
+### What a conf_recal number means
+
+It is the expected error expressed relative to the endpoint's own typical CV error:
+
+| conf | expected error |
+|---|---|
+| 0.37 | 1.00 x rmse_cv — *typical* |
+| 0.50 | 0.69 x rmse_cv |
+| 0.61 | 0.49 x rmse_cv |
+| 0.80 | 0.22 x rmse_cv |
+
+In modelling-space units, from the DEPLOYED calibrations:
+
+| endpoint | rmse_cv | err @ conf 0.37 | err @ conf 0.50 | err @ conf 0.80 |
+|---|---|---|---|---|
+| solubility | 0.615 | 0.615 | 0.426 | 0.137 |
+| logd | 0.534 | 0.534 | 0.370 | 0.119 |
+| hlm | 0.440 | 0.440 | 0.305 | 0.098 |
+| mlm | 0.496 | 0.496 | 0.344 | 0.111 |
+| rlm | 0.758 | 0.758 | 0.525 | 0.169 |
+| caco2 | 0.654 | 0.654 | 0.453 | 0.146 |
+| mdck | 0.551 | 0.551 | 0.382 | 0.123 |
+| ppb | 0.321 | 0.321 | 0.223 | 0.072 |
+
+**The natural neutral point is exp(-1) = 0.37, not 0.5.** A compound in ordinary chemical space
+scores near 0.37 by construction, which is why so many webapp cells sit just under the 0.5 colour
+split. `webapp.confidence_split: 0.5` therefore means "expected error <= 0.69 x typical" — a
+defensible cut, but arbitrary relative to the mechanism. Use **0.37** for a split that means
+"better than this model's usual performance".
+
+### The one real limitation
+
+Public rows never enter a test fold (`fold_ids_aug` puts them in every train block), so they
+contribute ZERO calibration rows. That is correct — `rmse_cv` must describe error on internal bRo5
+chemistry, not on public small-molecule space. But it caps the calibration's power at the internal
+count: 324 (hlm, mlm) | 317 (logd) | 120 (solubility) | 107 (mdck) | 95 (caco2) | 69 (ppb) |
+**39 (rlm)**. Calibration rows as a share of the shipped model's training data run from 7.02% (logd)
+down to **0.01% (rlm)**. Proposed remedy if more power is wanted: repeated CV over several fold
+seeds (a `calib_repeats` knob), which multiplies the calibration rows without changing the
+population described. NOT out-of-bag predictions — an OOB prediction averages only the ~37% of trees
+that missed the row, so its variance is ~2.7x a full-forest prediction and `rmse_cv` would come out
+pessimistic.

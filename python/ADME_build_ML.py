@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.expanduser('~/Scripts'))                       # shar
 sys.path.insert(0, os.path.expanduser('~/CDD_Vault_API/python'))          # CDD Vault API (get_protocol_data)
 
 import argparse
+import json
 import pickle
 import numpy as np
 import pandas as pd
@@ -699,6 +700,43 @@ class OUTPUT():
          register a NEW MLTrail model (adme_<k><DEPLOY.experiment_suffix>, features_type from config DEPLOY;
          the champions adme_<k> stay untouched). The full internal+public training set is archived. Requires
          build_ML_data_<k> + get_internal_public_sets + select_best_combo_and_update already run for k.
+
+        HOW THE DEPLOYED CONFIDENCE IS BUILT — 6 model fits, in simple words
+        --------------------------------------------------------------------
+        Say the endpoint has 1000 internal compounds, plus the public rows BEST_PUBLIC selected.
+
+        Fits 1-5, the CALIBRATION run. Cut the 1000 internal compounds into 5 folds of 200 (grouped by
+        InChIKey, so twins of one molecule stay together). Each fit trains on 800 internal + EVERY public
+        row, then predicts its own held-out 200 internal compounds. For each held-out compound, write down
+        two things: how much the 200 trees disagree (`uq_std`) and the true error. Every compound is held
+        out exactly once, so this gives 1000 rows and leaves nobody out. Then THROW THE 5 MODELS AWAY —
+        only their predictions matter.
+
+        Learn 3 numbers from those 1000 rows (`ML_Reg.calibrate_confidence_params`):
+          - recal_a, recal_b : a straight line, expected |error| ~ a + b * uq_std
+          - rmse_cv          : the RMSE of the 1000 held-out predictions
+        Those 3 numbers ARE the calibration. Nothing else is stored.
+
+        Fit 6, the SHIPPED model. Fit one new forest on ALL 1000 internal + every public row, with nothing
+        held out. The joblib bundle saves that forest AND the 3 numbers together.
+
+        At predict time the 200 trees each score the new compound:
+          value      = mean of the 200 tree predictions
+          uq_std     = spread of the 200 tree predictions
+          confidence = exp(-clip(recal_a + recal_b * uq_std, 0) / rmse_cv)      (webapp/app.py:_confidence)
+
+        NO compound is set aside for the calibration. There is no calibration hold-out: every internal
+        compound is used TWICE — once to learn the spread/error line through its held-out prediction, and
+        once to train the shipped forest. That is the reason for 5-fold CV instead of one hold-out split,
+        which would have wasted a fifth of the compounds.
+
+        CAUTION on what the number means: `conf_recal` is an expected error measured against the endpoint's
+        OWN typical CV error, so exp(-1) = 0.37 is the neutral point (expected error == rmse_cv), NOT 0.5.
+        CAUTION on power: public rows sit in every fold's TRAIN and never in a test fold, so they add ZERO
+        calibration rows. That is deliberate — rmse_cv must describe error on internal chemistry, not on
+        public small molecules — but it caps the calibration at the internal count (324 for hlm, 39 for rlm).
+        See wiki/wiki.md 'How the DEPLOYED confidence is built'. Verified by tests/test_deploy.py.
+
         param DATA data: the endpoint's built sets (d, int_ids, pub_ids, combo, fold_ids_aug)
         param class params: PARAMS instance (ADME_ENDPOINTS, DEPLOY)
         param registry: MLTrail Registry (None with dry_run -> fit + calibrate but do not register)
@@ -741,6 +779,97 @@ class OUTPUT():
             training_set=train[['compound', 'smiles', 'label']], smiles_column='smiles',
             compound_id_column='compound', label_column='label', metrics=metrics, comment=comment))
         return summary
+
+    def deploy_endpoint_cp(self, data, params, registry, k, dry_run=False, force_pretrain=False):
+        """
+        -Chemprop twin of deploy_endpoint. Fit the DEPLOYABLE chemprop model for endpoint k: public pretrain
+         (cached per grouping) then frozen-encoder finetune on EVERY internal row, and register it as a NEW
+         MLTrail model `adme_<k>_cp` with framework='chemprop'. MLTrail stores the model DIRECTORY (the
+         convention already in the vault for adme_mt_*), so a `deploy_meta.json` is written inside it holding
+         everything a predictor needs: the task list, the scored task's INDEX, the DS_ descriptor columns, the
+         transform and the unit.
+         NO confidence calibration: a plain `regression` head returns no per-row std. The webapp takes its
+         confidence from the RF model of the same endpoint, which is why RF must stay deployed for all 8.
+         Requires build_ML_data_CP already run for k.
+        param DATA data: a DATA with build_ML_data_CP run for k (cp_int, cp_pub, cp_tasks, cp_grouping)
+        param class params: PARAMS instance (ADME_ENDPOINTS, CHEMPROP_TRANSFER, DEPLOY)
+        param registry: MLTrail Registry (None with dry_run -> fit but do not register)
+        param str k: endpoint key
+        param bool dry_run: skip MLTrail registration (returns the summary only)
+        param bool force_pretrain: retrain stage 1 instead of reusing the cached grouping checkpoint
+        return dict: {endpoint, model_id, grouping, tasks, n_train, model_dir, pretrain_checkpoint}
+        """
+        cfg, ep = params.CHEMPROP_TRANSFER, params.ADME_ENDPOINTS[k]
+        desc = data.cp_ds_cols if cfg['descriptors'] == 'precomputed' else None
+        mfeat = cfg['molecule_featurizers'] if cfg['descriptors'] == 'featurizer' else None
+        # fit the shipped model: pretrain (reused per grouping) + frozen finetune on ALL internal rows
+        fit = ML_Reg.chemprop_fit_transfer(
+            data.cp_int, os.path.expanduser(cfg['chemprop_bin']), data.cp_pub, target=k, targets=data.cp_tasks,
+            descriptor_cols=desc, molecule_featurizers=mfeat, hp=cfg['hp'],
+            epochs_pretrain=cfg['epochs_pretrain'], epochs=cfg['epochs_finetune'], patience=cfg['patience'],
+            seed=cfg.get('seed', 42), freeze_encoder=cfg['freeze_encoder'],
+            pretrain_dir=os.path.join(cfg['pretrain_dir'], data.cp_grouping), force_pretrain=force_pretrain,
+            outdir=os.path.join(cfg['output_dir'], f'deploy_{data.cp_grouping}_{k}'))
+        # the model dir must describe itself: a predictor needs the task index, the DS_ columns and the units
+        meta = {'endpoint': k, 'grouping': data.cp_grouping, 'tasks': fit['tasks'],
+                'target_index': fit['tasks'].index(k), 'descriptor_cols': fit['descriptor_cols'],
+                'transform': ep['transform'], 'unit': ep.get('unit', ''), 'n_train': fit['n_train'],
+                'freeze_encoder': bool(cfg['freeze_encoder']), 'seed': cfg.get('seed', 42),
+                'pretrain_checkpoint': fit['pretrain_checkpoint'], 'confidence': 'from the RF model of this endpoint'}
+        with open(os.path.join(fit['model_dir'], 'deploy_meta.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
+        summary = {'endpoint': k, 'model_id': None, 'grouping': data.cp_grouping, 'tasks': fit['tasks'],
+                   'n_train': fit['n_train'], 'model_dir': fit['model_dir'],
+                   'pretrain_checkpoint': fit['pretrain_checkpoint']}
+        if dry_run or registry is None:
+            return summary
+        # register the model DIRECTORY (the adme_mt_* convention); idempotent on the endpoint's name
+        name = f'adme_{k}_cp'
+        listing = registry.list()
+        hit = listing.loc[listing['experiment_name'] == name, 'id'] if len(listing) else pd.Series([], dtype=int)
+        summary['model_id'] = int(registry.add(
+            model_id=int(hit.iloc[0]) if len(hit) else None, overwrite=len(hit) > 0,
+            model=fit['model_dir'], experiment_name=name, experiment_measure=ep['col'].split('_', 1)[1],
+            unit=ep.get('unit', ''), model_type='single_task_regression', framework='chemprop',
+            features_type='smiles+DS', target_columns=fit['tasks'],
+            comment=(f"chemprop transfer for {k}: '{data.cp_grouping}' public pretrain + "
+                     f"{'frozen-encoder ' if cfg['freeze_encoder'] else 'full '}finetune on {fit['n_train']} "
+                     f"internal rows; scored task index {meta['target_index']} of {fit['tasks']}; "
+                     f"needs the {len(fit['descriptor_cols'])} DS_ descriptors; confidence comes from adme_{k}_h237.")))
+        return summary
+
+    def deploy_all_endpoints_cp(self, data, params, endpoints=None, leak='exact', dry_run=False,
+                                n_splits=5, seed=42, force_pretrain=False):
+        """
+        -used in CLI: python/ADME_build_ML.py --deploy_CP_all_endpoints
+        -Chemprop twin of deploy_all_endpoints: for every endpoint, build the chemprop pools and fit + register
+         the deployable transfer model. Requires data.df_all + data.MF_features['all'] to be built first.
+         CAUTION: chemprop does NOT win every endpoint (see the champion table in the wiki). Deploying all 8
+         is deliberate — the webapp picks which endpoints take the chemprop VALUE, and RF stays deployed
+         everywhere because the confidence comes from its tree variance.
+        param DATA data: a DATA with load_combine_dfs + build_MF_features already run
+        param class params: PARAMS instance (ADME_ENDPOINTS, BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER, DEPLOY)
+        param list endpoints: endpoints to deploy (default: all params.ADME_ENDPOINTS)
+        param str leak: leak-control level for build_ML_data_CP ('exact' | 'skeleton' | 'none')
+        param bool dry_run: fit but do not register to MLTrail
+        param int n_splits: passed to build_ML_data_CP; the deploy fit IGNORES cp_folds (it trains on
+            every internal row), so this only sizes the fold report build_ML_data_CP prints
+        param int seed: fold seed, same caveat
+        param bool force_pretrain: retrain stage 1 even when a cached grouping checkpoint exists — needed
+            after a change to ENDPOINT_PUBLIC_FILES, because the cache holds the OLD public pool
+        return list: one summary dict per endpoint
+        """
+        registry = None if dry_run else __import__('mltrail').Registry.from_default()
+        summaries = []
+        for k in (endpoints or list(params.ADME_ENDPOINTS)):
+            # build the pretrain/finetune pools for this endpoint's winning grouping
+            data.build_ML_data_CP(params, k=k, leak=leak, n_splits=n_splits, seed=seed)
+            s = self.deploy_endpoint_cp(data, params, registry, k, dry_run=dry_run,
+                                        force_pretrain=force_pretrain)
+            summaries.append(s)
+            print(f"> deploy_cp {k}: id={s['model_id']} grouping={s['grouping']} tasks={len(s['tasks'])} "
+                  f"n_train={s['n_train']} -> {s['model_dir']}")
+        return summaries
 
     def deploy_all_endpoints(self, data, params, endpoints=None, min_n=1000, dry_run=False):
         """
@@ -785,7 +914,11 @@ if __name__ == "__main__":
                     help="chemprop leak control: drop public molecules that also exist internally")
     ap.add_argument('--deploy_RF_all_endpoints', action='store_true',
                     help="fit + deploy the RF (internal + BEST_PUBLIC) for every endpoint and register to MLTrail")
+    ap.add_argument('--deploy_CP_all_endpoints', action='store_true',
+                    help="fit + deploy the chemprop transfer model for every endpoint and register to MLTrail")
     ap.add_argument('--dry_run', action='store_true', help="deploy: fit + calibrate but do not register to MLTrail")
+    ap.add_argument('--force_pretrain', action='store_true',
+                    help="chemprop: retrain stage 1 instead of reusing the cached grouping checkpoint")
     ap.add_argument('--endpoints', default=None, help="comma-separated subset for --assess/--deploy")
     ap.add_argument('--min_n', type=int, default=1000, help="public-origin minimum-count filter")
     args = ap.parse_args()
@@ -798,7 +931,8 @@ if __name__ == "__main__":
     data = DATA()
     data.load_df_internal_exp_all(params, overwrite=args.overwrite)
 
-    if args.assess_RF_all_endpoints or args.assess_CP_all_endpoints or args.deploy_RF_all_endpoints:
+    if (args.assess_RF_all_endpoints or args.assess_CP_all_endpoints or args.deploy_RF_all_endpoints
+            or args.deploy_CP_all_endpoints):
         # build the unified dataset + all-compound H237 features (shared by assess + deploy)
         data.load_combine_dfs(params)
         data.build_MF_features(params)
@@ -821,3 +955,11 @@ if __name__ == "__main__":
         summaries = output.deploy_all_endpoints(data, params, endpoints=eps, min_n=args.min_n, dry_run=args.dry_run)
         ids = [s['model_id'] for s in summaries]
         print(f"> done: deployed {len(summaries)} endpoint(s){' (dry_run)' if args.dry_run else ''} -> MLTrail ids {ids}")
+
+    if args.deploy_CP_all_endpoints:
+        # fit + deploy the chemprop transfer model for every endpoint and register to MLTrail
+        summaries = output.deploy_all_endpoints_cp(data, params, endpoints=eps, leak=args.leak,
+                                                  dry_run=args.dry_run, force_pretrain=args.force_pretrain)
+        ids = [s['model_id'] for s in summaries]
+        print(f"> done: deployed {len(summaries)} chemprop endpoint(s)"
+              f"{' (dry_run)' if args.dry_run else ''} -> MLTrail ids {ids}")

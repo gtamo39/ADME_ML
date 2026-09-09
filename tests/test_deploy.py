@@ -8,6 +8,7 @@ scalars mirrored into metrics.
 import types
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
 
 import python.ADME_build_ML as m   # sets sys.path so `import ML_Reg` resolves; chdir to repo root
 from python.ADME_build_ML import OUTPUT
@@ -95,3 +96,101 @@ def test_deploy_registers_new_h237_model_with_calibration():
     # the archived training set is sliced to the canonical [compound, smiles, label]
     assert list(kw['training_set'].columns) == ['compound', 'smiles', 'label']
     assert len(kw['training_set']) == len(data.int_ids) + len(data.pub_ids)
+
+
+# ---- the deployment recipe: 5 CV fits for the calibration + 1 shipped fit ----
+
+class _CountingRF(RandomForestRegressor):
+    """A champion RF that records every fit, so a test can count them and see each train size.
+
+    K_fold_by_defined_IDs deepcopies the model per fold, so the counters live on the CLASS.
+    """
+    n_fits = 0
+    train_sizes = []
+
+    def fit(self, X, y, **kw):
+        _CountingRF.n_fits += 1
+        _CountingRF.train_sizes.append(len(y))
+        return super().fit(X, y, **kw)
+
+
+def _deploy_with_capture(n_int=60, n_pub=200):
+    """Run deploy_endpoint with a counting model, capturing the CV frame ML_Reg was handed and returned."""
+    params, data = _fake_params(), _fake_data(n_int=n_int, n_pub=n_pub)
+    _CountingRF.n_fits, _CountingRF.train_sizes = 0, []
+    out = OUTPUT(params)
+    out.make_model = lambda *a, **kw: _CountingRF(**params.RF_SINGLETASK['champion'],
+                                                  n_jobs=1, random_state=params.RF_SINGLETASK['seed'])
+    cap = {}
+    real = m.ML_Reg.K_fold_by_defined_IDs
+
+    def _spy(df, ID, ID_sets, **kw):
+        cap['id_sets'] = ID_sets
+        res = real(df, ID, ID_sets, **kw)
+        cap['cv'] = res[1]
+        return res
+
+    m.ML_Reg.K_fold_by_defined_IDs = _spy
+    try:
+        s = out.deploy_endpoint(data, params, registry=None, k='sol', dry_run=True)
+    finally:
+        m.ML_Reg.K_fold_by_defined_IDs = real
+    return s, data, cap
+
+
+def test_deployment_does_five_cv_fits_then_one_shipped_fit():
+    """Expect: exactly 6 fits — 5 calibration folds (80% internal + ALL public) then 1 shipped fit
+    (100% internal + ALL public). This is the recipe documented in deploy_endpoint."""
+    s, data, cap = _deploy_with_capture()
+    n_int, n_pub = len(data.int_ids), len(data.pub_ids)
+    # 5 folds for the calibration plus the single deployable model
+    assert _CountingRF.n_fits == 6, _CountingRF.n_fits
+    # each of the 5 fold fits sees ~4/5 of the internal rows PLUS every public row
+    for sz in _CountingRF.train_sizes[:5]:
+        assert n_pub + 0.75 * n_int <= sz <= n_pub + 0.85 * n_int, sz
+    # the shipped fit is the only one that sees every internal row
+    assert _CountingRF.train_sizes[5] == n_int + n_pub, _CountingRF.train_sizes[5]
+    assert s['n_train'] == n_int + n_pub
+
+
+def test_calibration_uses_every_internal_compound_exactly_once_and_no_public():
+    """Expect: the calibration frame is the union of the 5 validation arms — one row per internal
+    compound, none left out, and NOT a single public compound (public sits in every train block)."""
+    s, data, cap = _deploy_with_capture()
+    cv = cap['cv']
+    # every internal compound contributes exactly one held-out row: nothing is set aside, nothing repeats
+    assert len(cv) == len(data.int_ids), (len(cv), len(data.int_ids))
+    assert cv['compound'].nunique() == len(data.int_ids)
+    assert set(cv['compound']) == set(data.int_ids)
+    # public compounds never enter a test fold, so they contribute no calibration row
+    assert not set(cv['compound']) & set(data.pub_ids)
+    # and the fold ids the CV was handed put the public rows in TRAIN only
+    for tr, te in cap['id_sets']:
+        assert set(data.pub_ids) <= set(tr) and not (set(te) & set(data.pub_ids))
+    # the 5 test blocks partition the internal set
+    assert sorted(cv['fold'].unique()) == [1, 2, 3, 4, 5]
+
+
+def test_bundled_calibration_is_recomputable_from_the_validation_arms():
+    """Expect: the 3 numbers shipped in the bundle are exactly what calibrate_confidence_params gives
+    when re-run on the captured CV frame — proving the calibration comes from the held-out folds."""
+    s, data, cap = _deploy_with_capture()
+    again = m.ML_Reg.calibrate_confidence_params(cap['cv'])
+    for kk in ('rmse_cv', 'recal_a', 'recal_b', 'label_std'):
+        # bit-for-bit: the deployed calibration IS the fit on the validation arms
+        assert abs(s['calibration'][kk] - float(again[kk])) < 1e-12, (kk, s['calibration'][kk], again[kk])
+
+
+def test_webapp_applies_the_same_confidence_formula_as_the_deployed_calibration():
+    """Expect: webapp._confidence(std, bundle) == exp(-clip(recal_a + recal_b*std, 0) / rmse_cv),
+    so the number a user sees is the deployed calibration applied to the live tree spread."""
+    from webapp.app import _confidence
+    s, data, cap = _deploy_with_capture()
+    c = s['calibration']
+    std = np.linspace(0.0, 1.5, 25)
+    want = np.exp(-np.clip(c['recal_a'] + c['recal_b'] * std, 0.0, None) / c['rmse_cv'])
+    got = _confidence(std, {'calibration': c, 'sigma': None})
+    # the webapp must not re-derive or rescale anything
+    assert np.allclose(got, want), np.abs(got - want).max()
+    # a confidence is a probability-like score in (0, 1]
+    assert (got > 0).all() and (got <= 1.0 + 1e-12).all()

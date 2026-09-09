@@ -16,6 +16,8 @@ let FILTER_MODE = 'all';   // 'all' = every term must pass (AND), 'any' = at lea
 let HIDDEN = new Set();    // column keys the user hid (still exported to the CSV)
 let PAL = null;            // live cell palette; starts as the SERAC defaults from /api/models
 let SHARP = 1;             // multiplies each column's color_slope (low = smoother value fade)
+let BLEND = 10;            // half-width (%) of the gradient band across the cell split (0 = hard edge)
+let SHAPE = 'curved';      // 'curved' (arc) or 'straight' (corner-to-corner diagonal)
 
 // ---- color helpers ----------------------------------------------------------
 const hexToRgb = (h) => { const n = parseInt(h.replace('#', ''), 16); return [n >> 16 & 255, n >> 8 & 255, n & 255]; };
@@ -240,11 +242,20 @@ function renderColors() {
   ['azure', 'ember'].forEach((k) => { $('l_' + k).style.background = PAL[k]; });
   $('c_sharp').value = SHARP;
   $('sharpval').textContent = SHARP.toFixed(2).replace(/0$/, '');
+  // the cells read the split shape and the blend from CSS, so a change needs no row re-render
+  $('c_blend').value = BLEND;
+  $('c_shape').value = SHAPE;
+  $('blendval').textContent = BLEND + '%';
+  const root = document.documentElement;
+  root.classList.toggle('shape-straight', SHAPE !== 'curved');   // curved is the CSS default
+  root.style.setProperty('--blend', BLEND + '%');
+  root.style.setProperty('--divop', Math.max(0, 1 - BLEND / 12).toFixed(2));
   // legend bar: the same fade the value triangles use, unfavorable -> cutoff -> favorable
   const fade = (hex, a) => { const [r, g, b] = hexToRgb(hex); return `rgba(${r},${g},${b},${a})`; };
   $('l_bar').style.background = `linear-gradient(to right, ${fade(PAL.unfav, 0.9)}, ${fade(PAL.unfav, 0.1)},` +
                                 ` ${fade(PAL.fav, 0.1)}, ${fade(PAL.fav, 0.9)})`;
-  const changed = COLOR_KEYS.filter((k) => PAL[k] !== MODELS.palette[k]).length + (SHARP !== 1 ? 1 : 0);
+  const changed = COLOR_KEYS.filter((k) => PAL[k] !== MODELS.palette[k]).length
+                  + (SHARP !== 1 ? 1 : 0) + (BLEND !== 10 ? 1 : 0) + (SHAPE !== 'curved' ? 1 : 0);
   $('colorstatus').textContent = changed ? `${changed} changed` : '';
   $('colorstatus').className = changed ? 'filterstatus on' : 'filterstatus';
 }
@@ -371,23 +382,63 @@ function updateSelAll() {
 }
 
 // ---- upload ------------------------------------------------------------------
+// write the status line
+function setStatus(text) { statusEl.textContent = text; }
+
+// show/advance/hide the scoring progress bar. /api/predict streams one line per finished stage, so
+// this is real progress, not a guess — the chemprop stages take seconds each (one CLI subprocess).
+function setProgress(done, total) {
+  const on = done != null;
+  $('prog').classList.toggle('on', on);
+  if (!on) return;
+  const pct = total ? Math.round((100 * done) / total) : 0;
+  $('progfill').style.width = pct + '%';
+  $('progpct').textContent = pct + '%';
+}
+
+// read a newline-delimited-JSON body line by line, handing each parsed object to onLine
+async function readNdjson(res, onLine) {
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = '';
+  for (;;) {
+    const { value, done } = await reader.read();
+    buf += done ? '' : dec.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (line) onLine(JSON.parse(line));
+    }
+    if (done) break;
+  }
+}
+
 async function upload(files) {
   if (!files || !files.length) return;
-  statusEl.textContent = `scoring ${files.length} file(s)…`;
+  setStatus(`scoring ${files.length} file(s)…`);
+  setProgress(0, 1);
   const fd = new FormData();
   for (const f of files) fd.append('files', f);
   try {
     const res = await fetch('/api/predict', { method: 'POST', body: fd });
-    if (!res.ok) { statusEl.textContent = 'error: ' + (await res.text()).slice(0, 200); return; }
-    const data = await res.json();
+    if (!res.ok) { setProgress(null); setStatus('error: ' + (await res.text()).slice(0, 200)); return; }
+    let data = null, err = null;
+    await readNdjson(res, (m) => {
+      if (m.result) data = m.result;
+      else if (m.error) err = m.error;
+      else { setProgress(m.done, m.total); setStatus(`scoring · ${m.label}`); }
+    });
+    setProgress(null);
+    if (err) { setStatus('error: ' + err); return; }
+    if (!data) { setStatus('error: the prediction stream ended with no result'); return; }
     ROWS = data.rows.map((r) => ({ ...r, score: null, mpo: null, selected: true }));
     recomputeMPO();
     if (SORT.key) sortRows();
     renderRows();
     legend.style.display = ROWS.length ? 'flex' : 'none';
     dlBtn.disabled = !ROWS.length;
-    statusEl.textContent = `${data.n} compounds · ${data.n_valid} scored · ${data.n - data.n_valid} unparsed`;
-  } catch (e) { statusEl.textContent = 'error: ' + e; }
+    setStatus(`${data.n} compounds · ${data.n_valid} scored · ${data.n - data.n_valid} unparsed`);
+  } catch (e) { setProgress(null); setStatus('error: ' + e); }
 }
 
 // ---- hover: high-resolution structure preview -------------------------------
@@ -447,19 +498,19 @@ function toCSV(rows) {
 
 dlBtn.addEventListener('click', () => {
   const sel = VISIBLE.filter((r) => r.selected);      // filtered-out rows are never exported
-  if (!sel.length) { statusEl.textContent = 'no compounds selected'; return; }
+  if (!sel.length) { setStatus('no compounds selected'); return; }
   // trigger a local download of the selected rows (nothing leaves the machine)
   const url = URL.createObjectURL(new Blob([toCSV(sel)], { type: 'text/csv' }));
   const a = document.createElement('a'); a.href = url; a.download = 'adme_predictions.csv'; a.click();
   URL.revokeObjectURL(url);
-  statusEl.textContent = `downloaded ${sel.length} of ${VISIBLE.length} shown compounds`;
+  setStatus(`downloaded ${sel.length} of ${VISIBLE.length} shown compounds`);
 });
 clearBtn.addEventListener('click', () => {
   ROWS = []; VISIBLE = []; SORT = { key: null, dir: 1 };
   renderRows(); legend.style.display = 'none'; dlBtn.disabled = true;
   preview.style.display = 'none';
   const sa = $('selall'); if (sa) { sa.checked = true; sa.indeterminate = false; }
-  fileInput.value = ''; statusEl.textContent = 'idle';
+  fileInput.value = ''; setStatus('idle');
 });
 
 // filter panel: add / clear terms and switch the AND-OR mode; every change re-renders the grid.
@@ -478,8 +529,11 @@ COLOR_KEYS.forEach((k) => $('c_' + k).addEventListener('input', (e) => {
   PAL[k] = e.target.value; renderColors(); renderRows();
 }));
 $('c_sharp').addEventListener('input', (e) => { SHARP = parseFloat(e.target.value); renderColors(); renderRows(); });
+// the split shape and blend live in CSS, so they need renderColors only — no row rebuild
+$('c_blend').addEventListener('input', (e) => { BLEND = parseFloat(e.target.value); renderColors(); });
+$('c_shape').addEventListener('change', (e) => { SHAPE = e.target.value; renderColors(); });
 $('resetcolors').addEventListener('click', () => {
-  PAL = { ...MODELS.palette }; SHARP = 1; renderColors(); renderRows();
+  PAL = { ...MODELS.palette }; SHARP = 1; BLEND = 10; SHAPE = 'curved'; renderColors(); renderRows();
 });
 
 // default MPO = equal-weight mean of each endpoint's sigmoid-at-cutoff desirability.

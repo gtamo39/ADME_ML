@@ -8,9 +8,12 @@ Pipeline (reusing the MLTrail vault + the ADME config):
   startup -> discover the deployed RF models in the MLTrail vault (prefer new H237 over H236)
           -> load each estimator + trained feature columns + conf_recal calibration (from the bundle)
           -> fallback scale = std of the archived training-set labels when no calibration is bundled
+          -> discover the chemprop value models (adme_<ep>_cp) for the endpoints that config
+             `webapp.value_model` sends to chemprop; RF still loads for ALL 8 endpoints
           -> load any config `webapp.extra_models` (non-ADME MLTrail models, own grid column)
   upload  -> read the dropped SDF/CSV once -> featurize H237 once
           -> per model: mean (raw value) + per-tree std (-> conf_recal confidence) -> favorable flag
+          -> chemprop endpoints: REPLACE the value with the chemprop prediction, KEEP the RF confidence
           -> per extra classifier: P(positive class) + the decision margin |2p-1| as the confidence
   render  -> LiveDesign-style grid, one diagonal-split cell per endpoint
 
@@ -18,24 +21,31 @@ Predictions/SMILES/ids render only in the LOCAL browser (localhost); nothing cro
 """
 import atexit
 import io
+import json
+import os
+import re
 import shutil
+import sys
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+sys.path.insert(0, os.path.expanduser('~/Scripts'))       # shared helpers (ML_Reg.chemprop_predict_from_checkpoint)
 
 import joblib
 import numpy as np
 import pandas as pd
 import yaml
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from rdkit import Chem
 from rdkit.Chem.Draw import rdMolDraw2D
 
+import ML_Reg
 from mltrail import Registry
-from mltrail.backends import align_features
+from mltrail.backends import align_features, resolve_checkpoint
 from mltrail.featurizers import get_featurizer
 from mltrail.readers import read_dataset
 
@@ -69,7 +79,10 @@ _INV = {
 STAGE_DIR = Path(tempfile.mkdtemp(prefix="adme_webapp_"))
 atexit.register(lambda: shutil.rmtree(STAGE_DIR, ignore_errors=True))
 
+VALUE_MODEL = WEBAPP.get("value_model", {})   # endpoint -> 'rf' | 'chemprop' (which model gives the VALUE)
+
 CHAMPIONS = {}          # endpoint -> {model, feature_cols, sigma, transform, unit, cutoff, favorable, model_id}
+CP_VALUES = {}          # endpoint -> {checkpoint, tasks, descriptor_cols, transform, model_id} (value only)
 EXTRAS = {}             # key -> {model, feature_cols, pos_idx, label, unit, threshold, model_id} (extra columns)
 _FEATURIZE = None       # H236 featurizer (built once at startup)
 _LAST_CSV = None        # flat DataFrame of the most recent prediction run (for /api/download)
@@ -120,6 +133,46 @@ def _discover_champions():
         }
     fts = sorted(f"{ep}:{CHAMPIONS[ep]['features_type']}" for ep in CHAMPIONS)
     print(f"> loaded {len(CHAMPIONS)} RF models: {fts}", flush=True)
+
+
+def _discover_cp_values():
+    """Load the deployed chemprop models (`adme_<ep>_cp`) for every endpoint that config
+    `webapp.value_model` sends to chemprop. These supply the VALUE only — the confidence keeps coming
+    from the RF champion, because a chemprop regression head returns no per-row std. Each model
+    directory describes itself in `deploy_meta.json` (task list, target index, DS_ descriptor columns),
+    written by OUTPUT.deploy_endpoint_cp; MLTrail's own chemprop_predict is not used, because it sends
+    SMILES only and these models need the descriptor columns."""
+    want = {ep for ep, m in VALUE_MODEL.items() if m == "chemprop"}
+    bad = {ep for ep, m in VALUE_MODEL.items() if m not in ("rf", "chemprop")}
+    if bad:
+        print(f"WARN: webapp.value_model has unsupported model(s) {sorted(bad)}; those endpoints use RF", flush=True)
+    if not want:
+        return
+    reg, cp_bin = Registry.from_default(), CONFIG["CHEMPROP_TRANSFER"]["chemprop_bin"]
+    for _, row in reg.list().iterrows():
+        d = reg.details(row["id"])
+        name = str(d.get("experiment_name", ""))
+        if d.get("framework") != "chemprop" or not name.startswith("adme_") or not name.endswith("_cp"):
+            continue
+        ep = name[len("adme_"):-len("_cp")]
+        if ep not in want:
+            continue
+        meta_path = Path(d["model_path"]) / "deploy_meta.json"
+        if not meta_path.exists():
+            print(f"WARN: {ep}: {meta_path} missing; falling back to the RF value", flush=True)
+            continue
+        meta = json.loads(meta_path.read_text())
+        CP_VALUES[ep] = {
+            "checkpoint": str(resolve_checkpoint(d["model_path"])), "chemprop_bin": os.path.expanduser(cp_bin),
+            "tasks": meta["tasks"], "descriptor_cols": meta["descriptor_cols"],
+            "transform": meta["transform"], "grouping": meta["grouping"], "model_id": int(d["id"]),
+        }
+    missing = sorted(want - set(CP_VALUES))
+    if missing:
+        print(f"WARN: no deployed adme_<ep>_cp for {missing}; those endpoints use the RF value", flush=True)
+    got = ", ".join(f"{ep}:{c['grouping']}(id {c['model_id']})" for ep, c in sorted(CP_VALUES.items()))
+    print(f"> loaded {len(CP_VALUES)} chemprop VALUE models: {got}", flush=True)
+    print(f"> confidence comes from RF for all {len(CHAMPIONS)} endpoints", flush=True)
 
 
 def _load_extras():
@@ -208,16 +261,37 @@ def _read_upload(path, filename):
 
 
 def _predict_all(df):
-    """Featurize H236 once, score every champion, and return (rows, flat_df).
+    """Drain _predict_iter and return (rows, flat_df) — for a caller that wants only the answer."""
+    for item in _predict_iter(df):
+        if item[0] == "done":
+            return item[1], item[2]
+    raise RuntimeError("_predict_iter ended without a result")
+
+
+def _predict_iter(df):
+    """Featurize H237 once, score every champion, and YIELD progress as each model finishes.
+
+    The VALUE comes from the model config `webapp.value_model` names (RF, or chemprop where it wins);
+    the CONFIDENCE always comes from the RF champion's per-tree std.
+
+    Yields ("step", label, done, total) after every stage, then ("done", rows, flat_df) exactly once.
+    The route turns those into an NDJSON stream, so the browser can draw a real progress bar instead
+    of guessing — the chemprop stages are seconds each, because every one is a CLI subprocess.
 
     rows: per-compound dicts for the grid (compound, smiles, svg, valid, preds{ep:{value,favorable,confidence}}).
     flat_df: the same data flattened to one row per compound for CSV download.
     """
+    # stages: featurize + one per RF model + one per chemprop override + one per extra + the render
+    total = 2 + len(CHAMPIONS) + len(CP_VALUES) + len(EXTRAS)
+    done = 0
+
     df = df.reset_index(drop=True)
     df["_key"] = np.arange(len(df))
     feats = _FEATURIZE(pd.DataFrame({"compound": df["_key"].values, "smiles": df["smiles"].values}))
     keys = feats["compound"].to_numpy()                     # _key of each row that featurized (bad SMILES dropped)
     pos = {k: i for i, k in enumerate(keys)}
+    done += 1
+    yield "step", "featurizing", done, total
 
     # per endpoint: mean (raw) + confidence for every valid row, indexed by _key
     ep_out = {}
@@ -228,6 +302,23 @@ def _predict_all(df):
         raw = _INV[c["transform"]](per_tree.mean(axis=0))
         conf = _confidence(per_tree.std(axis=0), c)                                # (0, 1], conf_recal or fallback
         ep_out[ep] = (raw, conf)
+        done += 1
+        yield "step", f"{ep} (RF)", done, total
+
+    # chemprop VALUE override: replace the value for its endpoints, KEEP the RF confidence (index 1).
+    # chemprop needs the SMILES plus the same DS_ descriptor columns it trained on, so it gets the
+    # featurized frame with the smiles of the rows that survived featurization, in feats row order.
+    if CP_VALUES:
+        cp_in = feats.assign(smiles=df.set_index("_key").loc[keys, "smiles"].to_numpy())
+        for ep, c in CP_VALUES.items():
+            if ep not in ep_out:
+                continue
+            pred = ML_Reg.chemprop_predict_from_checkpoint(
+                cp_in, "compound", c["checkpoint"], c["chemprop_bin"], target=ep, targets=c["tasks"],
+                descriptor_cols=c["descriptor_cols"])
+            ep_out[ep] = (_INV[c["transform"]](pred["pred_y"].to_numpy(float)), ep_out[ep][1])
+            done += 1
+            yield "step", f"{ep} (chemprop)", done, total
 
     # extra classifiers: value = P(positive class); confidence = decision margin |2p-1| (0 at the
     # 0.5 boundary, 1 at a unanimous forest). NOTE: a per-tree std is useless here — the trees vote 0/1,
@@ -237,6 +328,8 @@ def _predict_all(df):
         Xv = X.to_numpy() if hasattr(X, "to_numpy") else np.asarray(X)
         prob = c["model"].predict_proba(Xv)[:, c["pos_idx"]]
         ep_out[xk] = (prob, np.abs(2.0 * prob - 1.0))
+        done += 1
+        yield "step", c["label"], done, total
 
     order = _ordered_endpoints()
     rows, flat = [], []
@@ -268,7 +361,8 @@ def _predict_all(df):
         svg_hi = _svg(smi, width=400, height=300, bond_line_width=1.2) if valid else ""
         rows.append({"compound": r["compound"], "smiles": smi, "svg": svg, "svg_hi": svg_hi, "valid": valid, "preds": preds})
         flat.append(flat_row)
-    return rows, pd.DataFrame(flat)
+    yield "step", "drawing structures", total, total
+    yield "done", rows, pd.DataFrame(flat)
 
 
 # ---------- app ----------
@@ -276,7 +370,8 @@ def _predict_all(df):
 @asynccontextmanager
 async def lifespan(app):
     global _FEATURIZE
-    _discover_champions()                 # load the deployed models + per-endpoint calibration
+    _discover_champions()                 # RF for ALL endpoints — it always supplies the confidence
+    _discover_cp_values()                 # chemprop models that override the VALUE (config webapp.value_model)
     _load_extras()                        # non-ADME extra-column models (config webapp.extra_models)
     _FEATURIZE = get_featurizer("H237", CONFIG)   # H237 featurizer (H237 columns cover H236 fallbacks)
     yield
@@ -287,16 +382,28 @@ app = FastAPI(title="ADME property prediction", lifespan=lifespan)
 
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    """Serve the shell, stamping app.js with its own mtime.
+
+    The version query used to be hand-edited, so a code change could be — and was — served from the
+    browser cache, leaving an old app.js talking to a new API. The mtime makes that impossible.
+    """
+    html = (STATIC_DIR / "index.html").read_text()
+    v = int((STATIC_DIR / "app.js").stat().st_mtime)
+    html = re.sub(r'(/static/app\.js)(\?v=[^"\']*)?', r'\1?v=%d' % v, html)
+    return Response(html, media_type="text/html", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/models")
 def models():
-    """Champion roster (endpoint, unit, cutoff, favorable direction) + the cell palette. Metadata only."""
+    """Champion roster (endpoint, unit, cutoff, favorable direction, which model gives the value and
+    which gives the confidence) + the cell palette. Metadata only."""
     order = _ordered_endpoints()
     eps = [{"key": ep, "unit": CHAMPIONS[ep]["unit"], "cutoff": CHAMPIONS[ep]["cutoff"],
             "favorable": CHAMPIONS[ep]["favorable"], "transform": CHAMPIONS[ep]["transform"],
-            "color_slope": COLOR_SLOPE, "model_id": CHAMPIONS[ep]["model_id"]} for ep in order]
+            "color_slope": COLOR_SLOPE, "model_id": CHAMPIONS[ep]["model_id"],
+            "value_model": "chemprop" if ep in CP_VALUES else "rf",
+            "value_model_id": CP_VALUES[ep]["model_id"] if ep in CP_VALUES else CHAMPIONS[ep]["model_id"],
+            "confidence_model_id": CHAMPIONS[ep]["model_id"]} for ep in order]
     # a probability lives on a 0-1 scale, so its fade needs a steeper slope than a log-unit endpoint
     extras = [{"key": k, "label": c["label"], "unit": c["unit"], "cutoff": c["threshold"],
                "favorable": ">=", "kind": "classification", "transform": "identity",
@@ -307,8 +414,13 @@ def models():
 
 @app.post("/api/predict")
 async def predict(files: list[UploadFile] = File(...)):
-    """Accept one or more dropped .sdf/.csv files; return per-compound predictions for the grid."""
-    global _LAST_CSV
+    """Accept one or more dropped .sdf/.csv files; STREAM per-compound predictions for the grid.
+
+    The body is newline-delimited JSON: one {"label","done","total"} line per finished stage, then a
+    final {"result": {...}} line. Streaming, not one JSON blob, because a run takes tens of seconds —
+    every chemprop endpoint is its own CLI subprocess — and the browser draws a real progress bar
+    from these lines. An error mid-run arrives as a final {"error": "..."} line.
+    """
     frames = []
     for uf in files:
         staged = STAGE_DIR / f"{uuid.uuid4().hex}{Path(uf.filename).suffix.lower()}"
@@ -318,10 +430,26 @@ async def predict(files: list[UploadFile] = File(...)):
         finally:
             staged.unlink(missing_ok=True)
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["compound", "smiles"])
-    if len(df) == 0:
-        return {"rows": [], "n": 0, "n_valid": 0}
-    rows, _LAST_CSV = _predict_all(df)
-    return {"rows": rows, "n": len(rows), "n_valid": int(sum(r["valid"] for r in rows))}
+
+    def stream():
+        global _LAST_CSV
+        if len(df) == 0:
+            yield json.dumps({"result": {"rows": [], "n": 0, "n_valid": 0}}) + "\n"
+            return
+        try:
+            for item in _predict_iter(df):
+                if item[0] == "step":
+                    yield json.dumps({"label": item[1], "done": item[2], "total": item[3]}) + "\n"
+                else:
+                    _, rows, _LAST_CSV = item
+                    yield json.dumps({"result": {"rows": rows, "n": len(rows),
+                                                 "n_valid": int(sum(r["valid"] for r in rows))}}) + "\n"
+        except Exception as ex:                       # a half-written stream needs an explicit error line
+            yield json.dumps({"error": f"{type(ex).__name__}: {ex}"}) + "\n"
+
+    # no-transform stops any proxy buffering the stream and defeating the progress bar
+    return StreamingResponse(stream(), media_type="application/x-ndjson",
+                             headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
 
 
 @app.get("/api/download")

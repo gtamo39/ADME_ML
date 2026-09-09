@@ -27,7 +27,12 @@ def _fake_params(rf_dir):
         CHEMPROP_TRANSFER={'groupings': {'sol_lipo': ['solubility', 'logd']},
                            'clusters': {'mdck_perm': {'target': 'mdck', 'file': 'tf_fake_cluster.parquet'}}},
         METRICS_PKL_RF_DIR=rf_dir, METRICS_PKL_CP_DIR=os.path.join(rf_dir, 'cp'),
-        ADME_CACHE=rf_dir, FOLD_GROUP_BY_INCHIKEY=True)
+        ADME_CACHE=rf_dir, FOLD_GROUP_BY_INCHIKEY=True,
+        # deploy_endpoint_cp reads the transform / unit / raw column name from here
+        ADME_ENDPOINTS={'logd': {'col': 'logd_LogD7.4', 'transform': 'identity', 'unit': 'logD7.4'},
+                        'solubility': {'col': 'sol_Solubility', 'transform': 'log10', 'unit': 'uM'},
+                        'mdck': {'col': 'mdck_Mean Papp A to B', 'transform': 'log10', 'unit': '1e-6cm/s'}},
+        DEPLOY={'features_type': 'H237', 'experiment_suffix': '_h237'})
 
 
 def _data_with_wide():

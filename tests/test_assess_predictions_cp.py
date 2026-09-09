@@ -5,6 +5,7 @@ checkpoint on `train`, and fabricates a prediction column on `predict`. Syntheti
 SMILES, fake compound ids. This checks the plumbing (arm semantics, provenance, pickle round trip), not
 model quality.
 """
+import json
 import os
 import stat
 import sys
@@ -140,3 +141,51 @@ def test_assess_all_endpoints_cp_loops_and_collects():
         # the shared sol_lipo pretrain ran once, so only 1 of the train calls has no --checkpoint
         trains = [a for a in open(os.environ['FAKE_CP_LOG']).read().splitlines() if a.startswith('train')]
         assert sum('--checkpoint' not in a for a in trains) == 1 + 4, trains   # 1 pretrain + 4 scratch folds
+
+
+def test_deploy_endpoint_cp_fits_and_writes_self_describing_meta():
+    """deploy_endpoint_cp must fit on EVERY internal row and leave a deploy_meta.json a predictor can use.
+
+    dry_run so no MLTrail write happens. The argv log must show one pretrain (no --checkpoint) and one
+    finetune that DOES load it and freezes the encoder, and no fold splitting anywhere.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        data, out = _data(tmp), _output(tmp)
+        s = out.deploy_endpoint_cp(data, data.params, None, 'logd', dry_run=True)
+
+        # dry_run returns a summary with no model id, and names the grouping it pretrained from
+        assert s['model_id'] is None and s['grouping'] == 'sol_lipo' and s['endpoint'] == 'logd'
+        # the shipped model trains on every internal row measured for the endpoint (no held-out fold)
+        assert s['n_train'] == len(data.cp_int)
+        # the model dir describes itself: task list, the scored task's index, descriptors, transform, unit
+        meta = json.load(open(os.path.join(s['model_dir'], 'deploy_meta.json')))
+        assert meta['tasks'] == data.cp_tasks and meta['target_index'] == data.cp_tasks.index('logd')
+        assert meta['descriptor_cols'] == data.cp_ds_cols and meta['n_train'] == s['n_train']
+        assert meta['confidence'].startswith('from the RF model')
+
+        trains = [a for a in open(os.environ['FAKE_CP_LOG']).read().splitlines() if a.startswith('train')]
+        # the deploy fit is exactly 2 trainings: one pretrain, one finetune. No folds.
+        assert len(trains) == 2, trains
+        assert '--checkpoint' not in trains[0] and '--freeze-encoder' not in trains[0]
+        assert '--checkpoint' in trains[1] and '--freeze-encoder' in trains[1]
+        # both stages seed PyTorch, so the shipped model is reproducible
+        assert all('--pytorch-seed 42' in a for a in trains), trains
+
+
+def test_deploy_all_endpoints_cp_loops_every_endpoint():
+    """deploy_all_endpoints_cp must fit one model per requested endpoint, reusing a shared pretrain."""
+    with tempfile.TemporaryDirectory() as tmp:
+        data = cp._data_with_wide()
+        prm = _cp_params(tmp)
+        prm.BEST_CHEMPROP_GROUPINGS['solubility'] = 'sol_lipo'
+        data.build_ML_data_CP(prm, k='logd', leak='none', n_splits=2)
+        out = _output(tmp)
+        res = out.deploy_all_endpoints_cp(data, prm, endpoints=['logd', 'solubility'], leak='none',
+                                          dry_run=True, n_splits=2)
+
+        # one summary per endpoint, both from the shared sol_lipo grouping
+        assert [r['endpoint'] for r in res] == ['logd', 'solubility']
+        assert {r['grouping'] for r in res} == {'sol_lipo'}
+        # the stage-1 pretrain is shared: only ONE of the trainings lacks --checkpoint
+        trains = [a for a in open(os.environ['FAKE_CP_LOG']).read().splitlines() if a.startswith('train')]
+        assert sum('--checkpoint' not in a for a in trains) == 1, trains

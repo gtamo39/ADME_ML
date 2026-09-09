@@ -139,10 +139,10 @@ CHEMPROP_TRANSFER:
 ## ==================== PATHS / CV POLICY ====================
 ## ---- ML model training and deployment ---- ##
 MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
-METRICS_PKL_RF_DIR: 'output/results/20260825_metrics'    # OUTPUT.assess_predictions writes <k>.pkl here (6 RF arms).
+METRICS_PKL_RF_DIR: 'output/results/20260909_metrics_rf' # 'output/results/20260825_metrics'    # OUTPUT.assess_predictions writes <k>.pkl here (6 RF arms).
                                                         # ALSO the fold source for chemprop: DATA._cp_folds reads the
                                                         # `fold` column of <k>.pkl, so both models score identical folds.
-METRICS_PKL_CP_DIR: 'output/results/20260907_metrics_cp'   # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
+METRICS_PKL_CP_DIR: 'output/results/20260909_metrics_cp' # 'output/results/20260907_metrics_cp'   # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
 FOLD_GROUP_BY_INCHIKEY: true   # CV folds grouped by InChIKey so a molecule's twins never split across train/test (anti-leakage)
 
 ## ==================== DEPLOYMENT ====================
@@ -177,6 +177,23 @@ webapp:
     caco2:      {value: 10, favorable: '>='}    # 1e-6 cm/s
     mdck:       {value: 10, favorable: '>='}    # 1e-6 cm/s
     ppb:        {value: 1,  favorable: '<'}     # % unbound
+  # Which model supplies the VALUE per endpoint (winners of the AUGMENTED arm, r2, wiki 2026-09-09).
+  # The CONFIDENCE always comes from the RF model adme_<ep>_h237 — a chemprop regression head
+  # returns no per-row std — so RF stays deployed for all 8 endpoints whatever this map says.
+  #   'rf'       -> adme_<ep>_h237  (sklearn bundle, internal + BEST_PUBLIC)
+  #   'chemprop' -> adme_<ep>_cp    (chemprop dir, public pretrain + frozen finetune)
+  # CAUTION: near-shell (dist060_agree) wins mdck and caco2, but it has NO deploy path yet, so both
+  # fall back to 'rf'. Add 'near_shell' here once that model reaches MLTrail.
+  value_model:
+    solubility: chemprop     # 0.755 (all8)      beats RF 0.680
+    logd:       chemprop     # 0.842 (sol_lipo)  beats RF 0.822
+    hlm:        chemprop     # 0.616 (clearance) beats RF 0.587
+    mlm:        chemprop     # 0.662 (clearance) — margin over RF 0.664 internal is 0.002, inside the noise
+    rlm:        chemprop     # 0.527 (clearance) beats RF 0.109
+    mdck:       rf           # near-shell 0.542 wins but is not deployable yet
+    caco2:      rf           # near-shell 0.765 wins but is not deployable yet
+    ppb:        rf           # 0.548 (all public) — RF wins outright
+
   # Extra MLTrail models shown as their own grid column. NOT part of the MPO formula scope.
   extra_models:
     - key: px_activity                  # column key; also <key>_pred / <key>_conf in filters + the CSV
