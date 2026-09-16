@@ -25,3 +25,6 @@ __pycache__/
 
 # Claude Code per-machine settings
 .claude/settings.local.json
+
+# Claude scratch copies of notebooks (outputs stripped; see python/nb_edit.py)
+*.claude.ipynb

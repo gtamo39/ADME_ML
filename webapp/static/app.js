@@ -3,7 +3,7 @@
 
 const $ = (id) => document.getElementById(id);
 const drop = $('drop'), fileInput = $('file'), grid = $('grid'),
-      statusEl = $('status'), legend = $('legend'), dlBtn = $('download'), clearBtn = $('clear'),
+      statusEl = $('status'), legend = $('legend'), dlBtn = $('download'), sdfBtn = $('download_sdf'), clearBtn = $('clear'),
       mpoInput = $('mpo'), mpoStatus = $('mpostatus'),
       filterRowsEl = $('filterrows'), filterStatus = $('filterstatus');
 
@@ -15,8 +15,10 @@ let FILTERS = [];          // filter terms [{field, op, value}] — an incomplet
 let FILTER_MODE = 'all';   // 'all' = every term must pass (AND), 'any' = at least one (OR)
 let HIDDEN = new Set();    // column keys the user hid (still exported to the CSV)
 let PAL = null;            // live cell palette; starts as the SERAC defaults from /api/models
-let SHARP = 1;             // multiplies each column's color_slope (low = smoother value fade)
-let BLEND = 10;            // half-width (%) of the gradient band across the cell split (0 = hard edge)
+let SHARP = 4;             // multiplies each column's color_slope (low = smoother value fade)
+const SHARP_DEFAULT = 4;   // slider runs smoother 0.25 .. harder 4 (index.html #c_sharp)
+let BLEND = 20;            // half-width (%) of the gradient band across the cell split
+const BLEND_DEFAULT = 20;  // slider runs hard 4% .. soft 20% (index.html #c_blend)
 let SHAPE = 'curved';      // 'curved' (arc) or 'straight' (corner-to-corner diagonal)
 
 // ---- color helpers ----------------------------------------------------------
@@ -241,7 +243,7 @@ function renderColors() {
   COLOR_KEYS.forEach((k) => { $('c_' + k).value = PAL[k]; });
   ['azure', 'ember'].forEach((k) => { $('l_' + k).style.background = PAL[k]; });
   $('c_sharp').value = SHARP;
-  $('sharpval').textContent = SHARP.toFixed(2).replace(/0$/, '');
+  $('sharpval').textContent = String(SHARP);
   // the cells read the split shape and the blend from CSS, so a change needs no row re-render
   $('c_blend').value = BLEND;
   $('c_shape').value = SHAPE;
@@ -255,7 +257,7 @@ function renderColors() {
   $('l_bar').style.background = `linear-gradient(to right, ${fade(PAL.unfav, 0.9)}, ${fade(PAL.unfav, 0.1)},` +
                                 ` ${fade(PAL.fav, 0.1)}, ${fade(PAL.fav, 0.9)})`;
   const changed = COLOR_KEYS.filter((k) => PAL[k] !== MODELS.palette[k]).length
-                  + (SHARP !== 1 ? 1 : 0) + (BLEND !== 10 ? 1 : 0) + (SHAPE !== 'curved' ? 1 : 0);
+                  + (SHARP !== SHARP_DEFAULT ? 1 : 0) + (BLEND !== BLEND_DEFAULT ? 1 : 0) + (SHAPE !== 'curved' ? 1 : 0);
   $('colorstatus').textContent = changed ? `${changed} changed` : '';
   $('colorstatus').className = changed ? 'filterstatus on' : 'filterstatus';
 }
@@ -431,12 +433,13 @@ async function upload(files) {
     setProgress(null);
     if (err) { setStatus('error: ' + err); return; }
     if (!data) { setStatus('error: the prediction stream ended with no result'); return; }
-    ROWS = data.rows.map((r) => ({ ...r, score: null, mpo: null, selected: true }));
+    // idx = position in the server's last run; the SDF export needs it to find the original record
+    ROWS = data.rows.map((r, i) => ({ ...r, idx: i, score: null, mpo: null, selected: true }));
     recomputeMPO();
     if (SORT.key) sortRows();
     renderRows();
     legend.style.display = ROWS.length ? 'flex' : 'none';
-    dlBtn.disabled = !ROWS.length;
+    dlBtn.disabled = sdfBtn.disabled = !ROWS.length;
     setStatus(`${data.n} compounds · ${data.n_valid} scored · ${data.n - data.n_valid} unparsed`);
   } catch (e) { setProgress(null); setStatus('error: ' + e); }
 }
@@ -505,9 +508,27 @@ dlBtn.addEventListener('click', () => {
   URL.revokeObjectURL(url);
   setStatus(`downloaded ${sel.length} of ${VISIBLE.length} shown compounds`);
 });
+// SDF export: the server holds the original records, so only the row selection is sent up
+sdfBtn.addEventListener('click', async () => {
+  const sel = VISIBLE.filter((r) => r.selected);     // filtered-out rows are never exported
+  if (!sel.length) { setStatus('no compounds selected'); return; }
+  setStatus(`building SDF for ${sel.length} compounds…`);
+  try {
+    const res = await fetch('/api/download_sdf', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rows: sel.map((r) => ({ idx: r.idx, mpo: r.mpo, score: r.score })) }),
+    });
+    if (!res.ok) { setStatus('error: ' + (await res.text()).slice(0, 200)); return; }
+    const url = URL.createObjectURL(await res.blob());
+    const a = document.createElement('a'); a.href = url; a.download = 'adme_predictions.sdf'; a.click();
+    URL.revokeObjectURL(url);
+    setStatus(`downloaded ${sel.length} of ${VISIBLE.length} shown compounds as SDF`);
+  } catch (e) { setStatus('error: ' + e); }
+});
+
 clearBtn.addEventListener('click', () => {
   ROWS = []; VISIBLE = []; SORT = { key: null, dir: 1 };
-  renderRows(); legend.style.display = 'none'; dlBtn.disabled = true;
+  renderRows(); legend.style.display = 'none'; dlBtn.disabled = sdfBtn.disabled = true;
   preview.style.display = 'none';
   const sa = $('selall'); if (sa) { sa.checked = true; sa.indeterminate = false; }
   fileInput.value = ''; setStatus('idle');
@@ -533,7 +554,7 @@ $('c_sharp').addEventListener('input', (e) => { SHARP = parseFloat(e.target.valu
 $('c_blend').addEventListener('input', (e) => { BLEND = parseFloat(e.target.value); renderColors(); });
 $('c_shape').addEventListener('change', (e) => { SHAPE = e.target.value; renderColors(); });
 $('resetcolors').addEventListener('click', () => {
-  PAL = { ...MODELS.palette }; SHARP = 1; BLEND = 10; SHAPE = 'curved'; renderColors(); renderRows();
+  PAL = { ...MODELS.palette }; SHARP = SHARP_DEFAULT; BLEND = BLEND_DEFAULT; SHAPE = 'curved'; renderColors(); renderRows();
 });
 
 // default MPO = equal-weight mean of each endpoint's sigmoid-at-cutoff desirability.

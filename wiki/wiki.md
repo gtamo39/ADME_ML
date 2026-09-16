@@ -2118,3 +2118,948 @@ seeds (a `calib_repeats` knob), which multiplies the calibration rows without ch
 population described. NOT out-of-bag predictions — an OOB prediction averages only the ~37% of trees
 that missed the row, so its variance is ~2.7x a full-forest prediction and `rmse_cv` would come out
 pessimistic.
+
+## External benchmark — the intern's public-only models on our internal set (2026-09-10)
+
+Source audited and cleared: `/home/justasm/Project/serac-intern-project` (see the audit note below).
+`predict.py` emits raw assay units in the SAME units as `ADME_ENDPOINTS` — he converts Biogen's
+`LOG HLM/RLM_CLint (mL/min/kg)` to uL/min/mg with `HUMAN_MICROSOME_SCALING = 1.157` — so no unit fix
+is needed. His models are LightGBM on Morgan-2048 + 217 RDKit descriptors, trained on PUBLIC data
+only (n_train 4,677-11,509): TDC, the Biogen ADME 3521 release, OpenADMET, and ChEMBL for mdck.
+
+Run (input needs `id,smiles`; keep both paths OUTSIDE his repo — see the audit caution):
+
+```bash
+cd /home/justasm/Project/serac-intern-project
+./.venv/bin/python predict.py --input  /home/gtamo/ADME_ML/tmp/20260910_intern_input.csv \
+                              --output /home/gtamo/ADME_ML/tmp/20260910_intern_preds.csv
+```
+
+Scored through `score_round_trip` (notebook cell `01a26a07`, now a reusable function) so both
+prediction sets pass the IDENTICAL truth pipeline — mdck MDR1 filter, solubility cap, non-finite
+drop, config transform to modelling space:
+
+| endpoint | N | ours R²det | intern R²det | ours bias | intern bias |
+|---|---|---|---|---|---|
+| solubility | 121 | 0.833 | 0.287 | +0.028 | -0.119 |
+| logd | 318 | 0.891 | 0.493 | +0.013 | -0.393 |
+| hlm | 325 | 0.766 | **-0.153** | +0.012 | -0.149 |
+| mlm | 325 | 0.775 | 0.290 | +0.017 | -0.105 |
+| rlm | 39 | 0.844 | 0.126 | +0.002 | +0.128 |
+| caco2 | 95 | 0.712 | **-0.274** | +0.224 | +0.506 |
+| mdck | 108 | 0.759 | **-0.356** | +0.090 | +0.479 |
+| ppb | 69 | 0.884 | **-0.089** | -0.006 | +0.192 |
+
+CAUTION: this is NOT a like-for-like contest. Our models trained on every one of these 326
+compounds, so our column is an upper bound, not a held-out score. His models never saw them, so his
+column IS an honest external score. The comparison that matters is **his R²det vs OUR held-out CV
+numbers**, not vs this row.
+
+Even so, the finding is real and useful: **a public-only model transfers poorly to our bRo5 series.**
+Four endpoints go NEGATIVE on R²det (hlm, caco2, mdck, ppb) — worse than predicting the mean — while
+their Pearson r² stays positive (0.085-0.344). That gap is the calibration offset: his caco2 and mdck
+carry a +0.48 to +0.51 log-unit bias, i.e. a systematic ~3x over-prediction of permeability on our
+chemistry. **This is the cleanest evidence yet for why internal data is needed**, and it is an
+independent confirmation of the project's R²det-over-r² rule: r² alone would have called caco2
+(0.344) and mdck (0.328) "weak but working", when both are in fact worse than a constant predictor.
+
+## ★ LIKE-FOR-LIKE transfer: our public->internal arms vs the intern's public-only models (2026-09-10)
+
+Notebook cell `f7e1632f`, self-contained (it needs no other cell to have run). **This is the fair
+contest**, unlike the round-trip table: all three bars
+are public->internal, so NO internal compound was in ANY training set. Our arms are
+`ext_->_internal_metrics` from `output.metrics_results` (RF) and `output.metrics_results_cp`
+(chemprop); the intern's are his public-only LightGBM scored through the identical truth pipeline
+via **`fn.score_round_trip`**, which moved from a notebook cell into `python/functions.py` on
+2026-09-10 — a notebook-local definition made the figure depend on the round-trip cell having been
+run (NameError otherwise) and dragged round-trip wording into a transfer-only figure. It takes
+`truth` and `endpoints` as arguments instead of reaching for notebook globals, and `v=False`
+silences its match-count line.
+
+The figure plots TWO bars per endpoint: our BEST arm of the two (SERAC `paper`) against the
+intern (SERAC `ember`), with the x tick naming which of ours won. The table below the figure
+keeps both of our arms. `CLIP01 = True` clips the DRAWN bars into [0, 1] so both metrics share one
+frame (the house `CLIP0` convention from cell `5dc3198e`); a floored bar keeps its TRUE value in the
+label, prefixed `↓`, and the y-label says "floored at 0" — so "worse than the mean" is still
+readable off the figure, not hidden by it.
+
+**R²det — the intern wins 6 of 8:**
+
+| endpoint | n | ours RF | ours chemprop | ours best | intern | gain |
+|---|---|---|---|---|---|---|
+| solubility | 120 | **0.422** | -0.119 | 0.422 | 0.287 | **+0.135** |
+| logd | 317 | 0.254 | **0.476** | 0.476 | 0.493 | -0.017 |
+| caco2 | 95 | -0.217 | **0.241** | 0.241 | -0.274 | **+0.515** |
+| mlm | 324 | -0.533 | -0.191 | -0.191 | **0.290** | -0.481 |
+| rlm | 39 | -0.724 | -0.302 | -0.302 | **0.126** | -0.428 |
+| hlm | 324 | -1.047 | -0.851 | -0.851 | **-0.153** | -0.698 |
+| ppb | 69 | -0.949 | -3.353 | -0.949 | **-0.089** | -0.860 |
+| mdck | 107 | -3.468 | -1.506 | -1.506 | **-0.356** | -1.150 |
+
+**R² (squared Pearson) — WE win 8 of 8:**
+
+| endpoint | ours best | intern | gain |
+|---|---|---|---|
+| solubility | 0.577 | 0.430 | +0.147 |
+| logd | 0.620 | 0.614 | +0.006 |
+| mdck | 0.402 | 0.328 | +0.074 |
+| hlm | 0.329 | 0.085 | +0.244 |
+| mlm | 0.457 | 0.315 | +0.142 |
+| rlm | 0.337 | 0.192 | +0.145 |
+| caco2 | 0.529 | 0.344 | +0.185 |
+| ppb | 0.087 | 0.086 | +0.001 |
+
+### The conclusion, and it is not the flattering one
+
+**Our public-only models RANK better; his are better CALIBRATED.** We beat him on ranking at every
+single endpoint, and he beats us on absolute scale at six. The two metrics disagree completely,
+which is the sharpest demonstration of the R²det-over-r² rule this project has produced: on r²
+alone we would have declared an 8-0 win, while more than half of our transfer arms are in fact
+worse than predicting the mean in raw units.
+
+Likely cause: our transfer arm trains on the narrow `BEST_PUBLIC` origins picked to optimise the
+AUGMENTED arm, not standalone transfer. His trains on a broad merged public pool (TDC + Biogen 3521
++ OpenADMET + ChEMBL) with an explicit unit harmonisation, which lands the mean and spread closer to
+our assay scale.
+
+**What this reframes:** the big win from augmentation is mostly a CALIBRATION fix, not a ranking
+fix. Public data already ranks our compounds fairly well (r² 0.09-0.62); what internal data buys is
+the correct absolute scale. Corollary worth testing: a cheap affine recalibration of the transfer
+predictions (fit a + b*pred on a small internal set) may recover most of the augmented arm's R²det
+at a fraction of the internal-data cost.
+
+CAUTION for anyone quoting the earlier round-trip benchmark (2026-09-10, section above): its
+conclusion "a public-only model transfers poorly to our bRo5 series" still holds in absolute terms
+for BOTH parties, but it must NOT be read as "ours transfer better". On R²det ours transfer worse.
+
+## ★ WHY the intern's R²det beats ours on transfer — it is the OFFSET, not the transform (2026-09-10)
+
+Question asked: is his R²det better because he trained on raw values rather than log10?
+**Answer: no.** He trains in log10 for 7 of 8 endpoints, exactly as we do (his `train.py` ENDPOINTS
+spec: caco2/mdck/solubility are STORED as log10 with `log10: False`; hlm/mlm/rlm use `log10: True`;
+logd is identity). The single difference is **ppb** — his log10(% unbound) vs our `logit_pct` — and
+even there his ranking is identical to ours (r² 0.086 vs 0.087), so the transform explains nothing.
+
+### The decomposition that settles it
+
+For predictions `p` and truth `y`, the R²det achievable after an OPTIMAL affine rescale `a + b*p`
+is exactly **r²** (squared Pearson). So r² is the ranking ceiling, R²det is what you get as shipped,
+and **`r² - R²det` is the pure calibration penalty.**
+
+| endpoint | ours arm | ours r² | ours R²det | ours calib loss | his r² | his R²det | his calib loss |
+|---|---|---|---|---|---|---|---|
+| solubility | RF | **0.577** | 0.422 | 0.156 | 0.430 | 0.287 | 0.143 |
+| logd | cp | 0.520 | 0.476 | 0.044 | **0.614** | 0.493 | 0.121 |
+| hlm | cp | **0.329** | -0.851 | **1.180** | 0.085 | -0.153 | 0.239 |
+| mlm | cp | **0.457** | -0.191 | 0.648 | 0.315 | 0.290 | **0.025** |
+| rlm | cp | **0.337** | -0.302 | 0.639 | 0.192 | 0.126 | **0.066** |
+| caco2 | cp | **0.511** | 0.241 | 0.271 | 0.344 | -0.274 | 0.618 |
+| mdck | cp | 0.329 | -1.506 | **1.835** | 0.328 | -0.356 | 0.684 |
+| ppb | RF | 0.087 | -0.949 | 1.036 | 0.086 | -0.089 | 0.175 |
+
+**We rank better on 7 of 8. His calibration loss is smaller on 6 of 8 — the same 6 he wins.**
+The whole gap is calibration.
+
+### Where the mis-calibration sits: a systematic POSITIVE bias in our transfer arms
+
+Fitting `y ~ a + b*pred` (perfect = slope 1, bias 0):
+
+| endpoint | ours slope | **ours bias** | his slope | his bias |
+|---|---|---|---|---|
+| solubility | 1.390 | **+0.394** | 0.643 | -0.119 |
+| logd | 1.212 | -0.201 | 1.184 | -0.393 |
+| hlm | 0.938 | **+0.603** | 0.417 | -0.149 |
+| mlm | 1.223 | **+0.538** | 0.969 | -0.105 |
+| rlm | 1.089 | **+0.555** | 0.709 | +0.128 |
+| caco2 | 1.480 | **+0.360** | 0.574 | +0.506 |
+| mdck | 0.813 | **+0.795** | 0.792 | +0.479 |
+| ppb | 1.671 | **+0.477** | 0.749 | +0.192 |
+
+Our transfer arms over-predict on **7 of 8** endpoints, by a mean of about **+0.44 log units — a
+~2.8x over-prediction in raw units.** The direction is coherent with domain shift: a model trained
+on public, mostly Ro5-compliant chemistry predicts "typical drug-like" values — more soluble, more
+permeable, faster-cleared — than our bRo5 series actually shows.
+
+Our slopes also sit above 1 for 6 of 8 (predictions under-dispersed, the usual RF regression to the
+mean), but the offset dominates the penalty.
+
+### The probable root cause, and it is our own selection criterion
+
+`BEST_PUBLIC` was chosen to maximise the **AUGMENTED** arm, where internal rows are present to
+absorb any offset. That selection therefore never penalised a biased public source. His pool is a
+broad merge (TDC + Biogen 3521 + OpenADMET + ChEMBL) with explicit unit harmonisation and no such
+selection pressure, so it happens to land nearer our assay scale.
+
+### Actionable: affine recalibration should reverse the result
+
+Fitting just 2 parameters (`a`, `b`) on a small internal subset lifts each transfer arm from its
+R²det to its r² ceiling — hlm -0.851 -> 0.329, mdck -1.506 -> 0.329, ppb -0.949 -> 0.087. Since we
+win r² on 7 of 8, **a recalibrated transfer arm would beat his on 7 of 8.** This is the cheapest
+open win on the board: it needs a handful of internal measurements, not a full augmented training
+set. It also refines the earlier claim that augmentation's benefit is mostly calibration — the
+benefit is specifically removing a positive offset.
+
+## ★ The transfer figure is scored in MODELLING space — and the space FLIPS the verdict (2026-09-10)
+
+Question asked: are the predictions converted back to actual assay units before r² and R²det?
+**No. Both bars are scored in MODELLING space** (log10, or logit for ppb), never in raw units.
+
+Two different routes, same destination:
+- **Ours** — `ext_->_internal_preddf.real_y/pred_y` hold the `label` column, which `_endpoint_ML`
+  already built in modelling space via the config `fwd()`. Raw units never appear.
+- **His** — `predict.py` emits RAW units, then `fn.score_round_trip` applies the config transform to
+  BOTH his prediction and the truth. Raw -> back to log10.
+
+Verified: hlm's raw truth mean is 109.9 uL/min/mg while the scored `real_y` mean is 1.454, i.e.
+log10 scale, for both paths. And the truth vectors are **bit-identical** on shared compounds
+(max|difference| = 0.00e+00 at all 8 endpoints), so the contest is genuinely apples-to-apples.
+
+### CAUTION: the choice of space reverses the result
+
+The SAME predictions, scored both ways:
+
+| endpoint | ours LOG R²det | his LOG R²det | ours RAW R²det | his RAW R²det |
+|---|---|---|---|---|
+| solubility | 0.422 | 0.287 | **0.425** | **-1.481** |
+| logd | 0.476 | 0.493 | 0.476 | 0.493 |
+| hlm | -0.851 | -0.153 | **0.081** | -0.044 |
+| mlm | -0.191 | 0.290 | **0.196** | -0.033 |
+| rlm | -0.302 | 0.126 | **0.273** | -0.050 |
+| caco2 | 0.241 | -0.274 | **0.564** | **-2.570** |
+| mdck | -1.506 | -0.356 | -0.807 | 0.210 |
+| ppb | -0.949 | -0.089 | -0.130 | 0.046 |
+
+**Intern wins R²det 6/8 in log space, but only 3/8 in raw units.**
+
+The mechanism is the slope from the calibration decomposition above. In `y ~ a + b*pred`, OUR slopes
+sit above 1 (predictions under-dispersed, RF's regression to the mean) and HIS below 1
+(over-dispersed). Exponentiating an over-dispersed log prediction explodes: his solubility and caco2
+go to -1.48 and -2.57 in raw units. Our compressed predictions are conservative and survive the
+back-transform.
+
+Which space is right depends on the question. Modelling space stays the project default (the assays
+are log-normal, so the error is multiplicative, and a raw-space metric is dominated by a handful of
+large values — see the 2026-07-20 entry). But the **webapp displays raw units and triages on a raw
+cutoff**, so for the deployed decision the raw column is the relevant one — and there our models are
+already ahead at 5 of 8.
+
+Minor bookkeeping: `fn.score_round_trip` joins on `name` without a SMILES dedup, so the intern is
+scored on ONE extra compound at solubility, logd, hlm, mlm and mdck (the internal SMILES-twin pair,
+see the 2026-09-09 entry). 1 row in 107-324 does not move a metric, but the figure's `n=` label is
+taken from OUR arm and therefore under-reports his n by 1 at those five endpoints.
+
+## Webapp — colour defaults + SDF export (2026-09-10)
+
+**Colours.** `cell split` defaults to **curved**. The two sliders now open at the ends the user
+asked for: `blend` = **soft 20%** (`#c_blend`, range hard 4% .. soft 20%) and `value fade` =
+**harder 4** (`#c_sharp`, range smoother 0.25 .. harder 4). Each reset value lives in ONE place in
+`app.js` (`BLEND_DEFAULT`, `SHARP_DEFAULT`), used by the reset button AND the "N changed" badge, so
+the two can no longer disagree. The CSS fallback `var(--blend,20%)` matches the default, so the
+cells never flash a narrower band before `renderColors()` runs. At blend 20% the hairline opacity
+`--divop` computes to 0; that is by design (the hairline fades as the band widens) and the curved
+default draws no hairline anyway.
+
+CAUTION — the test suite command in CLAUDE.md collects nothing. 8 of the 10 files in `tests/` hold
+plain `test_*` functions (pytest style), which `python -m unittest discover -s tests` cannot
+collect; the 2 files that DO use `unittest.TestCase` (`test_rf_systematic`,
+`test_chemprop_systematic`) now fail at `setUpModule` because commit 0886a5b removed the config
+keys they read (`CHEMPROP_SYSTEMATIC`, `PARAMS.features_type`). So `discover` reports
+"Ran 0 tests ... FAILED (errors=2)". The 55 function tests all pass when a runner calls them
+directly. Open item: either convert the 8 files to `TestCase`, or repair the 2 stale files and
+agree on a runner.
+
+**SDF export.** New `Download SDF` button beside `Download CSV`, and a `POST /api/download_sdf`
+route. The CSV export is built client-side; the SDF cannot be, because the browser never holds the
+molblock — so the client posts only the row selection and the server emits the file.
+
+The contract: **if the input was an SDF, every record is re-emitted VERBATIM** — same atoms,
+coordinates, charges, stereo flags and original data fields — with only the prediction fields
+appended. A csv input has no original record, so a 2D depiction is generated from the SMILES
+(`AllChem.Compute2DCoords`) and the export says which path it took.
+
+CAUTION — the alignment trap this exposed. `mltrail.readers._read_sdf` **skips** records RDKit
+cannot parse, so the surviving rows no longer line up with the file's record order. Splitting the
+file separately to recover the molblocks would therefore attach predictions to the WRONG molecule.
+`webapp/app.py:_read_sdf_keep_blocks` parses and splits in ONE pass, so blocks are aligned to rows
+by construction. Second trap, found in testing: after `text.split("$$$$")` every record but the
+first inherits the separator's newline, which shifts the molblock header (title/program/comment/
+counts) and makes RDKit fail — only 1 of 4 records parsed until `.lstrip("\n")` was applied BEFORE
+the parse, not just before storing.
+
+Verified 2026-09-10 on a public 5-record SDF (ethanol, aspirin, L-alanine with a stereocentre,
+a glycine zwitterion, plus one deliberately corrupt record):
+- 4 good records parsed, the corrupt one skipped, and **4 exported**;
+- the connection table (everything up to `M  END`) is **byte-for-byte identical** for all 4;
+- the original user data field survived, 20 prediction fields were added;
+- canonical SMILES unchanged for every record;
+- csv input path: 5 records, all RDKit-readable, 2D coords present;
+- a subset selection exports only those rows in the requested order; an out-of-range index and an
+  empty selection both return HTTP 400 rather than silently exporting the wrong thing.
+
+NOTE for testing the webapp from a shell: a multi-line Bash tool command can be collapsed onto one
+line, which silently chains the commands and leaves a STALE uvicorn answering. That produced a
+false "only 1 of 4 records parsed" result here. Put webapp test sequences in a script file and run
+`bash script.sh`.
+
+## ★★ SEGFAULT LANDMINE — `rdkit.Chem.Draw` must be imported AFTER `seaborn` (2026-09-15)
+
+```
+from rdkit.Chem import Draw
+import seaborn            # <-- SEGMENTATION FAULT, core dumped, no traceback
+```
+Reverse the two lines and it is fine. Deterministic, 3/3 runs each way, in the `ML` env
+(rdkit 2025.09.3, seaborn present). Nothing is printed — the process dies at import, so a notebook
+shows only a dead kernel with no error.
+
+`python/ADME_build_ML.py` imports seaborn at module level (line 28), so
+`from rdkit.Chem import Draw; from python.ADME_build_ML import PARAMS` crashes too, and that is how
+this was found: the whole `Visualize_fingerprints` harness died with zero output. PIL, matplotlib
+offsetbox and `ML_Class` are INNOCENT — an early bisect blamed PIL only because
+`matplotlib.offsetbox` pulls PIL in regardless, leaving `Draw` still ahead of seaborn.
+
+**Rule for every notebook and script here: import seaborn (or anything that imports it, such as
+`ADME_build_ML`) BEFORE `rdkit.Chem.Draw`.** `Rdkit_tools.py` no longer trips this (fixed
+2026-09-15 — its `Draw` / `rdMolDraw2D` imports are now function-local), but a notebook importing
+`Draw` directly still must order it after seaborn. `Visualize_fingerprints.ipynb` now imports `Draw` on
+the line after `import seaborn as sns`, with a CAUTION comment. `FP_preds.ipynb` does not import
+`Draw` at all, so it is unaffected. Verified on the live notebook: seaborn at char 1563, Draw at
+1585.
+
+## Tree figure with bits drawn in place (cell 9e13d372, 2026-09-15)
+
+`fn.draw_bit_on_molecule(mol, bit, info, size=..., mol_color=, bond_width=, center_color=,
+env_color=, alpha=, bead_radius=)` -> PNG bytes: the WHOLE molecule drawn
+(`updateAtomPalette` recolours every element), the bit's radius-N environment in `env_color`, the
+central atom in `center_color`. This is the complement to `Draw.DrawMorganBit`, which crops to the
+fragment and marks cut bonds with `*` — useless for showing WHERE a bit sits.
+
+**★ Style follows andersle.no, and the trick is what NOT to do (2026-09-15).** The reference is
+https://www.andersle.no/posts/2022/drawfingerprint/drawfingerprint.html. Two things make it clean:
+
+1. **Do not recolour the skeleton.** Keeping RDKit's ELEMENT palette (red O, blue N, black C) is
+   what reads well. Earlier passes forced the whole molecule grey and then black; both looked worse
+   than leaving the palette alone. `mol_color=None` (the default) now skips `updateAtomPalette`
+   entirely; pass `BIT_BLACK` / `BIT_GREY` only to override.
+2. **Bead colour says what KIND of atom it is**, not merely centre-vs-environment. `BIT_COLORS`
+   holds the Okabe & Ito (colour-blind safe) palette the post uses:
+   `center (0.337,0.706,0.914)` | `aromatic (0.941,0.894,0.259)` | `ring (0.835,0.369,0.0)` |
+   `other (0.8,0.8,0.8)` | `bond (0.8,0.8,0.8)`. An atom is classed centre, then
+   `GetIsAromatic()`, then `IsInRing()`, else other — the post's `get_atom_colors` logic.
+
+Signature: `draw_bit_on_molecule(mol, bit, info, size, occurrence, mol_color=None, bond_width=2.0,
+colors=None, alpha=1.0, bead_radius=0.3)`; `colors` overrides any `BIT_COLORS` key.
+**RDKit accepts an RGBA 4-tuple in `highlightAtomColors` / `highlightBondColors`** (verified), so
+`alpha` needs no compositing of our own; `bead_radius` -> `drawOptions().highlightRadius`,
+`bond_width` -> `bondLineWidth`, and `fillHighlights=True` gives the solid beads.
+Cell 5 surfaces `MOL_C / BOND_W / BEAD_A / BEAD_R / BIT_PAL` and uses element colours at width 2.6,
+opaque beads, radius 0.36. The subtitle names the BEAD colours only, never the skeleton colour, so
+switching `MOL_C` cannot make it lie.
+
+**`fn.plot_decision_tree_MF_bits(tree, ML_df, mols, radius=2, ...)` -> figure** (moved out of the
+notebook 2026-09-15, now that the look is settled). Cell 5 is three lines: fit the tree, call it.
+
+**The tree alone is NOT enough input, and this is the reason.** `tree.tree_.feature[n]` holds a
+column INDEX, not a bit id, so the feature names must come from `ML_df`; choosing a molecule to
+show a bit on needs both `decision_path` (which rows reach the node) and the `B<id>` columns; and
+the STRUCTURES are in neither, since `ML_df` carries no smiles/mol — hence the third argument,
+`mols` (an id -> RDKit mol mapping, e.g. `dict(zip(logd.compound, logd.mol))`).
+
+Internals: leaves spread evenly with each parent centred over its children; per split it picks a
+molecule from the PRESENT child's population that carries that child's MAJORITY label, smallest
+first (see "Which molecule a split box shows", 2026-09-16); split
+boxes hold the bit picture plus `n cpds / P`; boxes are shaded by P(positive) on a two-point
+SERAC ramp, paper `#E3E0DA` at P = 0 to olive `#74B24A` at P = 1 (2026-09-16); edges read `ABSENT`
+in red `#C62828` and `PRESENT` in green `#2E7D32`, both bold and upper case. The four colours are
+arguments — `c_low` / `c_high` / `c_absent` / `c_present` — and `cmap='Oranges'` still overrides the
+ramp, so the earlier figures reproduce. Pass `SERAC_C['paper']` / `SERAC_C['olive']` from
+`config.yaml` to keep the palette in config rather than in the library defaults. Depth comes from `tree.get_depth()`, so it is not tied to the
+notebook's `VIZ_DEPTH` — verified at depth 2 (7 nodes, 20.8 x 18.5 in) and depth 4 (23 nodes,
+62.4 x 31.8 in). Style and geometry are all keyword args (`col/row/dpi/img/zoom/ygap`,
+`mol_color/bond_width/alpha/bead_radius/colors`, `pos_label`, `title`), defaults matching the figure
+that was signed off.
+
+**The UNHASHED bits IGNORE stereochemistry; the HASHED ones do not (2026-09-16).** A gap found
+by the user's question. `Rdkit_tools.unhashed_morgan` (line 458) and `morgan_bit_info` (line 521)
+build `GetMorganGenerator(radius=radius)` with no `includeChirality`, whose default is False.
+Both hashed siblings pass `includeChirality=True`: `get_MF_bits_from_df` (line 379) and the H237
+block (line 2821). So FP_preds section 2 (H237) separates stereoisomers and section 3 (the
+unhashed-bit tree) does NOT.
+
+Verified on public pairs: L/D-alanine, R/S-2-butanol and E/Z-2-butene each give IDENTICAL unhashed
+bits and DIFFERENT hashed bits. At the generator level, alanine's two enantiomers share 13 of 13
+bits with the flag off and 11 of 13 with it on. Consequence: two stereoisomers with different IC50
+carry identical features in section 3 and must land in the same leaf, which caps that tree's
+accuracy on any stereo-driven SAR.
+
+**FIXED the same day** (user: "Please add include_chirality = True on both"). `unhashed_morgan`,
+`morgan_bit_info` and `plot_decision_tree_MF_bits` now take `include_chirality=True`. The plotter
+carries the flag too, because it calls `morgan_bit_info` for the picture and the pair must not
+drift. Verified: the three stereo pairs now give DIFFERENT rows at the default and SAME rows at
+False; two copies of ethanol stay SAME; and on 8 public molecules with `dedup=False` a MISMATCHED
+flag loses 16 of 63 columns from the info map, so the flag must match on both calls exactly as the
+radius must.
+
+CAUTION: the bit ids CHANGED. Section 3 of FP_preds must be re-run, and any `B<id>` written down
+from an earlier run no longer names the same environment.
+
+**Which molecule a split box shows (2026-09-16, `Rdkit_tools.plot_decision_tree_MF_bits.example`).**
+The rows that reach a split AND carry its bit are exactly the rows the split sends right, so the
+candidates ARE the PRESENT child's population. That was already true before this change; the user
+asked for it after my earlier wording ("the smallest molecule") hid the restriction.
+
+The change is the tie-break. It was the smallest candidate by atom count. It is now the smallest
+candidate whose own label equals the PRESENT child's MAJORITY class. Reason: at a child with
+P = 0.92, the smallest candidate can easily be one of the 8% that carry the bit and still miss, so
+the box showed a structure that contradicted the probability printed above it. The majority class
+holds at least half of the candidates, so the filter never empties and needs no fallback branch.
+It gives nothing at a near-0.5 child, where "majority" is close to a coin toss.
+
+Verified on 24 public molecules (no internal structure was drawn, saved or read): `draw_bit_on_molecule`
+intercepted per split; every box drew from its PRESENT child, carried that child's majority label,
+and was the smallest kept; one of four splits changed molecule. `Scripts` suite unchanged at 181
+tests / the same 3 pre-existing failures (`test_check_ML_data`, `test_ml_class`, `test_ml_reg`).
+
+**Bit ids are NOT shown** (user, 2026-09-15: "I won't be reading this"). The picture is the label.
+
+**Layout is TWO-PASS, and it has to be.** Guessing a box's half-height from
+`px * zoom / (inches * dpi)` is wrong, because `tight_layout` rescales the axes afterwards — the
+first attempt put captions across the molecules and arrows inside the boxes. Pass 1 places the
+images and leaf rectangles; then `fig.tight_layout()`, `fig.canvas.draw()`, and
+`artist.get_window_extent().transformed(ax.transData.inverted())` give each box's REAL data-space
+edges; pass 2 hangs the captions and arrows off those. Knobs that matter: `COL`/`ROW` inches per
+column and per level, `IMG`/`ZOOM` for the molecule, and `YGAP = 1.28` — row spacing must EXCEED the
+box height or the arrows have nowhere to go. Split captions carry a white bbox at `zorder=6` and the
+arrows `zorder=1`, so a parent's arrow does not strike through the child's caption.
+
+CAUTION: with 8 leaf columns a molecule can only ever be about 1/9 of the figure width. If the
+pictures must be bigger, drop to `VIZ_DEPTH = 2` (4 leaves) — no amount of figure resizing helps,
+since the notebook scales the whole figure to the cell width.
+
+**No graphviz.** There is no `dot` binary on this machine and no apt package, and `pip install
+graphviz` supplies only the Python wrapper (it shells out to `dot`), so it would fail at render time.
+A balanced binary tree needs no automatic layout, so matplotlib + PIL do the job with no new
+dependency. `ipywidgets==8.1.9` WAS installed (pip, `ML` env) for the interactive version and is
+recorded in `requirements.txt` — with the caveat that it must also be installed where the Jupyter
+SERVER runs, since `jupyterlab`/`notebook` are absent from `ML`.
+
+Depth 3 is a deliberate choice: the champion depth-20 tree defines its leaves mostly by ABSENT bits
+(its biggest leaf: 20 tests, 1 present), and an absence has no substructure to draw.
+
+## ★★ STRUCTURE-FREE tree figure — the ONLY mode allowed for internal compounds (2026-09-15)
+
+`plot_decision_tree_MF_bits` draws molecules by default. **That is forbidden for internal
+compounds**: a structure in an image is a structure leaked, and an image is exactly what gets pasted
+into a slide or a ticket. The function therefore takes two independent brakes:
+
+- `mols=None` (now the default) — with no structures supplied, none can be drawn.
+- `draw_bits=False` — forces the text-only figure even when `mols` IS available.
+
+`draw_bits=None` (the default) follows `mols`, so simply omitting `mols` is already safe. In the
+structure-free mode a split box is a shaded rectangle carrying the bit id in monospace, and the
+subtitle reads "split boxes name the unhashed bit; no structures shown". `assert not (draw_bits and
+mols is None)` catches the opposite mistake.
+
+`Visualize_fingerprints.ipynb` uses the picture version legitimately: its logD set is PUBLIC
+(TDC Lipophilicity_AstraZeneca).
+
+**FP_preds section 3 now draws the structures — the USER's decision (2026-09-15).** They switched
+`draw_bits=True`, so the cell builds `MOL_UB = dict(zip(UB.compound, UB.smiles.map(
+Chem.MolFromSmiles)))` and passes it. The figure therefore contains INTERNAL structures. The CAUTION
+comment on the cell says to keep it on this machine and names the two ways back to the
+structure-free version. Claude did NOT run that cell: the edit was verified statically instead —
+the cell parses, and an AST read of the call confirms `mols=MOL_UB` (not None) and
+`draw_bits=True`, so the `assert not (draw_bits and mols is None)` cannot fire. Parsing is safe
+because `unhashed_morgan` reported 0 all-zero rows over all 2067 UB compounds, i.e. every SMILES
+parses, so no `mols[cpd]` is None.
+
+Verification is an assertion, not an eyeball: the harness checks the finished figure holds **zero
+`AnnotationBbox` and zero `AxesImage` artists** and fails loudly otherwise. Claude did not render or
+view this figure at any point.
+
+**Result, FP_preds section 3** (unhashed bits, radius 2, min_compounds 2 over all 2067 UB compounds
+-> 6359 bits found, **2476 kept**; radius split 35 / 632 / 1809). Labelled frame 148 compounds
+(62.2% hits — UB1 coverage, see the two-target section), section 2's folds reused after an
+`assert` that the compound sets match:
+
+| model | ROC-AUC | PR-AUC | MCC | F1 |
+|---|---|---|---|---|
+| depth-3 tree on UNHASHED bits | 0.918 | 0.951 | 0.713 | 0.891 |
+
+Confusion: TN 46, FP 10, FN 10, TP 82. The depth-3 tree grows to only **7 nodes / 4 leaves**, because
+`min_samples_leaf=20` against 148 labelled compounds stops it early — not a bug, and it makes the
+figure trivially readable.
+
+Bit filtering by `min_compounds` runs over the WHOLE library, not just the labelled rows. That is
+label-free (fingerprints are unsupervised), so it leaks nothing into the folds.
+
+### `nb_edit` can now convert a cell's kind (2026-09-15)
+
+`apply` carries `cell_type` across when it differs, fixing up `outputs` / `execution_count` so the
+JSON stays legal. Needed because the "## 3." header was followed by an EMPTY MARKDOWN cell, and the
+code had to go there. Tested on a throwaway notebook: a markdown placeholder became a code cell
+while a neighbouring cell kept its output.
+
+## ★ Unhashed Morgan code LIVES IN `Scripts/Rdkit_tools.py` (moved 2026-09-15)
+
+`unhashed_morgan`, `morgan_bit_info`, `draw_bit_on_molecule`, `plot_decision_tree_MF_bits` and the
+`BIT_COLORS` palette now sit next to their HASHED siblings (`get_MF_bits_from_df`,
+`compute_H236_features`, `compute_H237_features`), so all chemistry and depiction is one module.
+Call them as **`rdkit_tools.<name>`**, not `fn.<name>`. `python/functions.py` keeps only a pointer
+comment; it still owns the InChIKey / leak-control / round-trip helpers.
+
+`unhashed_morgan` now MIMICS `get_MF_bits_from_df`: positional `df_` with `|compound|smiles|`, and it
+returns the fingerprint frame `|compound|B<id>|...`. The bit index is opt-in via `return_bits=True`
+(the notebook uses it, to print the radius spread). One deliberate divergence: `get_MF_bits_from_df`
+DROPS an unparseable-SMILES row, `unhashed_morgan` returns an all-zero row instead — a silent drop
+de-aligns the matrix from its labels.
+
+Verified after the move: 4200 logD compounds -> 5957 bits (unchanged), `return_bits` tuple shapes
+(4200, 5958) + (15872, 5), the depth-3 figure identical, and `compute_H237_features` /
+`compute_H236_features` / `get_MF_bits_from_df` all still build (so `FP_preds.ipynb` is unaffected).
+
+`Scripts/docs/documentation.md` now carries the full reference — the function table, the five defects
+of the retired `get_unique_MFs_from_df` family, and the gotchas.
+
+**FIXED 2026-09-15: the `Rdkit_tools` half of the segfault is gone.** It used to import
+`rdkit.Chem.Draw` and `rdMolDraw2D` at module level, so `import Rdkit_tools; import seaborn` was
+fatal for every caller. `Draw` was referenced only in docstrings and `rdMolDraw2D` only inside
+`draw_bit_on_molecule`, so both module-level imports were removed and `rdMolDraw2D` is now imported
+inside that one function, with a CAUTION comment where the imports used to be. Verified:
+`import Rdkit_tools; import seaborn` is clean 3/3, `draw_bit_on_molecule` still renders with
+Rdkit_tools imported FIRST, and the Scripts suite is unchanged (181 tests, the same 3 pre-existing
+failures, 4 skipped, 4 expected failures, 1 unexpected success).
+
+STILL LIVE: a notebook that writes `from rdkit.Chem import Draw` itself must keep that line AFTER
+`import seaborn` — see the landmine section above. Only the library's half is fixed.
+
+## UNHASHED Morgan fingerprints — `fn.unhashed_morgan` (2026-09-15, `vignettes/Visualize_fingerprints.ipynb`)
+
+New workstream: make a decision tree's splits INTERPRETABLE by mapping each split back to the atom
+environment it tests. Hashed H237 bits cannot do this (collisions), so the notebook builds UNHASHED
+Morgan bits, where one column IS one environment. Target for the walk-through is PUBLIC logD 7.4.
+
+**Data (cell a02ec8a5).** `autoresearch/predict_adme/public_logd.parquet` via
+`params.ADME_CACHE` + `params.ENDPOINT_PUBLIC_FILES['logd'][0]`: 4200 compounds, one origin
+`TDC:Lipophilicity_AstraZeneca`, logD -1.50 to 4.50 (mean 2.19, sd 1.20), no nulls, all SMILES parse.
+Only `compound/smiles/value/origin` are read — that parquet also carries 4470 pre-built HASHED H237
+columns, which are the wrong kind here.
+
+**The old code was incomplete — measured, not assumed.** `Rdkit_tools.get_unique_MFs_from_df` and its
+helpers `get_all_bits` / `draw_unique_MFs` / `get_colinear_features` had the right core
+(`AllChem.GetMorganFingerprint(..., bitInfo=info)`) but five defects, shown on public molecules:
+
+1. `MF[MF['r'] == r]` kept only bits whose FIRST-SEEN radius equalled r, discarding radius 0 and 1 —
+   **59 unique bits in, 6 out** on 6 molecules.
+2. It silently dropped molecules with no bit at that radius (ethanol vanished; 6 in, 5 pivoted rows).
+3. `bit_info` was populated ONLY with `drawBits=True` (0 vs 59 entries), and held just the first
+   molecule per bit — so the bit->atom map, the whole point, was off by default.
+4. Dedup compared only ADJACENT columns after sorting: identical `F0`/`F3` -> flagged nothing;
+   the same pair made adjacent -> correctly flagged.
+5. It returned the tall-skinny frame; the pivoted matrix was built internally and thrown away.
+Minor: `draw_unique_MFs` has a bare string where a `print` was meant, so its DANGER path returns
+None in silence; `drawMol` is accepted and unused; several bare `except:`.
+
+**Replacement: `python/functions.py`.**
+- `unhashed_morgan(df, radius=2, keep_radii=None, min_compounds=2, dedup=True)` -> `(X, bits)`.
+  `X` is `|compound|B<id>|...` int8, ONE ROW PER INPUT ROW (an unparseable SMILES gives an all-zero
+  row, never a dropped row). `bits` is `|bit|radius|n_compounds|kept|duplicate_of|` for every bit
+  found before filtering, so an absorbed duplicate names the column that took it over.
+- `morgan_bit_info(mol, radius=2)` -> `{bit: ((atom_idx, radius), ...)}` for ANY molecule, which
+  feeds `Draw.DrawMorganBit(mol, bit, info)` directly.
+- Both go through `_bit_info_map(gen, mol)`, which uses **`rdFingerprintGenerator.GetMorganGenerator`
+  + `GetSparseFingerprint(additionalOutput=ao)`**, not the retired `AllChem.GetMorganFingerprint`.
+  RDKit 2025.09.3 prints `DEPRECATION WARNING: please use MorganGenerator` once per molecule from the
+  old call, which floods a 4200-compound run. `GetSparseFingerprint` IS the unhashed fingerprint:
+  bit ids and atom environments verified identical to the old call on public molecules, and every
+  logD number below is unchanged after the switch. The generator is built once per call, not per
+  molecule. `Draw.DrawMorganBit` / `DrawMorganEnv` accept the new map and emit no warning.
+- **Column names keep RDKit's raw bit id (`B<id>`).** The old code renumbered to F0..Fn, which
+  destroys bit identity across datasets. Never renumber.
+
+**On the 4200 logD compounds (cell 01e07fa0):** 15,872 bits found; at `min_compounds=2` and dedup,
+**5957 kept** (radius 0/1/2 = 45 / 1233 / 4679), 1999 absorbed as duplicates, 7916 dropped as rare.
+25 MB, 3.7 s, 0 all-zero rows, median 46 bits per compound. `min_compounds` trades width for
+coverage: 1 -> 8092 bits / 34 MB, 10 -> 2071 / 8.7 MB, 25 -> 1029 / 4.3 MB.
+
+**Step 3 — classification on the unhashed bits (cell 38488032, 2026-09-15).** Binarize logD at
+**LOGD_HI = 3.0** (the medchem "too lipophilic" line; 2.36, the median, is the balanced
+alternative): **1163 high / 3037 low (27.7%)**. Folds and model copy FP_preds exactly —
+`StratifiedGroupKFold` on skeleton InChIKey, and one `DecisionTreeClassifier(**TREE_KW)` where
+`TREE_KW = champion minus n_estimators`.
+
+| metric | value |
+|---|---|
+| ROC-AUC | 0.73 |
+| PR-AUC | 0.54 |
+| MCC | 0.305 |
+| F1 | 0.48 |
+| accuracy | 0.73 |
+| balanced accuracy | 0.644 |
+| recall / precision | 0.442 / 0.524 |
+
+Confusion: TN 2571, FP 466, FN 649, TP 514.
+
+**This is a genuinely HARD task, unlike the UBR2 hit call — and that is the useful contrast.**
+Plain accuracy 0.73 barely clears the **0.723 majority-class** bar, so read MCC (0.305) and balanced
+accuracy (0.644) instead. Recall is only 0.44: the tree misses more lipophilic compounds than it
+finds. A label shuffle returns ROC-AUC **0.500**, so the signal is real but weak. logD is a
+whole-molecule property, and a single tree on sparse substructure bits is the wrong shape of model
+for it — which is exactly why it makes a good interpretability subject: the tree has real, non-
+trivial structure to inspect, instead of the one dominant bit that UBR2 collapsed onto.
+
+The tree emits **69 distinct probabilities** here (vs 5 on UBR2), so its ROC curve has usable
+resolution for once.
+
+**Step 4 is now ONE LINE (trimmed 2026-09-15).** Cell 5 referenced exactly one name from it —
+`FEAT_logd`, the bit-column list — so cell 4 is just that, and `plot_decision_tree_MF_bits`
+re-derives the same list internally anyway. The exploration that used to live there (`splits_logd`,
+`parent_logd`, `leaf_tests`, the single-bit `DrawMorganBit` demo) was removed at the user's request;
+what it FOUND is recorded below and stays true.
+
+*Superseded description of the old cell 4:* `ML_Class` returns only the LAST
+fold's model and fits on `.to_numpy()`, so bit names are lost there; step 4 therefore fits ONE tree
+on all 4200 rows with the same `TREE_KW`, keeping `FEAT_logd` as the column list.
+
+- `splits_logd`: `node | bit | n_samples | radius | n_compounds`, one row per internal node, joined
+  to `bits_logd`. **388 split nodes testing 309 distinct bits.**
+- `leaf_tests(node, parent, tree, feat)`: the root-to-node path as `[(bit id, must be PRESENT), ...]`.
+  Every split threshold is **0.5** (the columns are 0/1), so LEFT = bit absent, RIGHT = bit present.
+- `parent_logd`: child -> (parent, side), built once and reused per leaf.
+- Placement verified: `fn.morgan_bit_info(mol, MF_RADIUS)` -> `Draw.DrawMorganBit(mol, bit, info)`
+  returns a valid depiction (blue central atom, yellow neighbours, dashed bonds + `*` for the
+  attachment points).
+
+CAUTION: `Draw.DrawMorganBit(..., useSVG=True)` returns **different types by environment** — an
+IPython `SVG` object inside Jupyter, a plain `str` in a headless process. Wrapping it in
+`SVG(...)` therefore raises `TypeError: a bytes-like object is required, not 'SVG'` in the notebook
+while working fine in a script. The cell handles both:
+`_svg = Draw.DrawMorganBit(...); display(_svg if hasattr(_svg, 'data') else SVG(_svg))`.
+A headless subprocess CANNOT reproduce the Jupyter branch: `from rdkit.Chem.Draw import
+IPythonConsole`, and even `from IPython.display import SVG` next to rdkit, SEGFAULT in this env.
+Test such branches with a stub object carrying `.data`, and treat any display-path check done
+headless as unverified.
+
+Tree at champion knobs: **777 nodes, 389 leaves, depth 20, 309 bits used.**
+
+**★ The depth-20 tree is the wrong tree to visualize, and the reason is structural.** Its biggest
+leaf (node 515, 537 compounds, P(logD>3) = 0.09) is defined by **20 tests of which only 1 is
+PRESENT** — the other 19 are absences. An absence names no substructure, so there is nothing to
+highlight for it. Deep trees define leaves mostly by what a molecule LACKS. A depth-4 tree gives 23
+nodes / 12 leaves / 11 bits and leaves defined by a handful of tests, which is what the interactive
+plot needs. The cell prints the PRESENT count per leaf so this is visible rather than surprising.
+
+OPEN for step 5: `Draw.DrawMorganBit` crops to the environment fragment. To show a bit's LOCATION on
+the whole structure (the user's actual ask) use `Chem.FindAtomEnvironmentOfRadiusN` + `rdMolDraw2D`
+with `highlightAtoms`, the approach the retired `draw_unique_MFs` used. Import cell now also carries
+`Draw` and `SVG`.
+
+CAUTION: `Visualize_fingerprints.ipynb` has NO `globals().update(...)` shim, unlike
+`FP_preds.ipynb` — config is reached as `params.RF_SINGLETASK`, `params.SERAC_C`. Its import cell
+also now carries `importlib.reload(fn)`, because `%autoreload` did not add a newly created
+module-level helper (`_bit_info_map`) to the already-imported module, which raised a NameError from
+inside a reloaded function.
+
+**The four old functions are REMOVED from `Scripts/Rdkit_tools.py`** (user asked, 2026-09-15, for
+module separation): 198 lines replaced by a 10-line pointer to the new home. Verified no caller
+existed in any of the 7 repos or any notebook. `compute_H237_features` / `compute_H236_features` are
+untouched and still build (the FP_preds path is unaffected). `Rdkit_tools.py` was clean in git, so
+`git checkout -- Rdkit_tools.py` in `../Scripts` reverts it.
+
+CAUTION: `python -m unittest discover -s tests` — the command CLAUDE.md documents — collects
+**0 tests**. 8 of 10 test files use plain `def test_*()` functions, which `unittest` does not
+collect; only `test_chemprop_systematic` and `test_rf_systematic` use `unittest.TestCase`, and both
+error at setUp because the 2026-09-08 lean-config pass removed `CHEMPROP_SYSTEMATIC` and
+`features_type`, which those retired runners still read. So the suite currently verifies nothing.
+Pre-existing, unrelated to this change, but it means notebook/probe checks are the only real
+verification today.
+
+## Notebook editing — `python/nb_edit.py`, never clear the live notebook (2026-09-15)
+
+The user's notebook outputs are their record of a run and are NOT recoverable (FP_preds.ipynb is
+untracked, so git cannot restore them). Claude destroyed some on 2026-09-15 by running
+`jupyter nbconvert --clear-output --inplace` on the live file. That approach is now banned.
+
+`python/nb_edit.py` replaces it with a scratch-copy workflow:
+
+| command | effect |
+|---|---|
+| `nb_edit.py checkout <nb>.ipynb` | copies to `<nb>.claude.ipynb` and clears the COPY only |
+| `nb_edit.py cells <nb>` | lists index / id / first source line, reads no output |
+| `nb_edit.py apply <nb>.ipynb --cell <id>` | writes ONLY the named cells' SOURCE back to the live file |
+| `nb_edit.py apply <nb>.ipynb --all` | every differing cell — UNSAFE mid-session, see below |
+
+`apply` matches cells by **id**, not index, so a cell the user inserts mid-session cannot cause a
+mis-targeted edit — which is exactly what went wrong earlier that day (matching on `IC50_CAP` hit
+the regression cell instead of the user's new classification cell). Only an edited cell loses its
+own outputs, which are stale once the source changes; every other cell keeps its outputs.
+
+**Always `--cell <id>`, never `--all`.** `--all` pushes every cell whose source differs, so a cell
+the user edits in the LIVE notebook after the checkout gets overwritten with the stale copy. Name
+the ids you actually changed. Sequence: checkout, edit, apply those ids, delete the copy.
+
+**Conflict guard.** `checkout` records each cell's source hash in the copy's metadata, and `apply`
+refuses to write any cell whose live source changed since then (exit 1, nothing written; `--force`
+overrides). Verified 2026-09-15 on three cases: the user editing a DIFFERENT cell applies fine; the
+user editing the SAME cell is refused and their edit survives; the user merely RE-RUNNING cells
+applies fine and every untouched cell keeps its fresh outputs. So the user does not have to stop
+working — only the specific cell Claude is rewriting is off limits between checkout and apply.
+
+`*.claude.ipynb` is in `.gitignore`. Do not leave a scratch copy lying around — check out fresh at
+edit time (`--force` refreshes), so `apply` can never push stale source. The same rule is in the
+Data Privacy section of all 7 sibling `CLAUDE.md` files; the helper itself lives only here.
+
+CAUTION: `apply` rewrites the live notebook. Ask the user to close it in Jupyter first, or the
+editor may save its in-memory copy over the change.
+
+## UBR2 FP IC50 — first RF baseline (2026-09-14, `vignettes/FP_preds.ipynb` cells 6-7)
+
+New workstream, separate from ADME: potency regression on the UBR2 fluorescence-polarisation assay
+(`data/FP/20260914_UBR2.csv`, a UBR1 file sits next to it). Not an ADME endpoint, so it does **not**
+go through `ADME_build_ML.py`; the notebook calls `Rdkit_tools.compute_H237_features` and
+`ML_Reg.run_K_Fold_Xval_Regression` directly.
+
+**Data shape.** The CSV holds 2776 per-measurement rows but only 2067 unique compounds, so a
+`groupby('compound').first()` collapse is mandatory. 29 compounds carry more than one distinct
+geomean; `.first()` takes one, as `df_all` does elsewhere in this repo.
+
+**Censoring decision (revised 2026-09-15, user's call).** The geomean IC50 column is a STRING: 1739
+exact, 1031 right-censored `>`, 6 left-censored `<`. The `>` bounds are NOT all at one ceiling — they
+run from 4.3 to 62.4 uM, clustering near 50-54. Convention: **strip the prefix, keep the bound as its
+numeric value, then clip at a cap.** So `>9.43` becomes 9.43, and anything above the cap becomes the
+cap. Cap = **100 uM** (`IC50_CAP` in the notebook cell; move it to `config/config.yaml` once the
+workstream settles). On this file the cap binds **nothing** (max value 62.4), so it is a guard for
+later files only. Label space is **raw uM**, not log10 and not pIC50 (deliberate; differs from the
+ADME `_TF` log10 convention).
+
+*Superseded:* the first pass (2026-09-14) mapped every `>` row to a flat 100 uM. That discarded the
+information in the bound and invented a 62-to-100 gap with no compounds in it. It inflated RMSE
+(17.45 vs 7.85) and wrecked calibration on the exact subset (R²det -5.69 vs -0.41). Do not go back
+to it.
+
+**Baseline result (2026-09-15).** H237 (4469 features, 4035 after the all-zero drop), RF champion
+params from `RF_SINGLETASK.champion`, 5 folds, n=2067:
+
+| subset | n | RMSE (uM) | MAE | R²det | R² | Spearman |
+|---|---|---|---|---|---|---|
+| all compounds | 2067 | 7.85 | 3.68 | **0.904** | 0.904 | 0.905 |
+| exact IC50 only | 1209 | 7.80 | 2.90 | **-0.409** | 0.558 | 0.728 |
+| censored (`>`) only | 858 | 7.91 | 4.76 | **-1.046** | 0.264 | 0.477 |
+
+**The headline 0.904 still rests on the weak/strong split, not on potency resolution.** Conditioned
+on the compounds with a real IC50 the model remains mis-calibrated (R²det negative) and ranks
+moderately (rho 0.73). Both conditional subsets score worse than the pooled number, which is the
+signature of a model that separates two clouds well and resolves within neither. Read the pooled
+metric as a classification proxy. Next step if this workstream continues: model in log10/pIC50
+space, or split into a hit classifier plus a potency regressor on the exact rows.
+
+**★ TWO TARGETS — UB1 and UB2, selected by `UB_N` (2026-09-15, user's pattern).**
+`data/FP/20260914_U1.csv` joined alongside U2. The loader cell (95d68fe6) renames each file's IC50
+column to `ic50_raw_UB1` / `ic50_raw_UB2` and left-joins into one `UB` frame on compound+smiles;
+both sections then pick a target with `UB_N = '_UB1' | '_UB2'`. Downstream names lost the `2`
+(`H237_UB`, `ML_UB`, `pred_UB`, `ML_UB_clf`, `clf_UB`, `roc_UB`). U1's IC50 column was renamed to
+plain `IC50` in the CSV, which is what the loader's rename expects.
+
+**Coverage is very lopsided.** UB2 labels 2067 of 2067 compounds; **UB1 labels only 148** (150 rows,
+2 collapse on compound). All 150 UB1 compounds match into UB2 and every shared SMILES agrees, so
+the left join loses nothing. Censoring: UB1 is 139 exact + 11 `>`; UB2 is 1207 exact + 858 `>` + 2 `<`.
+
+**★ Bug the second target exposed: unmeasured compounds became confirmed non-hits.**
+`(_ic50 < HIT_UM)` returns **False**, not NA, for a NaN IC50. With UB2 that was invisible (every row
+had a label). With UB1 it silently labelled **1919 unmeasured compounds as non-hits** — a poisoned
+training set. The classification cell now masks on `_ic50.isna()` as well as on the undecidable `>`
+rows. The regression cell never had this, because `dropna(subset=['label'])` removes NaN labels
+there. Check this whenever a new target with partial coverage is added.
+
+| target | cutoff | n | hits | non-hits | accuracy | F1 | ROC-AUC | PR-AUC |
+|---|---|---|---|---|---|---|---|---|
+| UB1 | 10 uM | 148 | 99 | 49 | 0.90 | 0.93 | 0.89 | 0.95 |
+| UB2 | 10 uM | 2063 | 1123 | 940 | 0.94 | 0.94 | 0.95 | 0.97 |
+| UB1 | 1 uM | 148 | **15** | 133 | — | — | — | unusable |
+
+UB1 at a **1 uM cutoff leaves 15 hits** — 3 per fold. It still runs (7 TP against 8 FN, no better
+than chance on the positives) and the fold assert does NOT catch it, because 15 clears the
+one-per-fold minimum. The assert only guards the hard sklearn failure; read the printed class counts
+to judge whether n is usable. **Use the 10 uM cutoff for UB1**; 1 uM is viable for UB2 only.
+
+UB1 at 10 uM reaches accuracy 0.90 on 148 compounds, which is encouraging but rests on 49 non-hits.
+Do not compare its numbers with UB2's without noting the 14x difference in n.
+
+**Single decision tree vs the RF champion (2026-09-15, hit cutoff 1 uM, n=2067, 942 hits).**
+Asked whether the predictive power needs 200 trees. It mostly does not.
+
+| model | ROC-AUC skel / Butina | PR-AUC skel / Butina | MCC skel / Butina | F1 skel / Butina | distinct probas |
+|---|---|---|---|---|---|
+| RF champion (200 trees) | 0.987 / 0.986 | 0.981 / 0.981 | **0.905** / 0.898 | 0.948 / 0.945 | 787 |
+| DecisionTree, champion knobs | 0.949 / 0.936 | 0.956 / 0.947 | 0.877 / 0.862 | 0.934 / 0.925 | 5 |
+| DecisionTree, all features | 0.946 / 0.941 | 0.951 / 0.947 | 0.875 / 0.870 | 0.933 / 0.929 | 5 |
+| DecisionTree, default (no cap) | 0.939 / 0.929 | 0.947 / 0.942 | 0.877 / 0.859 | 0.934 / 0.923 | 2 |
+| **DecisionTree, max_depth=5** | 0.958 / 0.957 | 0.881 / 0.902 | **0.883** / 0.861 | 0.937 / 0.923 | 35 |
+
+**MCC costs only ~0.025 and F1 ~0.014 when 200 trees become 1.** The ROC-AUC gap (0.99 -> 0.94-0.96)
+is largely an ARTEFACT: a lone tree emits 2-5 distinct probabilities, so its ROC curve is a coarse
+staircase with almost no ranking resolution. Judge a single tree on MCC/F1, not ROC-AUC. The
+notebook cell now runs `DecisionTreeClassifier(**TREE_KW, ...)` where
+`TREE_KW = champion minus n_estimators` (`n_estimators`/`n_jobs` are RF-only); the RF line sits
+commented above it for a one-line flip back.
+
+**★ A depth-5 tree reaches MCC 0.883 — the best MCC of any tree tested, beating the deep ones.**
+39 nodes, and only **19 of 4469 features** carry any importance, with a single fingerprint bit
+holding **0.85** of the total. The hit/non-hit signal is concentrated in a handful of features, not
+distributed. That explains every earlier "too good to be true" number: this is an easy, nearly
+rule-shaped classification task on a congeneric library, which is also why it survived
+cluster-grouped folds and a label shuffle. Feature identity was NOT decoded to substructures (user
+instruction, 2026-09-15: no structure inspection) — decode locally if it matters.
+
+Practical read: keep the RF for the deployable model, since it ranks (787 distinct probabilities vs
+5) and a calibrated probability is what a triage cell needs. Use the depth-5 tree as the
+explanation of WHY the model works, not as the model.
+
+**★ LEAKAGE AUDIT — no material leakage, but the 0.90 is NOT a potency result (2026-09-15).**
+Prompted by how good the numbers looked. Five checks; the model is clean, the METRIC is not.
+
+1. *Imputation.* H237 has **0 NaN cells** here, so the pre-split `fillna(mean)` inside both CV
+   helpers never fires. No leakage path.
+2. *Exact twins.* 2067 names -> **2065 exact InChIKeys**; only 2 groups (4 compounds) are true
+   duplicates, and they disagree on the label anyway.
+3. *Skeleton twins.* 2067 names -> **1943 skeleton InChIKeys**: 100 groups covering **224 compounds**
+   are salts / stereoisomers / tautomers of one connectivity, split across random folds. Regrouping
+   the folds by skeleton InChIKey changes nothing: R²det 0.903 -> **0.904**.
+4. *Analog optimism.* Median nearest-neighbour Tanimoto from a test compound to its own train block
+   is **0.706**; 11% of test compounds have a train neighbour >= 0.90 and **190 (9.2%) >= 0.99**. It
+   is a congeneric library. Butina cluster folds (T=0.6, 838 clusters, largest 130) cost only
+   **0.012**: R²det 0.903 -> **0.891**. On the exact-IC50 subset the cost is larger but still small
+   (R²det -0.438 -> -0.684, rho 0.732 -> 0.642).
+5. *Confidence.* Already leakage-controlled by `apply_confidences_lofo`.
+
+| fold definition | n | RMSE (uM) | R²det | rho | exact-only R²det | exact-only rho |
+|---|---|---|---|---|---|---|
+| random by NAME (reported) | 2067 | 7.87 | 0.903 | 0.906 | -0.438 | 0.732 |
+| grouped by skeleton InChIKey | 2067 | 7.84 | 0.904 | 0.906 | -0.470 | 0.737 |
+| grouped by Butina cluster T=0.6 | 2067 | 8.37 | 0.891 | 0.882 | -0.684 | 0.642 |
+
+**The real problem is the metric, not the split.** The label is bimodal — exact compounds average
+**2.3 uM**, censored compounds average **52.1 uM**, and the pooled std is 25.29 uM. So an ORACLE that
+knows nothing but the censored/active flag, and predicts each group's train mean, scores
+
+| predictor | R²det |
+|---|---|
+| global train mean | -0.000 |
+| **oracle: censored-flag group mean** | **+0.941** |
+| our RF, cluster-grouped folds | +0.891 |
+| our RF, random name folds | +0.903 |
+
+**The RF scores BELOW a two-class oracle.** Every bit of the 0.90 is hit/non-hit separation; the
+model adds nothing on top of knowing which side a compound falls. R² on a bimodal label is a
+classification score in a regression costume. **Never quote the pooled R²det for this assay.**
+
+What IS real and worth keeping: rank correlation among the exact-IC50 compounds (rho 0.64 under
+cluster folds, 0.74 under random folds), and the confidence, which separates error 6x WITHIN the
+exact subset. Correct framing for this workstream: report a hit/non-hit classifier (AUC / PR-AUC)
+plus a potency regressor trained on the 1209 exact rows, scored in log10 space. Do not report the
+pooled regression.
+
+**★ CLASSIFICATION REFRAME — this is the right way to model this assay (2026-09-15).**
+Acting on the audit above: binarize at a potency cutoff and classify, instead of regressing a
+bimodal label. The notebook now holds BOTH sections: `## 1. Regression` (cell 9 label+CV, cell 10
+conf panel) and `## 2. Classification` (cell 12). The classification cell reuses `H237_UB2` from
+cell 9 and writes a separate `UB2['hit']` column with `_clf`-suffixed outputs, so running section 2
+never clobbers section 1's `label`, `pred_UB2` or `metrics_UB2`.
+
+Label: `hit = geomean IC50 < HIT_UM`, with **HIT_UM = 10 uM** (a notebook variable; move it to
+`config/config.yaml` once settled). Balance at 10 uM is **1127 hits / 940 non-hits (54.5%)** — no
+class-imbalance handling needed. At 1 uM it would be 942 (45.6%), also usable.
+
+**Censoring makes 4 compounds undecidable.** A `>9.43` row clips to 9.43 and would read as a hit, but
+its true IC50 may sit either side of 10 uM. The cell masks those out with
+`.astype('boolean').mask(...)` and drops them, leaving **n=2063**. CAUTION: a plain `bool` column
+cannot hold `pd.NA` in pandas 2.x — the nullable `'boolean'` dtype is required. Re-check this count
+whenever HIT_UM changes; at a higher cutoff many more `>` rows become undecidable.
+
+Folds: `StratifiedGroupKFold` on **skeleton InChIKey** groups (honours `FOLD_GROUP_BY_INCHIKEY`) —
+verified 0 groups straddle a split, and the hit rate holds at 0.545 in every fold. Runner is
+`ML_Class.K_fold_by_defined_IDs_Classification`, which already emits a `fold` column.
+
+| fold definition | n | ROC-AUC | PR-AUC | MCC | F1 |
+|---|---|---|---|---|---|
+| random by NAME | 2063 | 0.992 | 0.994 | 0.926 | 0.966 |
+| **skeleton InChIKey (the cell)** | 2063 | **0.991** | **0.993** | **0.916** | **0.961** |
+| Butina cluster T=0.6 | 2063 | 0.991 | 0.993 | 0.910 | 0.958 |
+
+Confusion at the 0.5 probability cut (skeleton folds): TN 908, FP 32, FN 54, TP 1069.
+
+**Unlike the regression, this result is real.** Cluster-grouped folds cost **0.001** ROC-AUC and
+0.006 MCC, so it is not analog memorisation. Majority-class accuracy is 0.544 against the model's
+0.96, so the gain is large. A label-shuffle control returns ROC-AUC **0.488**, confirming no
+pipeline leak. The earlier conclusion stands and is now quantified: the chemistry supports a strong
+**hit / non-hit** call and a weak potency ranking. Report ROC-AUC / PR-AUC / MCC for this assay.
+
+OPEN: the `conf_recal` panel (cell 9) is REGRESSION-only — it needs `uq_std` and a numeric residual,
+which the classification `pred_df` (`compound, fold, real_y, pred_y, probas`) does not carry. The
+classification counterparts already in `ML_Class` are `get_PPV_vs_proba` and `plot_roc_curve`.
+
+**CV function — use `K_fold_by_defined_IDs`, not `run_K_Fold_Xval_Regression` (2026-09-15).** Only the
+former records a per-row `fold` column, and without it `apply_confidences_lofo` returns None, so the
+confidence calibration has to fall back to an in-sample fit. Build the folds with
+`ML_Reg.get_validation_sets(ML_UB2['compound'].tolist())`. The swap changed nothing measurable
+(RMSE 7.85 -> 7.87, R²det 0.904 -> 0.903), and it also drops the ndarray gotcha noted below.
+CAUTION: `get_validation_sets` hardcodes `n_splits=5` and silently ignores its `folds` argument.
+
+**Confidence calibration — `conf_recal` transfers to this assay (2026-09-15).** Same recipe as the
+deployed ADME endpoints: `calibrate_confidence_params` on the CV arm, then
+`apply_confidences_lofo` so each fold is scored by a fit on the other four. Result:
+`rmse_cv = 7.87 uM`, `label_std = 25.29 uM`, fit `|resid| ~ -0.76 + 0.80 * uq_std`.
+
+The tree spread is an unusually strong error predictor here — Spearman **0.903** between `uq_std`
+and `|residual|`, well above what the ADME endpoints show. All four `conf_*` variants rank almost
+identically (spearman vs `|resid|`: labelstd -0.903, rmse -0.903, conformal -0.896, recal -0.889),
+so the choice of variant is about the SCALE it reports, not about ranking power.
+
+Panel: `vignettes/FP_preds.ipynb` cell 9 reuses the SAME single-panel style as
+`Multitask_adme_preds.ipynb` cell 17 (scatter + 5-bin mean trend + the webapp 0.5 split with a
+per-half RMSE box), so UBR2 reads directly against the 8 ADME panels. Split at 0.5:
+
+| side of split | n | RMSE (uM) |
+|---|---|---|
+| left, least confident | 605 | 13.76 |
+| right, most confident | 1462 | 3.05 |
+
+A **4.5x** RMSE separation across the split, rho **-0.89**, and the 5-bin trend falls monotonically
+17.0 -> 8.6 -> 3.9 -> 1.8 -> 0.4 uM. Part of that width comes from the bimodal label (see the audit
+below), but the signal SURVIVES inside each class, so it is real: cluster-grouped folds give rho
+-0.811 on the exact-IC50 compounds alone (RMSE 17.71 left of the split vs 2.77 right, n=257/952) and
+-0.781 on the censored compounds alone. The confidence machinery transfers to this assay unchanged.
+
+Reliability by `conf_recal` decile (expected error = `-ln(conf) * rmse_cv`):
+
+| conf_recal bin | n | mean conf | expected err (uM) | observed err (uM) |
+|---|---|---|---|---|
+| 0.098-0.211 | 207 | 0.159 | 14.46 | 16.71 |
+| 0.211-0.351 | 207 | 0.276 | 10.12 | 9.51 |
+| 0.351-0.510 | 206 | 0.433 | 6.59 | 4.42 |
+| 0.510-0.650 | 207 | 0.583 | 4.24 | 2.66 |
+| 0.650-0.809 | 207 | 0.732 | 2.45 | 1.62 |
+| 0.809-0.970 | 206 | 0.888 | 0.94 | 0.94 |
+| 0.970-1.000 | 827 | 0.999 | 0.01 | 0.30 |
+
+Conservative through the middle (it promises 6.6 uM and delivers 4.4), slightly optimistic in the
+worst decile, and structurally broken at the top.
+
+**★ The saturation problem — 37% of the library gets conf_recal = 1.0.** `recal_a` is NEGATIVE
+(-0.76), so `sigma_hat = clip(a + b*std, 0, None)` hits exactly 0 for any compound whose trees agree
+within **0.94 uM**, giving `conf = exp(0) = 1.0`. That is **769 of 2067 compounds (37.2%)**. Their
+mean error really is small (0.22 uM), but the worst of them is off by **26.7 uM** — so a displayed
+confidence of 1.0 is not a guarantee, and the top decile loses all ability to rank. Only 7 of 10
+requested deciles survive `qcut` because of the tie mass.
+
+Root cause is a code/doc mismatch in `ML_Reg.calibrate_confidence_params`: the docstring and the
+inline comment both say *"nonneg least-squares fit |resid| ~ a + b*std"*, but the code runs an
+unconstrained `np.polyfit(s, resid, 1)`. Non-negativity is imposed later on the PREDICTION inside
+`apply_confidences`, never on the coefficients. A true NNLS fit (`scipy.optimize.nnls`) would keep
+`a >= 0` and remove the saturation. `ML_Reg.py` lives in `../Scripts`, a DIFFERENT repo — do not
+edit it from here; raise it there. This affects the deployed ADME confidences too wherever
+`recal_a` came out negative — worth auditing the stored calibrations.
+
+**Gotcha in `ML_Reg.run_K_Fold_Xval_Regression`.** The returned `pred_df[ID]` column holds 1-element
+numpy arrays, not scalars (`ID_name = np.array(features_df[[ID]])` keeps 2 dims). Any downstream
+merge on that column raises `TypeError: unhashable type: 'numpy.ndarray'`. Flatten first:
+`pred_df['compound'] = pred_df['compound'].map(lambda a: a[0])`.

@@ -40,3 +40,6 @@ meeko==0.7.1        # docking prep (unused in the modelling sections; top-cell i
 gemmi==0.7.4        # meeko runtime dependency (install explicitly if meeko used --no-deps)
 python-pptx==1.0.2   # datasets/publication slides (python/make_datasets_slide.py)
 lightgbm==4.7.0     # fast gradient-boosted trees; model-family speed/accuracy benchmark (python/bench_models_transfer.py)
+ipywidgets==8.1.9   # interactive decision-tree / fingerprint viewer (vignettes/Visualize_fingerprints.ipynb).
+                    # Runs fully offline. CAUTION: also needs installing where the JUPYTER SERVER runs,
+                    # not only in the kernel env, or the widgets render blank.

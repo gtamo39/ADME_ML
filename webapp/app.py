@@ -41,6 +41,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from rdkit import Chem
+from rdkit.Chem import AllChem
 from rdkit.Chem.Draw import rdMolDraw2D
 
 import ML_Reg
@@ -86,6 +87,7 @@ CP_VALUES = {}          # endpoint -> {checkpoint, tasks, descriptor_cols, trans
 EXTRAS = {}             # key -> {model, feature_cols, pos_idx, label, unit, threshold, model_id} (extra columns)
 _FEATURIZE = None       # H236 featurizer (built once at startup)
 _LAST_CSV = None        # flat DataFrame of the most recent prediction run (for /api/download)
+_LAST_BLOCKS = None     # original SDF record per row of _LAST_CSV, or None when the input was a csv
 
 
 # ---------- startup: discover + load the champions ----------
@@ -245,19 +247,45 @@ def _is_favorable(raw, cutoff, sign):
            raw > cutoff if sign == ">" else raw < cutoff)
 
 
+def _read_sdf_keep_blocks(path):
+    """Read an SDF into df[compound, smiles] AND the untouched text of each record it kept.
+
+    mltrail's reader SKIPS records RDKit cannot parse, so the surviving rows no longer line up with
+    the file's record order. Re-splitting the file separately would therefore attach a prediction to
+    the wrong molecule. This parses and splits in ONE pass, so the returned blocks are aligned to the
+    returned rows by construction. Each block is the original text verbatim, up to and including
+    'M  END' plus any data fields — the export re-emits it byte for byte.
+    """
+    text = Path(path).read_text(errors="replace")
+    ids, smiles, blocks = [], [], []
+    for i, record in enumerate(text.split("$$$$")):
+        # every record after the first inherits the separator's newline; a leading blank line shifts
+        # the molblock header (title/program/comment/counts) and RDKit then fails to parse it
+        record = record.lstrip("\n")
+        if not record.strip():
+            continue
+        mol = Chem.MolFromMolBlock(record)              # same parse+sanitize as SDMolSupplier
+        if mol is None:
+            continue                                    # mirrors mltrail's skip rule
+        ids.append(mol.GetProp("_Name") if mol.HasProp("_Name") and mol.GetProp("_Name") else i)
+        smiles.append(Chem.MolToSmiles(mol))
+        blocks.append(record)
+    return pd.DataFrame({"compound": ids, "smiles": smiles}), blocks
+
+
 def _read_upload(path, filename):
-    """Read one dropped file into df[compound, smiles], auto-detecting the columns (csv) or
-    deriving SMILES from structure (sdf). SDF uses the molecule title (_Name) as compound id."""
+    """Read one dropped file into (df[compound, smiles], sdf_blocks). blocks is None for a csv:
+    there is no original record to preserve, so the SDF export builds one from the SMILES."""
     ext = Path(filename).suffix.lower()
     if ext == ".sdf":
-        return read_dataset(path, compound_id="_Name")
+        return _read_sdf_keep_blocks(path)
     head = pd.read_csv(path, nrows=0)
     cols = list(head.columns)
     smi_col = next((c for c in cols if "smiles" in c.lower()), None)
     if smi_col is None:
         raise HTTPException(400, f"{filename}: no SMILES column found (looked for a name containing 'smiles')")
     id_col = next((c for c in cols if any(k in c.lower() for k in ("compound", "_id", "id", "name"))), None)
-    return read_dataset(path, smiles_column=smi_col, compound_id=id_col)
+    return read_dataset(path, smiles_column=smi_col, compound_id=id_col), None
 
 
 def _predict_all(df):
@@ -421,18 +449,21 @@ async def predict(files: list[UploadFile] = File(...)):
     every chemprop endpoint is its own CLI subprocess — and the browser draws a real progress bar
     from these lines. An error mid-run arrives as a final {"error": "..."} line.
     """
-    frames = []
+    frames, blocks = [], []
     for uf in files:
         staged = STAGE_DIR / f"{uuid.uuid4().hex}{Path(uf.filename).suffix.lower()}"
         staged.write_bytes(await uf.read())
         try:
-            frames.append(_read_upload(str(staged), uf.filename))
+            frame, blk = _read_upload(str(staged), uf.filename)
         finally:
             staged.unlink(missing_ok=True)
+        frames.append(frame)
+        # a csv contributes no original record; pad so `blocks` stays aligned with the concat
+        blocks += blk if blk is not None else [None] * len(frame)
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["compound", "smiles"])
 
     def stream():
-        global _LAST_CSV
+        global _LAST_CSV, _LAST_BLOCKS
         if len(df) == 0:
             yield json.dumps({"result": {"rows": [], "n": 0, "n_valid": 0}}) + "\n"
             return
@@ -442,6 +473,7 @@ async def predict(files: list[UploadFile] = File(...)):
                     yield json.dumps({"label": item[1], "done": item[2], "total": item[3]}) + "\n"
                 else:
                     _, rows, _LAST_CSV = item
+                    _LAST_BLOCKS = blocks
                     yield json.dumps({"result": {"rows": rows, "n": len(rows),
                                                  "n_valid": int(sum(r["valid"] for r in rows))}}) + "\n"
         except Exception as ex:                       # a half-written stream needs an explicit error line
@@ -450,6 +482,58 @@ async def predict(files: list[UploadFile] = File(...)):
     # no-transform stops any proxy buffering the stream and defeating the progress bar
     return StreamingResponse(stream(), media_type="application/x-ndjson",
                              headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+
+
+@app.post("/api/download_sdf")
+async def download_sdf(payload: dict):
+    """Return the selected predictions as an SDF, generated locally and never written to the repo.
+
+    When the run came from a dropped SDF, each record is re-emitted **verbatim** — same atoms,
+    coordinates, charges, stereo flags and original data fields — and only the prediction fields are
+    appended, so a round trip through the app cannot alter a structure. When the run came from a csv
+    there is no original record, so a 2D depiction is generated from the SMILES instead.
+    """
+    if _LAST_CSV is None:
+        raise HTTPException(404, "no predictions yet")
+    rows = payload.get("rows") or []
+    if not rows:
+        raise HTTPException(400, "no rows selected")
+    n = len(_LAST_CSV)
+    out, made = [], 0
+    for item in rows:
+        i = int(item.get("idx", -1))
+        if not 0 <= i < n:
+            raise HTTPException(400, f"row index {i} is outside the last run (0..{n - 1})")
+        rec = _LAST_CSV.iloc[i]
+        block = _LAST_BLOCKS[i] if _LAST_BLOCKS and i < len(_LAST_BLOCKS) else None
+        if block is None:
+            # csv input: no original record exists, so depict the molecule from its SMILES
+            mol = Chem.MolFromSmiles(str(rec["smiles"]))
+            if mol is None:
+                continue
+            AllChem.Compute2DCoords(mol)
+            mol.SetProp("_Name", str(rec["compound"]))
+            block = Chem.MolToMolBlock(mol)
+            made += 1
+        fields = {c: rec[c] for c in _LAST_CSV.columns if c not in ("compound", "smiles")}
+        fields.update({k: v for k, v in item.items() if k in ("mpo", "score") and v not in (None, "")})
+        out.append(_sdf_record(block, fields))
+    body = "".join(out)
+    print(f"> SDF export: {len(out)} records ({made} depicted from SMILES, "
+          f"{len(out) - made} original records preserved)", flush=True)
+    return Response(body, media_type="chemical/x-mdl-sdfile",
+                    headers={"Content-Disposition": "attachment; filename=adme_predictions.sdf"})
+
+
+def _sdf_record(block, fields):
+    """One SDF record: the molblock verbatim, then the prediction fields, then the $$$$ terminator."""
+    parts = [block if block.endswith("\n") else block + "\n"]
+    for k, v in fields.items():
+        if v is None or (isinstance(v, float) and not np.isfinite(v)):
+            continue
+        parts.append(f"> <{k}>\n{v}\n\n")
+    parts.append("$$$$\n")
+    return "".join(parts)
 
 
 @app.get("/api/download")

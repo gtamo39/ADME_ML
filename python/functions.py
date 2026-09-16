@@ -2,6 +2,7 @@
 import os
 from functools import lru_cache
 from glob import glob
+import numpy as np
 import pandas as pd
 from rdkit import Chem
 from joblib import Parallel, delayed
@@ -90,3 +91,65 @@ def drop_internal_twins(pub, internal, level='exact', id_col='compound', smiles_
         print(f'> leak control ({level}): dropped {int(leak.sum())} of {len(pub)} public rows '
               f'sharing a molecule with the {len(internal)} internal compounds')
     return pub[~leak].reset_index(drop=True), leak
+
+
+# raw assay units -> modelling space, mirroring the transforms in ADME_build_ML._TF. Defined here
+# rather than imported, because ADME_build_ML imports THIS module (an import back would be circular).
+_ROUND_TRIP_TF = {'log10':     lambda v: np.log10(v),
+                  'logit_pct': lambda v: np.log10(v / (100.0 - v)),
+                  'identity':  lambda v: v}
+
+
+def score_round_trip(preds, truth, endpoints, id_col='id', truth_id='name',
+                     pred_col=lambda k: k + '_pred', conf_col=lambda k: k + '_confidence', v=True):
+    """
+    -Score ANY table of raw-unit predictions against the internal experimental truth, endpoint by
+     endpoint, applying exactly the steps the training path applies so that two prediction sets stay
+     comparable: the config `filter` (mdck keeps MDR1 only), `label_cap_raw` winsorization, the
+     non-finite drop, and the config transform into MODELLING space. Used for the deployed-model
+     round trip AND for scoring an external model (which has no confidence column).
+    param dataframe preds: one row per compound; id_col joins to truth[truth_id]
+    param dataframe truth: the internal experimental pull (DATA.df_internal_exp_all)
+    param dict endpoints: params.ADME_ENDPOINTS (col / transform / unit / filter / label_cap_raw)
+    param callable pred_col: endpoint key -> its prediction column in `preds`
+    param callable conf_col: endpoint key -> its confidence column, or None when there is none
+    param bool v: print how many compounds matched
+    return tuple: (long [compound, endpoint, real_y, pred_y, conf, resid], metrics indexed by endpoint)
+    """
+    import ML_Reg                                    # lazy: only the notebook/runner path needs it
+    rt = truth.merge(preds, left_on=truth_id, right_on=id_col, how='inner')
+    if v:
+        print(f'> round trip: {len(rt)} of {len(truth)} internal compounds matched a prediction')
+    cols = {'R2_det': 'r2det', 'R2_pears': 'r2', 'RMSE': 'rmse', 'N': 'n_test'}
+    long, metrics = [], []
+    for k, ep in endpoints.items():
+        d = rt
+        # mdck keeps only the MDR1 cell line, exactly as DATA._endpoint_dfs does
+        if ep.get('filter'):
+            d = d[d[ep['filter']['col']].astype(str).str.contains(ep['filter']['contains'], na=False)]
+        tf = _ROUND_TRIP_TF[ep['transform']]
+        # winsorize the truth at the training cap, so a saturated assay value is not scored as an error
+        real = tf(d[ep['col']].astype(float).clip(upper=ep.get('label_cap_raw')))
+        pred = tf(d[pred_col(k)].astype(float))
+        m = np.isfinite(real) & np.isfinite(pred)
+        cc = conf_col(k) if conf_col else None
+        long.append(pd.DataFrame({'compound': d.loc[m, truth_id], 'endpoint': k,
+                                  'real_y': real[m], 'pred_y': pred[m],
+                                  'conf': d.loc[m, cc].astype(float) if cc else np.nan}))
+        r = ML_Reg.get_reg_metrics_from_preddf(long[-1], v=False)
+        metrics.append({'endpoint': k, 'unit': ep.get('unit', ''),
+                        # bias = mean(pred - real): a non-zero value is exactly what R2_pears hides
+                        'bias': float(np.mean(long[-1].pred_y - long[-1].real_y)),
+                        **{lab: r[key] for lab, key in cols.items()}})
+    long = pd.concat(long, ignore_index=True)
+    long['resid'] = long['pred_y'] - long['real_y']
+    return long, pd.DataFrame(metrics).set_index('endpoint')
+
+
+# -------------------------------
+# UNHASHED Morgan fingerprints — MOVED to Scripts/Rdkit_tools.py on 2026-09-15
+# -------------------------------
+# unhashed_morgan / morgan_bit_info / draw_bit_on_molecule / plot_decision_tree_MF_bits and the
+# BIT_COLORS palette now live next to their hashed siblings (get_MF_bits_from_df,
+# compute_H236_features, compute_H237_features) in Scripts/Rdkit_tools.py, so all the chemistry
+# and depiction code sits in one module. Call them as rdkit_tools.<name>.

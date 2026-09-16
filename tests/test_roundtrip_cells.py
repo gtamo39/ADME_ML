@@ -19,10 +19,11 @@ from scipy import stats
 
 sys.path[:0] = [os.path.expanduser('~/Scripts'), os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))]
 import ML_Reg
+import python.functions as fn
 from python.ADME_build_ML import PARAMS
 
 NB = os.path.join(os.path.dirname(__file__), '..', 'vignettes', 'Multitask_adme_preds.ipynb')
-CELL_METRICS, CELL_PANELS, CELL_CV_PANELS = '01a26a07', 'eb77e860', '560d161e'
+CELL_METRICS, CELL_PANELS, CELL_CV_PANELS, CELL_BENCH = '01a26a07', 'eb77e860', '560d161e', '3c91817f'
 _INV = {'log10': lambda a: 10.0 ** a, 'identity': lambda a: a,
         'logit_pct': lambda a: 100.0 / (1.0 + 10.0 ** -a)}
 
@@ -82,7 +83,7 @@ def _run(tmpdir, cells=(CELL_METRICS,), n=40, seed=0):
         pass
     data = _D()
     data.df_internal_exp_all = internal
-    ns = {'pd': pd, 'np': np, 'plt': plt, 'stats': stats, 'ML_Reg': ML_Reg, 'data': data,
+    ns = {'pd': pd, 'np': np, 'plt': plt, 'stats': stats, 'ML_Reg': ML_Reg, 'fn': fn, 'data': data,
           'params': params, '_to_model': _to_model, 'SERAC_C': params.SERAC_C,
           '_REG_COLS': {'R2_det': 'r2det', 'R2_pears': 'r2', 'RMSE': 'rmse',
                         'N': 'n_test', 'n_train': 'n_train'}}
@@ -320,3 +321,50 @@ def test_cv_panel_skips_an_endpoint_with_no_pickle():
     # the remaining 7 must still have drawn their split
     assert sum('rho=' in a.get_title() for a in ns['fig'].axes) == 7
     plt.close('all')
+
+
+def test_benchmark_cell_scores_an_external_prediction_table():
+    """Input: the intern's column layout — bare endpoint names, an 'id' column, NO confidence.
+    Expect: score_round_trip handles it through the same truth pipeline, and the comparison table
+    carries both models side by side plus the R2det gain."""
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        internal, csv, params = _fixture(td)
+        ext = pd.read_csv(csv).rename(columns={'compound': 'id'})
+        # the intern's layout: bare endpoint columns, no <ep>_confidence at all
+        ext = ext[['id'] + [f'{k}_pred' for k in params.ADME_ENDPOINTS]]
+        ext.columns = ['id'] + list(params.ADME_ENDPOINTS)
+        ext_csv = os.path.join(td, 'intern.csv')
+        ext.to_csv(ext_csv, index=False)
+
+        def _to_model(v, tf):
+            if tf == 'log10':     return np.log10(v)
+            if tf == 'logit_pct': return np.log10(v / (100.0 - v))
+            return v
+
+        class _D:
+            pass
+        data = _D()
+        data.df_internal_exp_all = internal
+        ns = {'pd': pd, 'np': np, 'ML_Reg': ML_Reg, 'fn': fn, 'data': data, 'params': params,
+              '_to_model': _to_model,
+              '_REG_COLS': {'R2_det': 'r2det', 'R2_pears': 'r2', 'RMSE': 'rmse',
+                            'N': 'n_test', 'n_train': 'n_train'}}
+        exec(compile(_cell_source(CELL_METRICS).replace(
+            "'tmp/20260909_pred_internal.csv'", repr(csv)), 'm', 'exec'), ns)
+        exec(compile(_cell_source(CELL_BENCH).replace(
+            "'tmp/20260910_intern_preds.csv'", repr(ext_csv)), 'b', 'exec'), ns)
+
+    cmp = ns['cmp']
+    # every endpoint must appear, with both models scored
+    assert list(cmp.index) == list(params.ADME_ENDPOINTS), cmp.index
+    for col in ('ours R2det', 'intern R2det', 'ours bias', 'intern bias', 'R2det gain'):
+        assert col in cmp.columns, col
+    # the two tables were built from the SAME predictions here, so they must agree exactly
+    assert np.allclose(cmp['ours R2det'], cmp['intern R2det']), 'same inputs must score the same'
+    # which proves the gain column is a real difference, not a mislabelled copy
+    assert np.allclose(cmp['R2det gain'], 0.0)
+    # a missing confidence must not break the external scoring
+    assert ns['ext_long'].conf.isna().all()
+    # and the truth pipeline must still have applied the mdck filter (5 non-MDR1 rows dropped)
+    assert (ns['ext_long'].endpoint == 'mdck').sum() == 35
