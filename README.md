@@ -1,10 +1,200 @@
 # ADME_ML
 
 ML models to predict in-house ADME endpoints (solubility, LogD, liver-microsome clearance,
-Caco-2 / MDCK permeability, plasma protein binding) for beyond-Rule-of-5 compounds
+Caco-2 / MDCK permeability with and without a P-gp inhibitor, plasma protein binding) for beyond-Rule-of-5 compounds
 (PROTACs / molecular glues), trained on curated public data. See `wiki/wiki.md` for project state.
 
 **Hard rule:** in-house data (SMILES, labels, predictions) never leaves this machine. See `CLAUDE.md`.
+
+---
+
+# ⚑ RETRAIN AFTER NEW DATA — the full checklist
+
+New assay data landed in CDD Vault? Do these four steps in order. Steps 1–3 take a minute. Step 4
+starts the two long jobs.
+
+### 1. Bump the run paths
+
+Open `config/config.yaml`. Every path that carries a run date sits in ONE block at the top,
+`RUN PATHS`. Change all five to the same stamp:
+
+| key | example for a 2026-09-22 run |
+|---|---|
+| `ADME_RAW_CSV` | `data/20260922_all_adme.csv` |
+| `METRICS_PKL_RF_DIR` | `output/results/20260922_metrics_rf` |
+| `METRICS_PKL_CP_DIR` | `output/results/20260922_metrics_cp` |
+| `CHEMPROP_OUTPUT_DIR` | `output/predictions_runs_chemprop_transfer_20260922` |
+| `CHEMPROP_PRETRAIN_DIR` | `output/chemprop_models/transfer_pretrain_20260922` |
+
+A mixed set silently blends two runs. The worst case: chemprop scores the PREVIOUS run's RF folds.
+
+**CAUTION:** `--overwrite` writes the CDD Vault pull to `ADME_RAW_CSV`. Point that key at a NEW file.
+A path that already holds a snapshot is overwritten, and the old internal data is not recoverable.
+
+The last two keys are YAML anchors. `CHEMPROP_TRANSFER.output_dir` and `.pretrain_dir` are aliases of
+them, so you edit the value in the `RUN PATHS` block only.
+
+### 2. Nothing to do for the features
+
+`DATA.build_MF_features` caches the PUBLIC block (public SMILES never change) and **always
+recomputes the INTERNAL block**. New compounds therefore arrive on their own. Leave
+`MF_features_all_path` and its `date` argument alone.
+
+### 3. Decide the chemprop stage-1 pretrain
+
+`assess_predictions_cp` reuses a cached checkpoint per grouping and has no `--force_pretrain` flag.
+The new `CHEMPROP_PRETRAIN_DIR` of step 1 forces a fresh stage 1 for every grouping. Keep the old
+path only when you know that the new internal compounds add no public twins — leak control drops
+public molecules that also exist internally, so a new twin makes the cached checkpoint dirty.
+
+### 4. Run the two jobs — RF first, chemprop second
+
+Chemprop reads RF's folds from the `fold` column of `<METRICS_PKL_RF_DIR>/<endpoint>.pkl`. Start
+chemprop only after RF finishes, or it builds its own, incomparable folds.
+
+**CAUTION:** an SSH drop kills an interactive job. Both commands run detached under `screen`.
+Watch them with `screen -r rf` / `screen -r cp`, or `tail -f output/logs/20260922_rf.log`.
+
+```bash
+# 1. pull the new CDD data + assess RF, all 9 endpoints (detached)
+screen -dmS rf bash -c '~/miniconda3/envs/ML/bin/python python/ADME_build_ML.py \
+  --overwrite --assess_RF_all_endpoints 2>&1 | tee output/logs/20260922_rf.log'
+
+# 2. only after step 1 finishes — chemprop, 11 models per endpoint (long)
+screen -dmS cp bash -c '~/miniconda3/envs/ML/bin/python python/ADME_build_ML.py \
+  --assess_CP_all_endpoints 2>&1 | tee output/logs/20260922_cp.log'
+```
+
+When both finish, compare the RF and chemprop `r2det` per endpoint, update `webapp.value_model` if a
+winner changed, then deploy — see **Useful flags** and **Which model the webapp shows** below.
+
+---
+
+# ⚑ NEW PUBLIC DATASET — features + chemprop pretrain
+
+The checklist above covers new INTERNAL data. A new PUBLIC source needs these steps instead.
+
+### 1. Write the parquet
+
+The live path reads **four columns only** from a public parquet
+(`DATA._endpoint_dfs`, `pd.read_parquet(..., columns=[...])`):
+
+| column | content |
+|---|---|
+| `compound` | a unique id, e.g. `PUB_<endpoint>_<i>`. It must not collide with an internal SRB id. |
+| `smiles` | the structure |
+| `value` | **already in MODELLING space** — `log10` for solubility/clearance/permeability, `identity` for logd, `logit_pct` for ppb. Match `ADME_ENDPOINTS[<ep>].transform`. |
+| `origin` | the provenance label, e.g. `Biogen:hlm_biogen`. `BEST_PUBLIC` selects on this exact string. |
+
+Write it to `autoresearch/predict_adme/public_<name>.parquet` (config `ADME_CACHE`).
+
+You do **not** need a feature block. The older parquets carry ~4,469 feature columns, but that is
+legacy from the retired runner. `DATA.build_MF_features` derives every feature from the SMILES.
+
+The existing harmonizer is `autoresearch/predict_adme/build_public_features.py`, which calls
+`python/harmonize_adme.py` for the unit conversions and writes the id + the legacy feature block.
+**CAUTION:** it reads `ADME_PUBLIC`, `ADME_SCALING` and `BIOGEN_ADME_CSV`, which the lean config no
+longer holds. Point it at `config/config_legacy_20260903.yaml`, or convert the units yourself.
+
+### 2. Register the file in the config
+
+```yaml
+ENDPOINT_PUBLIC_FILES:
+  hlm: [public_hlm.parquet, public_novartis_hlm.parquet, public_<name>.parquet]   # <- add here
+BEST_PUBLIC:
+  hlm: ['Biogen:hlm_biogen', 'Novartis-NIBR', '<your origin string>']             # <- and here
+```
+
+The two keys do different jobs:
+
+| key | gates | effect if you forget it |
+|---|---|---|
+| `ENDPOINT_PUBLIC_FILES` | **both** RF and chemprop (it builds the wide `df_all`) | the rows never reach any model |
+| `BEST_PUBLIC` | **RF only** (`select_best_combo_and_update`) | chemprop uses the new data, RF ignores it |
+
+**CAUTION:** `get_internal_public_sets` drops any origin with **1000 compounds or fewer**
+(`--min_n`, default 1000). A small public source therefore never enters an RF arm, whatever
+`BEST_PUBLIC` says. Lower `--min_n` for a small source.
+
+### 3. H237 features — usually nothing to do
+
+`DATA.build_MF_features` **tops up the public cache incrementally**. It computes only the compounds
+`output/features/<date>_MF_features_H237_public.parquet` does not hold yet, then appends and saves.
+A new public file therefore costs one featurization of its own compounds, not a 369k rebuild. The
+internal block is always recomputed, and a coverage assertion proves every `df_all` compound has
+features.
+
+A **full** recompute is needed only when the H237 DEFINITION changes, not when compounds are added.
+Then bump the stamp, which writes a fresh cache under the new name:
+
+```python
+data.build_MF_features(params, type='H237', date='20260922')   # full rebuild, ~369k compounds
+```
+
+**CAUTION:** `date` is a method argument, **not** a config key. Two places set it — the default in
+`python/ADME_build_ML.py:DATA.build_MF_features`, which the CLI uses, and the notebook cell that
+calls `data.build_MF_features(params, type='H237', date='20260824')`. Change both, or the CLI and
+the notebook read different caches. The descriptastorus block dominates the cost (`n_jobs=32`).
+
+A cached public block whose feature columns no longer match the fresh internal block raises, instead
+of concatenating into NaN columns. That assertion names the cache file to rebuild.
+
+### 4. Retrain the chemprop stage-1 pretrain
+
+Stage 1 trains on **public rows only**, per grouping, and never sees an internal label. The
+checkpoint is cached at `<CHEMPROP_PRETRAIN_DIR>/<grouping>/` and is reused by every endpoint and
+fold of that grouping. New public data does not invalidate it by itself — you must force it.
+
+| path | how to force stage 1 |
+|---|---|
+| `--assess_CP_all_endpoints` | **no flag exists.** Point `CHEMPROP_PRETRAIN_DIR` (RUN PATHS block) at a new directory. |
+| `--deploy_CP_all_endpoints` | `--force_pretrain` |
+
+```bash
+ML_PY=~/miniconda3/envs/ML/bin/python
+
+# assess: bump CHEMPROP_PRETRAIN_DIR in config/config.yaml first, then
+screen -dmS cp bash -c "$ML_PY python/ADME_build_ML.py --assess_CP_all_endpoints \
+  2>&1 | tee output/logs/cp_newpublic.log"
+
+# deploy: the flag does it, no config edit
+$ML_PY python/ADME_build_ML.py --deploy_CP_all_endpoints --force_pretrain
+```
+
+**CAUTION:** a stale checkpoint ships a model trained on public rows you have since removed, or one
+that never saw the rows you just added. Read the log to tell the two apart:
+
+| log line | meaning |
+|---|---|
+| `> PRETRAIN <n> public rows \| <n> tasks [...] \| <n> ep` | stage 1 ran fresh on that pool |
+| `> PRETRAIN reused checkpoint -> <path>` | **the cache was reused** — your new public data did NOT reach stage 1 |
+| `> PRETRAIN skipped (df_pretrain is None)` | expected: this is the `internal_cv` arm, which trains from scratch by design |
+
+The deploy path prints the same three lines with a `DEPLOY ` prefix.
+
+### 5. A task with no public labels — `public_proxy`
+
+Stage 1 fits **one target scaler per task**. A task whose public column is entirely empty gets a NaN
+scaler, and that head then predicts NaN for ever — the frozen-encoder finetune inherits the scaler and
+cannot repair it. `build_ML_data_CP` now asserts this before any training and names the fix.
+
+`CHEMPROP_TRANSFER.public_proxy` fills such a task's PUBLIC rows from a related public column. Internal
+rows keep their real labels, so only stage 1 changes, and the stage-2 head re-learns any offset:
+
+```yaml
+CHEMPROP_TRANSFER:
+  public_proxy:
+    mdck_inh: {file: tf_novartis_mdck_perm.parquet, column: LE_MDCKv2_LogPapp}
+```
+
+**CAUTION:** a proxy is a modelling assumption, not a measurement. Check that its spread matches the
+internal target before you trust it — an offset is harmless (the stage-2 head absorbs it), a different
+spread is not. Record every proxy you add in `wiki/wiki.md`.
+
+One pretrain per grouping, so the cost is 7 pretrains, not 9 — `hlm/mlm/rlm` share `clearance`, and
+each of `solubility`, `logd`, `caco2`, `mdck`, `mdck_inh`, `ppb` has its own.
+
+---
 
 ## Conda environments
 
@@ -107,7 +297,7 @@ $ML_PY python/ADME_build_ML.py --deploy_CP_all_endpoints --force_pretrain
 | flag | effect |
 |------|--------|
 | `--config` | YAML to read (default `config/config.yaml`) |
-| `--endpoints a,b` | restrict to a subset; default is all 8 |
+| `--endpoints a,b` | restrict to a subset; default is all 9 |
 | `--leak exact\|skeleton\|none` | chemprop only: drop public molecules that also exist internally (default `exact`) |
 | `--min_n` | minimum compounds for a public origin to count (default 1000) |
 | `--overwrite` | re-pull the CDD Vault export instead of reading the cache |
@@ -116,7 +306,7 @@ $ML_PY python/ADME_build_ML.py --deploy_CP_all_endpoints --force_pretrain
 
 CAUTION: `--assess_CP_all_endpoints` trains **11 chemprop models per endpoint** (1 pretrain,
 5 transfer folds, 5 from-scratch folds). Stage 1 is cached per grouping, so `hlm/mlm/rlm` share one
-pretrain and `solubility/logd` share another — 6 pretrains across all 8 endpoints. Run it detached:
+pretrain and `solubility/logd` share another — 7 pretrains across all 9 endpoints. Run it detached:
 
 ```bash
 screen -S cpall
@@ -134,12 +324,50 @@ which one supplies the displayed **value**:
 | solubility, logd, hlm, mlm, rlm | `chemprop` (`adme_<ep>_cp`) |
 | mdck, caco2, ppb | `rf` (`adme_<ep>_h237`) |
 
-The **confidence** always comes from the RF model, for all 8 endpoints. A chemprop `regression`
+The **confidence** always comes from the RF model, for all 9 endpoints. A chemprop `regression`
 head returns no per-row std, so `conf_recal` only exists on the RF side. Deploy RF for every
 endpoint even where chemprop supplies the value.
 
 CAUTION: run `--deploy_RF_all_endpoints` before the webapp, whatever `value_model` says. Without
 the RF model an endpoint has no confidence and the webapp drops it.
+
+### Deploying ONE endpoint, and refreshing the webapp
+
+**CAUTION: the RF deploy is NOT idempotent.** `OUTPUT.deploy_endpoint` calls
+`registry.add(model_id=None, ...)`, and MLTrail reads "no model_id" as *new model, auto id, version 1*.
+So `--deploy_RF_all_endpoints` with no `--endpoints` registers a NEW entry for every endpoint and
+duplicates the ones already in the vault. Name the endpoint you mean:
+
+```bash
+ML_PY=~/miniconda3/envs/ML/bin/python
+
+# fit + calibrate without writing to MLTrail
+$ML_PY python/ADME_build_ML.py --deploy_RF_all_endpoints --endpoints mdck_inh --dry_run
+
+# register it
+$ML_PY python/ADME_build_ML.py --deploy_RF_all_endpoints --endpoints mdck_inh
+
+# confirm what the vault now holds
+$ML_PY -c "from mltrail import Registry; l = Registry.from_default().list(); \
+  print(l[l.experiment_name.astype(str).str.startswith('adme_')][['id','experiment_name']].to_string(index=False))"
+```
+
+The chemprop deploy IS idempotent — `deploy_endpoint_cp` looks the name up and overwrites — so only the
+RF side needs this care.
+
+### Running the webapp
+
+```bash
+conda run -n ML python webapp/app.py     # -> http://127.0.0.1:8050, localhost only
+```
+
+The app discovers its models ONCE at startup (`_discover_champions`), so a newly deployed endpoint
+appears only after a **restart**. Column order comes from `webapp.endpoint_order`, the triage colour
+from `webapp.cutoffs`, and which model supplies the value from `webapp.value_model`.
+
+CAUTION when testing it from a shell: a multi-line command collapsed onto one line silently chains the
+steps and leaves a STALE uvicorn answering. Put webapp test sequences in a script file and run
+`bash script.sh`.
 
 ### The same steps from the notebook
 

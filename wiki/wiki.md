@@ -359,6 +359,11 @@ the artifact. Features = **H237** (4469; `MF_features['all']`); MLTrail's built-
 predict time (**needs `descriptastorus` in the predict env — present in `ML`**). Run:
 `python python/ADME_build_ML.py --config config/config.yaml --deploy_RF_all_endpoints [--endpoints a,b] [--dry_run]`.
 Tests: `tests/test_deploy.py` (synthetic, fake registry — no vault write).
+**CAUTION (found 2026-09-23): the RF deploy is NOT idempotent.** It calls `registry.add(model_id=None, ...)`,
+and MLTrail's contract is `No model_id -> new model (auto id), version 1`. So running it WITHOUT
+`--endpoints` registers a NEW entry for every endpoint and duplicates whatever is already in the vault.
+Always name the endpoint. `deploy_endpoint_cp` does NOT have this problem — it looks the name up and
+passes `model_id=<hit>, overwrite=True`. Documented in the README under 'Deploying ONE endpoint'.
 
 **CLI runner (2026-08-27, `python/run_nvs_cellab.py`).** Runs Cell A+B headless with crash-safe incremental saves
 (SSH-drop cost the user 40 min of interactive compute). `python python/run_nvs_cellab.py --config … --outdir
@@ -3063,3 +3068,432 @@ edit it from here; raise it there. This affects the deployed ADME confidences to
 numpy arrays, not scalars (`ID_name = np.array(features_df[[ID]])` keeps 2 dims). Any downstream
 merge on that column raises `TypeError: unhashable type: 'numpy.ndarray'`. Flatten first:
 `pred_df['compound'] = pred_df['compound'].map(lambda a: a[0])`.
+
+### Section 4 — UB selectivity (2026-09-16, cells `2d1ead8c`, `e744e10e`)
+
+`UB_sel` keeps the compounds with BOTH a UBR1 and a UBR2 value. Cell `2d1ead8c` plots UBR2 against
+UBR1 with cutoff lines at `UB1_CUT` / `UB2_CUT` (both 10 uM as set) and a quadrant share table
+placed OUTSIDE the axes, so no label hides a datapoint.
+
+**Selectivity label definition.** Positive = potent on UB2 AND weak on UB1, which is the "UB2 only"
+quadrant. A censored bound is resolved to the only call it can support, by the `_potent(raw, cut)`
+helper in cell `e744e10e`: `<b` with b <= cut is certainly potent, `>b` with b >= cut is certainly
+not, and `>b` below the cut or `<b` above it leaves the call UNDECIDABLE and is dropped. This
+matters because the reverse — reading a `>5` as potent — creates a FALSE POSITIVE in a class that
+holds only a handful of compounds. On a 40-row synthetic cohort the censoring rule dropped 8 rows
+(20%). Truth table verified over all nine censored forms plus the missing case.
+
+CAUTION: `~` on an object-dtype boolean Series inverts the INTEGER, not the bool. The helper casts
+with `.astype(bool)` first. Without it the cell raises `TypeError: Boolean array expected` as soon
+as any value is missing.
+
+**Model (revised the same day).** `FEAT_SET` selects the features: `'H237'` reuses `H237_UB` from
+section 1, `'bits'` rebuilds the unhashed Morgan matrix on `UB_sel`. The label and the folds are
+identical either way, so the two runs are directly comparable. An assert rejects a NaN in the
+feature block, because the CV runner silently DROPS a train row holding NaN and would score a test
+row on garbage; pass `impute_by_mean=True` if H237 ever carries one. Then the CHAMPION RANDOM FOREST
+under LEAVE-ONE-OUT cross-validation, built as one-compound test sets and passed to
+`ML_Class.K_fold_by_defined_IDs_Classification` as `ID_sets`. It replaced the depth-3 decision tree
+and its figure, because a forest has no single tree to draw; the cell ends on
+`ML_Class.plot_roc_curve` over the pooled LOO predictions instead, which the forest's many distinct
+probabilities make smooth.
+
+`LOO_BY` selects the unit held out: `'compound'` (plain LOO) or `'skeleton'`, which holds every
+salt/stereoisomer twin out together. CAUTION: plain LOO leaves a twin of the held-out compound in
+TRAIN, so it does not carry the anti-leakage guarantee the StratifiedGroupKFold folds elsewhere in
+this repo do. `v=False` is deliberate: a one-row fold has no ROC curve, and LOO would print one
+metrics block per compound.
+
+Verified on the synthetic cohort: test folds hold exactly one compound under `'compound'`, each
+train set is everything-but-one, and under `'skeleton'` a planted enantiomer pair left together
+(fold size 2) while the folds still partitioned the cohort.
+
+CAUTION: not yet run on the real data. The quadrant plot showed the "UB2 only" cell holding a very
+small share, so every metric this section prints will rest on a few compounds.
+
+## ★ NEW ENDPOINT — `mdck_inh` (P-gp-inhibited MDCK Papp) wired end to end (2026-09-22)
+
+Ninth ADME endpoint, added to `config/config.yaml:ADME_ENDPOINTS`: internal column
+`mdck_Mean Papp A to B - PgP Inhibitor`, `log10`, unit `1e-6cm/s`, filtered on
+`mdck_Cell line - PgP inhibitor` contains `MDR1`. CAUTION: use the INHIBITOR cell-line column, not
+`mdck_Cell line` — one compound carries an mdck_inh value with an empty `mdck_Cell line`, so the
+plain column drops it.
+
+**Internal-only endpoint.** No public P-gp-inhibited MDCK source exists, so `ENDPOINT_PUBLIC_FILES`
+and `BEST_PUBLIC` hold `[]`. Three code changes in `python/ADME_build_ML.py` made that case work:
+- `load_combine_dfs` now calls `_endpoint_dfs` directly instead of the hardcoded `get_<ep>_data`
+  alias tuple, so a new config endpoint needs NO code alias.
+- `_endpoint_dfs` reads `ENDPOINT_PUBLIC_FILES.get(ep, [])` and builds an empty EXP block.
+- `assess_predictions` skips `ext_->_internal` and `ext_->_temp` when `pub_ids` is empty (their
+  train set would be empty); 4 arms remain, and `augmented_*` then equals its `internal_*` twin.
+
+**Chemprop.** New grouping `permeability_inh: [caco2, mdck, mdck_inh]` + `BEST_CHEMPROP_GROUPINGS.mdck_inh`.
+Existing groupings and their cached stage-1 checkpoints are untouched. Pretrain pool 337,684 public
+rows (caco2 337,684 / mdck 273,638 / mdck_inh 0 — the mdck_inh head is learned in stage 2 only).
+Not yet measured against RF.
+
+**First RF numbers (2026-09-22, `output/results/20260909_metrics_rf/mdck_inh.pkl`)** — 147 internal
+rows, 146 after the non-finite drop (one Papp of 0 -> log10 = -inf):
+| arm | R²det | R² | RMSE |
+|-----|-------|----|------|
+| internal_cv / augmented_cv | 0.684 | 0.684 | 0.315 |
+| internal_temp / augmented_temp | 0.592 | 0.632 | 0.266 |
+NOT yet registered to MLTrail, so the webapp has no `adme_mdck_inh_h237` column yet. The deploy dry
+run passed on the pre-fix 145-row frame (sources `['internal']`).
+
+**Webapp config** carries mdck_inh in `endpoint_order` (after mdck), `cutoffs`
+(10 · 1e-6cm/s, `>=`) and `value_model` (`rf`).
+
+**Notebook** (`vignettes/Multitask_adme_preds.ipynb`, 10 cells): the RF loop and the chemprop loop
+now read `list(params.ADME_ENDPOINTS)`; `_EP_SIGN` / `_EP_TF` / `CUTOFFS` gained mdck_inh; the two
+per-endpoint panels size their grid from the endpoint count and hide the spare axis. The
+retrospective comparison figures (intern benchmark, near-shell, `summary_transfer.csv`) keep their
+literal 8-endpoint lists — those external files hold no mdck_inh.
+
+## ★ CONFIG — every run-dated path lives in ONE `RUN PATHS` block (2026-09-22)
+
+A retrain needs five paths bumped together. They used to sit in three places, and `ADME_RAW_CSV` was
+not in the config at all — `PARAMS.load_params` fell back to the hardcoded default
+`data/20260707_all_adme.csv`, so `--overwrite` would have DESTROYED that snapshot in silence.
+
+`RUN PATHS` now sits at the TOP of `config/config.yaml` (it must, so its YAML anchors resolve for
+`CHEMPROP_TRANSFER` further down) and holds all five:
+`ADME_RAW_CSV`, `METRICS_PKL_RF_DIR`, `METRICS_PKL_CP_DIR`, `CHEMPROP_OUTPUT_DIR`, `CHEMPROP_PRETRAIN_DIR`.
+
+The last two are YAML **anchors** (`&cp_output_dir`, `&cp_pretrain_dir`); `CHEMPROP_TRANSFER.output_dir`
+and `.pretrain_dir` are **aliases** (`*name`). So no code changed — `cfg['output_dir']` still resolves —
+and the value is edited in one place. CAUTION for the "every key is read by a consumer" rule in the
+config header: `CHEMPROP_OUTPUT_DIR` / `CHEMPROP_PRETRAIN_DIR` are read INDIRECTLY, through the alias.
+
+`MF_features_all_path` and `FOLD_GROUP_BY_INCHIKEY` stayed in `PATHS / CV POLICY`: they carry no run date.
+
+**Why the pretrain dir must be bumped for a retrain:** `assess_predictions_cp` reuses a cached stage-1
+checkpoint per grouping and passes NO `force_pretrain` (only `deploy_endpoint_cp` has that flag). New
+internal compounds change leak control (`drop_internal_twins` removes public molecules that also exist
+internally), so a cached checkpoint can hold a molecule that is now internal. A new
+`CHEMPROP_PRETRAIN_DIR` is the only lever on the assess path.
+
+**README:** the retrain procedure is now a top-level section, `⚑ RETRAIN AFTER NEW DATA — the full
+checklist` (4 steps, ending with the two detached `screen` commands). Endpoint counts across the README
+moved 8 -> 9, and the pretrain count 6 -> 7 (the new `permeability_inh` grouping).
+
+## ★ NEW PUBLIC DATASET — the contract, the feature top-up, the pretrain cache (2026-09-22)
+
+Written up because three facts were only discoverable by reading code. README section
+`⚑ NEW PUBLIC DATASET — features + chemprop pretrain` carries the procedure.
+
+**1. A public parquet needs FOUR columns, not a feature block.** `DATA._endpoint_dfs` calls
+`pd.read_parquet(..., columns=['compound', 'smiles', 'value', 'origin'])`. The existing parquets in
+`autoresearch/predict_adme/` carry ~4,469 EXTRA feature columns (F*/MACCS/DS_, e.g. public_hlm has
+4,474 columns for 4,189 rows), written by `autoresearch/predict_adme/build_public_features.py` for the
+RETIRED runner. The live path never reads them — `DATA.build_MF_features` derives everything from the
+SMILES. `value` must ALREADY be in modelling space; `origin` is the exact string `BEST_PUBLIC` selects on.
+CAUTION: `build_public_features.py` -> `harmonize_adme.harmonize_all()` reads `ADME_PUBLIC` /
+`ADME_SCALING` / `BIOGEN_ADME_CSV`, which the lean config dropped on 2026-09-08. It defaults to
+`config/config.yaml` and would raise a KeyError; pass `config/config_legacy_20260903.yaml`.
+
+**2. The two config keys gate DIFFERENT models.** `ENDPOINT_PUBLIC_FILES` builds the wide `df_all`, so
+it gates BOTH RF and chemprop. `BEST_PUBLIC` is read only by `select_best_combo_and_update`, so it gates
+RF ONLY — chemprop's `cp_pub` takes every public row of the grouping's tasks straight from `df_all`.
+A new file listed only in `ENDPOINT_PUBLIC_FILES` therefore reaches chemprop and NOT the RF augmented arm.
+Second trap: `get_internal_public_sets` keeps an origin only when it has MORE than `min_n` (default 1000)
+compounds, so a small public source never enters an RF arm whatever `BEST_PUBLIC` says.
+
+**3. H237 needs no action for new compounds; it needs a stamp bump for a new DEFINITION.** The public
+cache tops up incrementally (only the missing compounds are featurized, then appended and saved), and the
+internal block is always recomputed. A FULL rebuild is required only when the H237 feature set itself
+changes. The stamp is a METHOD ARGUMENT, not a config key, set in two places that must move together:
+the `date=` default of `DATA.build_MF_features` (what the CLI uses) and the notebook cell
+`data.build_MF_features(params, type='H237', date='20260824')`. A column-set mismatch between the cached
+public block and the fresh internal block raises, and the message names the cache file.
+
+**4. Stage-1 pretrain reuse is the silent failure mode.** `chemprop_finetune_K_fold_by_defined_IDs`
+accepts `force_pretrain`, but `OUTPUT.assess_predictions_cp` NEVER passes it — so on the assess path a new
+`CHEMPROP_PRETRAIN_DIR` is the only lever. `deploy_endpoint_cp` has the `--force_pretrain` flag.
+Log lines that tell the cases apart (`Scripts/ML_Reg.py`): `> PRETRAIN <n> public rows | <n> tasks ... | <n> ep`
+= fresh; `> PRETRAIN reused checkpoint -> <path>` = CACHE HIT, the new public data did not reach stage 1;
+`> PRETRAIN skipped (df_pretrain is None)` = the `internal_cv` arm, by design. The deploy path prefixes
+all three with `DEPLOY `.
+
+## ★★ CHEMPROP NaN BUG — a task with 0 public labels poisons its stage-1 head (2026-09-22)
+
+**SYMPTOM.** `--assess_CP_all_endpoints` on `mdck_inh`: all 5 folds print `rmse: nan`, then
+`ML_Reg.get_reg_metrics_from_preddf` raises `ValueError: Input contains NaN`.
+
+**CAUSE (user's diagnosis, confirmed).** `permeability_inh` = [caco2, mdck, mdck_inh], but the stage-1
+pretrain pool held **0** `mdck_inh` labels (caco2 337,684 / mdck 273,638 / mdck_inh 0 — verified in
+`transfer_pretrain/permeability_inh/pretrain.csv`). Chemprop fits ONE TARGET SCALER PER TASK, so an
+all-NaN column gives a NaN mean and std, and that head can never emit a number. The frozen-encoder
+finetune INHERITS the scaler, so stage 2 cannot repair it. Proof in every fold's `predict_out.csv`:
+caco2 29/29 and mdck 29/29 predicted, `mdck_inh` **0/29**. The failure is isolated to that one head.
+`mdck_inh` is the first endpoint with no public rows at all; every other endpoint's own task has them.
+Splitting the stages does NOT help — stage 2 must keep stage 1's target columns or the head shape mismatches.
+
+**FIX 1 — `CHEMPROP_TRANSFER.public_proxy` (config, applied in `DATA.build_ML_data_CP`).** Fills a
+task's PUBLIC rows from a related public column; INTERNAL rows keep their real labels, so only stage 1
+changes and the stage-2 head re-learns the offset. Entry chosen (user decision 2026-09-22):
+`mdck_inh: {file: tf_novartis_mdck_perm.parquet, column: LE_MDCKv2_LogPapp}` — wild-type MDCK (no P-gp),
+the closest analogue of MDR1-MDCK + P-gp inhibitor. Result: cp_pub mdck_inh 0 -> **275,529**.
+Scale check (aggregate): Novartis LE_MDCKv2_LogPapp mean 1.092 std 0.557 vs internal mdck_inh log10
+mean -0.399 std 0.568 — **the spread matches, the offset is +1.49 log**. A pure shift is the best case
+for a frozen-encoder transfer, because the stage-2 FFN re-learns the intercept.
+CAUTION: this is a PREDICTED Novartis column, not a measurement, and it is a modelling assumption.
+Sanity check on the chemistry: internal mdck_inh (-0.399) sits ~0.3 log ABOVE internal mdck (-0.704),
+as expected when the inhibitor blocks P-gp efflux.
+
+**FIX 2 — guard.** `build_ML_data_CP` now asserts the SCORED task has >0 public labels, naming
+`public_proxy` and `BEST_CHEMPROP_GROUPINGS` in the message. Verified both ways: proxy on -> 275,529;
+proxy removed -> assert fires before any training. `mdck` is untouched (273,638).
+
+**MUST DO before re-running:** `transfer_pretrain/permeability_inh/` still holds the POISONED
+checkpoint, and `assess_predictions_cp` reuses a cached checkpoint with no force flag. Bump
+`CHEMPROP_PRETRAIN_DIR` (RUN PATHS) or the fix has no effect.
+
+**Side note (not the bug):** `CAUTION: 1 RF fold compounds are absent from cp_int`. `_endpoint_ML`
+dedups by SMILES and prefers the internal row; `cp_int` does not. One compound therefore sits in RF's
+folds but not in cp_int.
+
+## Public MDCK + P-gp-inhibitor data — the internet search (2026-09-22)
+
+Asked whether a public dataset holds MDR1-MDCK Papp A->B measured WITH a P-gp inhibitor (= passive
+permeability). **VERDICT: none exists at useful scale.** What is out there:
+| source | quantity | size | verdict |
+|---|---|---|---|
+| Biogen/Fang 2023 (`github.com/molecularinformatics/Computational-ADME`, Polaris `biogen/adme-fang-v1`) | MDR1-MDCK **efflux ratio** B-A/A-B | 885-3,087 per endpoint | WRONG QUANTITY — ER, not passive Papp |
+| TDC `PAMPA_NCATS` (NIH-NCATS) | PAMPA pH 7.4, cell-free passive | **5,473 measured** | closest MEASURED analogue; different assay, no cells |
+| TDC `Caco2_Wang` | Caco-2 Papp, no inhibitor | 906 | already used for caco2 |
+| ChEMBL harvest (measured 2026-09-22, see below) | EXACTLY right quantity | **298 compounds / 348 values** | real but tiny and fragmented — 53 assays, median 3 compounds each |
+| AstraZeneca multitask paper (ACS Omega 2025, PMC12631307) | MDCK ER 4,801 + NIH MDCK ER 3,081 | - | PROPRIETARY. Only the trained chemprop v2.1.0 artifact is public (doi 10.5281/zenodo.16948542) |
+Best future upgrade: a ChEMBL harvest for the real quantity (small, heterogeneous), or adding
+`PAMPA_NCATS` as a MEASURED passive task next to the predicted Novartis proxy.
+
+**HOW MUCH ChEMBL ACTUALLY HOLDS (harvested 2026-09-22 via the ChEMBL REST API).** Funnel over assay
+descriptions: 6,792 mention MDCK -> 1,715 also MDR1/P-gp/ABCB1 -> 1,354 also permeability/Papp -> **171
+also name a P-gp inhibitor**. Those 171 assays hold 1,072 activities on 494 molecules. Keeping only a
+permeability VALUE (not a ratio or a recovery), in a convertible cm/s unit, in the A->B direction leaves
+**348 values on 298 unique compounds, from 53 assays** (10 censored `<`). Inhibitor used: elacridar /
+GF120918 (the same compound) 182, cyclosporin 47, verapamil 37, zosuquidar 3, valspodar 2, unnamed 77.
+337 of 348 name MDR1 explicitly. Median 3 compounds per assay, max 32 — 53 separate protocols.
+**SCALE vs internal:** ChEMBL log10(Papp/1e-6 cm/s) mean 0.719 std **0.940**; internal mdck_inh mean
+-0.399 std 0.568. So ChEMBL sits ~1.1 log higher AND its spread is 1.7x wider (small drug-like molecules
+across heterogeneous protocols, vs our bRo5 series on one protocol).
+**VERDICT: do NOT replace the Novartis proxy with it for PRETRAINING** — 298 rows vs 275,529, and a worse
+spread match (0.94 vs 0.557 against internal 0.568). Its value is as a small MEASURED external check, or
+as an extra task, not as the stage-1 pool. Counts come from regex filters over assay descriptions, so
+treat them as a good estimate, not an exact audit.
+
+## ChEMBL mdck_inh harvest — `public_chembl_mdck_inh.parquet`, 289 compounds (2026-09-22)
+
+Built by the new runner `python/harvest_chembl_mdck_inh.py` (PARAMS/DATA/OUTPUT/MAIN), config
+`config/chembl_harvest.yaml` — kept OUT of `config/config.yaml`, which serves three consumers only.
+Raw API pages cache under `data/public_adme/chembl_mdck_inh/`, so a re-run needs no network (`--refresh`
+re-queries, `--dry_run` reports the funnel and writes nothing).
+
+**Funnel (assay descriptions, then activities):** 6,792 mention MDCK -> 1,715 MDR1/P-gp/ABCB1 -> 1,354
+permeability/Papp -> 171 name a P-gp inhibitor -> **96 also state the A->B direction**. Those 96 assays
+hold 802 activities on 350 molecules -> 434 are a permeability VALUE (not a ratio/recovery) -> 374 after
+dropping reverse-leg activity types -> 348 in a convertible unit -> 338 uncensored -> **289 unique
+molecules** after a median over assays. All 289 parse in RDKit.
+
+**Output (the four-column public contract `DATA._endpoint_dfs` reads):** compound `PUB_mdck_inh_<i>`,
+smiles, value = **log10(Papp / 1e-6 cm/s)** (matches `ADME_ENDPOINTS.mdck_inh.transform`), origin
+`ChEMBL:MDCK-MDR1_PgP-inhibitor`. Unit conversion in config: 1 nm/s = 0.1 x 1e-6 cm/s; the other
+spellings are already 1e-6 cm/s.
+
+**SCALE — the reason it is NOT wired in:**
+| source | mean | std | n |
+|---|---|---|---|
+| ChEMBL harvest | 0.923 | **0.811** | 289 |
+| internal mdck_inh | -0.399 | 0.568 | 146 |
+| Novartis `LE_MDCKv2_LogPapp` (the proxy in use) | 1.092 | **0.557** | 275,529 |
+The proxy's spread matches internal (0.557 vs 0.568); ChEMBL's is 1.4x wider, because it pools small
+drug-like molecules across 96 protocols while our series is bRo5 on one protocol.
+**DECISION: the parquet is NOT in `ENDPOINT_PUBLIC_FILES`.** It is 950x smaller than the proxy and a
+worse scale match, so it would not help stage 1 — and listing it would make it TRAINING data, destroying
+its one real use: a MEASURED, never-seen external check on the proxy assumption. Wire it in only as a
+deliberate experiment.
+CAUTION if you do: an origin with <=1000 compounds is dropped by `get_internal_public_sets` (`--min_n`),
+so RF would ignore it anyway; only chemprop would see it.
+
+**Related code fix:** `build_ML_data_CP`'s proxy now uses `fillna`, so a MEASURED public label always
+beats the predicted proxy. Before, the proxy overwrote every public row unconditionally, which would
+have silently replaced these 289 measurements had the file been listed.
+
+## ★ `min_n` lowered 1000 -> 100, PHYS dropped, ChEMBL wired into mdck_inh (2026-09-22)
+
+**THE QUESTION:** does lowering the public-origin size gate change any training set? Measured across all
+9 endpoints (`get_internal_public_sets` counts, after the SMILES dedup and the internal-twin removal).
+
+**Why it mostly does NOT matter:** `combo = [o for o in origins if o in BEST_PUBLIC[k]]`. The gate can
+only bite when `BEST_PUBLIC` names a SMALL origin — and that list was curated from origins that already
+passed 1000. Origins in the 100-1000 band that are NOT in `BEST_PUBLIC` change nothing:
+`TDC:Clearance_Microsome_AZ` 965 (hlm), `TDC:Caco2_Wang` 819 (caco2), `Biogen:ppb_biogen` 183 (ppb),
+`thermodynamic:ESOL` 171 (solubility). CAUTION: those origins DO already reach chemprop, which reads
+`ENDPOINT_PUBLIC_FILES` from `df_all` and ignores both `BEST_PUBLIC` and `min_n`.
+
+**THE ONE EXCEPTION — a config/code mismatch found by the sweep.** `BEST_PUBLIC['solubility']` named
+THREE origins (ChEMBL, AQUA, **PHYS**) but `thermodynamic:PHYS` has 834 compounds, so `min_n=1000` had
+ALWAYS dropped it. The deployed solubility model trained on ChEMBL 3,675 + AQUA 1,213 = 4,888 public
+compounds, never on PHYS. The config said one thing and the model did another, silently, for months.
+**DECISION (user, 2026-09-22): remove PHYS from `BEST_PUBLIC`** so the config states what runs, and
+solubility stays byte-identical at the lower gate. (The 2026-07 sweep is consistent: S9_thermo_pruned,
+which drops PHYS and AQUA, scored 0.720 vs plain thermo 0.711 — inside the noise.)
+
+**CHANGES APPLIED.** `PUBLIC_ORIGIN_MIN_N: 100` is now a CONFIG key (it was an argparse default of 1000
+plus three hardcoded `min_n=1000` notebook cells). `assess_all_endpoints`, `deploy_all_endpoints` and
+`get_internal_public_sets` all default to it; `--min_n` still overrides. `ENDPOINT_PUBLIC_FILES.mdck_inh
+= [public_chembl_mdck_inh.parquet]` and `BEST_PUBLIC.mdck_inh = ['ChEMBL:MDCK-MDR1_PgP-inhibitor']`
+(explicit, not the empty-list fallback). So mdck_inh now gets a transfer arm and an augmented arm.
+
+**VERIFIED (all 9 endpoints, same day):** combos unchanged everywhere except mdck_inh, which gains its
+289 public rows. n_public in TRAIN: solubility 4,888 | logd 4,199 | hlm 276,651 | mlm 273,624 |
+rlm 276,620 | caco2 330,767 | mdck 273,624 | **mdck_inh 289** | ppb 1,451.
+
+**EXPECTATION for mdck_inh, recorded BEFORE the run:** the ChEMBL rows sit ~1.3 log ABOVE internal
+(0.923 vs -0.399) with a 1.4x wider spread. Every earlier augmentation with a shifted public source HURT
+R2det while leaving Pearson r2 flat (wiki 2026-07). So expect the augmented arm to lose to internal-only
+and the transfer arm to carry a large positive bias. If it does, that is a measurement, not a bug — and
+it is the point of wiring it in.
+
+**CAUTION — an edit was lost to the open editor.** The `mdck_inh` filter column had been set to
+`mdck_Cell line - PgP inhibitor` (147 rows) and reverted to `mdck_Cell line` (146 rows) while the user
+had `config/config.yaml` open in the IDE. Restored 2026-09-22. Lesson: after Claude edits a file the
+user has open, re-read it before trusting it; a full config audit caught exactly this one line.
+
+## mdck_inh run set-up for the 2026-09-22 night run
+
+Scope: **mdck_inh only**. The 20260909 result dirs are KEPT, because the PHYS removal and
+`PUBLIC_ORIGIN_MIN_N` 1000->100 provably change no other endpoint's combo (verified across all 9 the
+same day). RF and chemprop therefore recompute mdck_inh alone; the other 8 load from their pickles.
+
+State prepared:
+- `output/chemprop_models/transfer_pretrain/permeability_inh/` **DELETED** (1.3 GB, user-authorised) —
+  it held the all-NaN mdck_inh head. `assess_predictions_cp` reuses a cached checkpoint and passes no
+  `force_pretrain`, so leaving it would have silently reloaded the broken model.
+- `output/predictions_runs_chemprop_transfer/permeability_inh_mdck_inh/` **DELETED** (50 MB, user-
+  authorised) because it held 5 `fold*/model/model_0/best.pt` from the crashed NaN run.
+  **CORRECTION (2026-09-23): that deletion was NOT necessary, and the rule first written here was wrong.**
+  Checked against the vault: chemprop REWRITES `fold*/model/model_0` on every run, and the transfer path
+  never passes `--ensemble-size` (the only `--ensemble-size` in `ML_Reg` belongs to the separate
+  ensemble-UQ experiment), so no `model_1` is ever created for the `model_*/best.pt` glob to pick up.
+  Every workdir in the vault holds exactly one `model_0` per fold, including `clearance_hlm`, which has
+  been re-run several times. **A chemprop WORKDIR is therefore safe to reuse, even after a crash.**
+  `CHEMPROP_OUTPUT_DIR` was briefly bumped to a dated path over this, then reverted. Bump it only to KEEP
+  a finished run's workdirs for comparison. The config comment now states this.
+- `20260909_metrics_rf/mdck_inh.pkl` and `20260909_metrics_cp/mdck_inh.pkl` are both absent, so both
+  runners recompute rather than load.
+- The other 6 stage-1 checkpoints (all8, clearance, mdck_perm, permeability, ppb_fu, sol_lipo) are
+  untouched and still valid, so only `permeability_inh` re-pretrains.
+
+## `fn.score_round_trip` skips an endpoint the prediction table does not carry (2026-09-23)
+
+Adding the 9th endpoint broke every cell that scores an EXTERNAL prediction table: the helper loops over
+`params.ADME_ENDPOINTS` and did `d[pred_col(k)]` unguarded, so a table without an `mdck_inh` column
+raised `KeyError: 'mdck_inh'` (hit in `vignettes/Multitask_adme_preds.ipynb` cell `f7e1632f`, the intern
+transfer figure; his `tmp/20260923_intern_preds.csv` holds the original 8).
+
+**FIX (`python/functions.py`):** an endpoint whose `pred_col(k)` is absent from the merged frame is
+SKIPPED and collected into `skipped`, which is printed when `v=True`. So the returned metrics index holds
+only what the table actually predicts — a caller must check `.index` rather than assume all 9. Verified on
+a synthetic frame built from the real column NAMES with fake values: 8 scored, `mdck_inh` absent, no raise.
+
+**Cell `f7e1632f`** now reads the intern csv FIRST and derives its endpoint list from what he predicts,
+then drops any endpoint with no RF transfer arm (printing which), and the title reports the shared-endpoint
+count.
+
+**★ ONE CANONICAL FIGURE ORDER — `fn.ordered_endpoints(params)` (2026-09-23).** Deriving a figure's
+endpoint list from `params.ADME_ENDPOINTS` put the bars in CONFIG order, which moved `mdck` from position
+3 to 7 and no longer matched the older figures. The helper returns `config webapp.endpoint_order` first,
+then appends any endpoint that key omits (so a new endpoint is never silently dropped from a figure);
+it mirrors `webapp/app.py::_ordered_endpoints`, so the notebook and the webapp grid agree.
+Order: **solubility, logd, mdck, mdck_inh, hlm, mlm, rlm, caco2, ppb**.
+Used by four cells: `acc47159` (arm bar chart), `560d161e` + `eb77e860` (the per-endpoint panels) and
+`f7e1632f` (the intern figure, intersected with his columns). To reorder every figure at once, edit
+`webapp.endpoint_order` — nothing else.
+
+Unaffected: cell `01a26a07` (our own round trip) iterates `rt_metrics.index`, so it follows the skip; the
+confidence panel `eb77e860` already guards empty frames and just renders an empty mdck_inh panel until the
+webapp deploys that endpoint.
+
+## `fn.plot_bar_summary_RF_CP_all_endpoints` — the all-endpoint bar figure moved to `functions.py` (2026-09-23)
+
+Notebook cell `5dc3198e` was 108 lines of figure code with ~30 `_bx_*` locals. It is now 9 lines calling
+`python/functions.py::plot_bar_summary_RF_CP_all_endpoints(rf_dir, cp_dir, params, ...)`.
+
+```
+fn.plot_bar_summary_RF_CP_all_endpoints(
+    params.METRICS_PKL_RF_DIR, params.METRICS_PKL_CP_DIR, params,
+    metric='r2det', clip0=True, nearshell_dir='output/results/20260831_ADME_nearshell',
+    cp_results=output.metrics_results_cp, out_png=None, dpi=None, v=True)
+-> (figure, DataFrame indexed by endpoint)
+```
+- Three grouped bars per endpoint: `ext_->_internal` / `internal_cv` / `augmented_cv`. Each bar is the
+  WINNER of RF vs chemprop (near-shell competes on the augmented arm only), so the figure answers
+  "how well can we predict this endpoint", not "how good is one model".
+- **`dpi` is the SAVE SWITCH:** `None` shows the figure and writes NOTHING; an int saves at that
+  resolution to `out_png`, default `output/figures/bar_summary_RF_CP_<metric>.png`.
+- Reads the per-endpoint pickles only — nothing is refitted. `cp_results` lets the in-memory
+  `output.metrics_results_cp` win over the pickle, as the old cell did.
+- Endpoint order = `fn.ordered_endpoints(params)`. An endpoint with NO RF pickle is skipped and named
+  (RF is the only mandatory source); missing chemprop or near-shell simply means fewer candidates.
+- Returns the summary frame, so the winner table is data rather than a print: columns `n`, then per arm
+  the value and `<arm>_by` (RF / chemprop / near-shell), plus `note` (the winning grouping).
+- matplotlib is imported INSIDE the function, keeping `functions.py` importable without a display and
+  clear of the seaborn/rdkit.Chem.Draw import-order landmine.
+
+Verified both modes on the live pickles: `dpi=None` wrote no file; `dpi=150` wrote a 96 KB png. The 9
+endpoints render in canonical order with the floored-bar arrows intact.
+
+**RF-ONLY TWIN — `fn.plot_bar_summary_RF_all_endpoints(rf_dir, params, ...)` (2026-09-23).** Same three
+arms, one model family, no winner contest — cell `acc47159` went 45 lines -> 8. Same `dpi` save switch
+(default `output/figures/bar_summary_RF_<metric>.png`), same canonical order, same skip-and-name for a
+missing pickle, and `rf_results` lets `output.metrics_results` win over the pickle. Returns
+`(figure, DataFrame)` with `n` + one column per arm.
+
+**Shared between the two figures** (added when the second one landed, so the logic exists once):
+`_BAR_ARMS` (the three arm keys and legend labels, in draw order), `_METRIC_LABEL` / `_METRIC_SHORT`,
+`_load_metrics_pkls(directory, endpoints, in_memory=None)` (unwraps either pickle shape, prefers the
+in-memory store, returns the missing list) and `_save_fig(fig, out_png, dpi, default_name, v)` which
+holds the dpi-is-the-switch rule in one place. Both figures re-verified after the dedup.
+
+## `vignettes/ADME_ML_results.ipynb` — the minimal results notebook (2026-09-23)
+
+New notebook (the file existed but was 0 bytes). Six cells, three of them markdown: one setup cell and
+one call per figure. It REFITS NOTHING — both helpers read the per-endpoint metrics pickles — so it is
+cheap to re-run after any assessment.
+
+- setup: `%autoreload 2`, repo root onto `sys.path` (so `python.` imports whether the kernel starts in
+  `vignettes/` or the repo root; importing `ADME_build_ML` then chdirs to the root itself), then
+  `params = PARAMS('config/config.yaml').load_params()`.
+- `## 1. RF only` -> `fn.plot_bar_summary_RF_all_endpoints(params.METRICS_PKL_RF_DIR, params, metric='r2', dpi=None)`
+- `## 2. Best model per endpoint` -> `fn.plot_bar_summary_RF_CP_all_endpoints(params.METRICS_PKL_RF_DIR,
+  params.METRICS_PKL_CP_DIR, params, metric='r2det', dpi=None)`
+
+Kernelspec copied from `Multitask_adme_preds.ipynb` (display name `chemprop`), so it opens on the same
+kernel. Verified by executing every code cell with cwd=`vignettes/` and the magics stripped: both cells
+ran, cwd ended at the repo root, both frames held all 9 endpoints, and `dpi=None` wrote no png.
+
+
+## Can CHEMPROP_OUTPUT_DIR and CHEMPROP_PRETRAIN_DIR be kept across runs? (2026-09-23)
+
+**`CHEMPROP_OUTPUT_DIR` — YES, always.** Chemprop rewrites `fold*/model/model_0` each run and the
+transfer path never creates a `model_1`. Bump it only to keep an old run's workdirs.
+
+**`CHEMPROP_PRETRAIN_DIR` — yes, as long as the PUBLIC pool is unchanged.** Stage 1 trains on
+`cp_pub` = public rows with >=1 grouping task measured, MINUS internal twins. So it changes when:
+| change | re-pretrain? |
+|---|---|
+| `ENDPOINT_PUBLIC_FILES` edited (file added/removed) | **YES** |
+| `CHEMPROP_TRANSFER.public_proxy` edited | **YES** |
+| a grouping's task list edited | **YES** (different head, different pool) |
+| new INTERNAL compounds (a CDD `--overwrite` pull) | only if they add a public TWIN |
+| `BEST_PUBLIC` edited | no — chemprop never reads it |
+| `PUBLIC_ORIGIN_MIN_N` changed | no — RF-only gate |
+
+The internal-compound case is decided by `drop_internal_twins`. **Evidence: every `leak control (exact):
+dropped N of M` line in every log of this project reads N = 0** — across all endpoints and internal set
+sizes from 39 to 325 compounds. Our bRo5 PROTACs simply never twin a public small molecule. So in
+practice a CDD pull does NOT invalidate a stage-1 checkpoint; check that line to confirm it stays 0.
+
+CAUTION: the reuse is SILENT — `assess_predictions_cp` passes no `force_pretrain`. The log says which
+happened: `> PRETRAIN <n> public rows ...` (fresh) vs `> PRETRAIN reused checkpoint -> <path>` (cached).

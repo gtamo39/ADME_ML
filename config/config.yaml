@@ -6,15 +6,43 @@
 # Point any legacy runner at that file with --config config/config_legacy_20260903.yaml.
 #
 # WHO READS WHAT
-#   python/ADME_build_ML.py            : ADME_ENDPOINTS, ENDPOINT_PUBLIC_FILES, BEST_PUBLIC, RF_SINGLETASK,
+#   python/ADME_build_ML.py            : RUN PATHS (ADME_RAW_CSV, METRICS_PKL_RF_DIR, METRICS_PKL_CP_DIR,
+#                                        CHEMPROP_OUTPUT_DIR, CHEMPROP_PRETRAIN_DIR), ADME_ENDPOINTS,
+#                                        ENDPOINT_PUBLIC_FILES, BEST_PUBLIC, RF_SINGLETASK,
 #                                        BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER, MF_features_all_path,
-#                                        METRICS_PKL_RF_DIR, METRICS_PKL_CP_DIR, FOLD_GROUP_BY_INCHIKEY, DEPLOY
+#                                        FOLD_GROUP_BY_INCHIKEY, DEPLOY
 #   vignettes/Multitask_adme_preds.ipynb: ADME_ENDPOINTS, BEST_PUBLIC, RF_SINGLETASK, METRICS_PKL_RF_DIR,
 #                                        METRICS_PKL_CP_DIR, SERAC_C, webapp
 #   webapp/app.py                      : ADME_ENDPOINTS, SERAC_C, webapp
 #
 # CAUTION: PARAMS.load_params does __dict__.update(yaml), so every top-level key becomes params.<KEY>.
 # Removing a key that a method reads fails only at that call site — grep before deleting one.
+
+## ==================== RUN PATHS — CHANGE THESE FIVE TOGETHER FOR A NEW RUN ====================
+# Every path that carries a run date lives here. Bump all five to the same stamp; a mixed set silently
+# blends two runs (e.g. chemprop scored on the PREVIOUS run's RF folds).
+# ORDER: run --assess_RF_all_endpoints BEFORE --assess_CP_all_endpoints. DATA._cp_folds reads the `fold`
+# column of <METRICS_PKL_RF_DIR>/<ep>.pkl, so an empty RF dir makes chemprop build its own, incomparable folds.
+# CAUTION: `--overwrite` WRITES the CDD Vault pull to ADME_RAW_CSV. Point it at a NEW file, or the pull
+# overwrites that snapshot and the old internal data is not recoverable.
+# NOT dated, so NOT here: MF_features_all_path (the public feature cache is keyed by its own `date`
+# argument and public SMILES never change; the internal block is always recomputed).
+ADME_RAW_CSV: 'data/202623_all_adme.csv' # 'data/20260707_all_adme.csv'                 # DATA.load_df_internal_exp_all reads this csv; --overwrite re-pulls from CDD Vault and rewrites it
+METRICS_PKL_RF_DIR: 'output/results/20260923_metrics_rf'   # OUTPUT.assess_predictions writes <k>.pkl here (6 RF arms); ALSO the fold source for chemprop
+METRICS_PKL_CP_DIR: 'output/results/20260923_metrics_cp'   # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
+# The next two are read as CHEMPROP_TRANSFER.output_dir / .pretrain_dir. They are YAML anchors, so the
+# value lives HERE and the CHEMPROP_TRANSFER entries below are aliases (*name). Edit them here only.
+CHEMPROP_OUTPUT_DIR:   &cp_output_dir   'output/predictions_runs_chemprop_transfer_20260923'   # per-endpoint chemprop workdirs <grouping>_<ep>
+# SAFE TO REUSE, including after a crash: chemprop rewrites fold*/model/model_0 on every run, and the
+# transfer path never passes --ensemble-size, so no model_1 is ever left behind for ML_Reg's
+# model_*/best.pt glob to pick up. Bump it only to KEEP a finished run's workdirs for comparison.
+CHEMPROP_PRETRAIN_DIR: &cp_pretrain_dir 'output/chemprop_models/transfer_pretrain'    # persisted stage-1 checkpoints, reused per grouping
+# REUSED SILENTLY: assess_predictions_cp passes NO force_pretrain, so a cached checkpoint is loaded as
+# it is. BUMP THIS (or delete the grouping's directory) whenever the PUBLIC pool changes:
+# ENDPOINT_PUBLIC_FILES, CHEMPROP_TRANSFER.public_proxy, or a grouping's task list.
+# New INTERNAL compounds reach the pool ONLY through leak control (drop_internal_twins), so check the
+# run's `leak control (exact): dropped N of M` line — N has been 0 in every run to date (our bRo5
+# compounds never twin a public molecule), so in practice a CDD pull does NOT invalidate stage 1.
 
 ## ==================== ENDPOINT DEFINITIONS ====================
 # endpoint -> in-house target column + transform to modelling space.
@@ -27,6 +55,7 @@ ADME_ENDPOINTS:
   rlm:        {col: 'rlm_CLint (raw)',                         transform: log10,     unit: uL/min/mg}
   caco2:      {col: 'caco2_Mean Papp A to B',                  transform: log10,     unit: 1e-6cm/s}
   mdck:       {col: 'mdck_Mean Papp A to B',                   transform: log10,     unit: 1e-6cm/s, filter: {col: 'mdck_Cell line', contains: MDR1}}  # MDR1-MDCK only (drop MDR2/MDR3)
+  mdck_inh:   {col: 'mdck_Mean Papp A to B - PgP Inhibitor',   transform: log10,     unit: 1e-6cm/s, filter: {col: 'mdck_Cell line - PgP inhibitor', contains: MDR1}}  # the INHIBITOR arm's own cell-line column: 147 rows, vs 146 on 'mdck_Cell line' (one row has it blank)
   ppb:        {col: 'ppb_%Unbound',                            transform: logit_pct, unit: pct_unbound}
 
 ## ============ PUBLIC DATA (prebuilt parquets) + PER-ENDPOINT SELECTIONS ============
@@ -47,6 +76,7 @@ ENDPOINT_PUBLIC_FILES:
   solubility: [public_solubility.parquet]
   logd:  [public_logd.parquet]
   mdck:  [public_novartis_mdck.parquet]
+  mdck_inh: [public_chembl_mdck_inh.parquet]   # 289 ChEMBL compounds, MDR1-MDCK Papp A->B WITH a P-gp inhibitor (python/harvest_chembl_mdck_inh.py)
   hlm:   [public_hlm.parquet, public_novartis_hlm.parquet]
   mlm:   [public_novartis_mlm.parquet]
   rlm:   [public_rlm.parquet, public_novartis_rlm.parquet]
@@ -54,9 +84,10 @@ ENDPOINT_PUBLIC_FILES:
   ppb:   [public_ppb.parquet, public_novartis_ppb.parquet]
 
 BEST_PUBLIC:
-  solubility: ['thermodynamic:ChEMBL','thermodynamic:AQUA','thermodynamic:PHYS']
+  solubility: ['thermodynamic:ChEMBL','thermodynamic:AQUA']   # PHYS removed 2026-09-22: 834 compounds, so min_n always dropped it (config said one thing, the model trained on another)
   logd:       ['TDC:Lipophilicity_AstraZeneca']
   mdck:       ['Novartis-NIBR']
+  mdck_inh:   ['ChEMBL:MDCK-MDR1_PgP-inhibitor']   # needs PUBLIC_ORIGIN_MIN_N <= 289
   hlm:        ['Biogen:hlm_biogen','Novartis-NIBR']
   mlm:        ['Novartis-NIBR']
   rlm:        ['Biogen:rlm', 'Novartis-NIBR']
@@ -83,6 +114,7 @@ BEST_CHEMPROP_GROUPINGS:
   logd:       sol_lipo
   solubility: all8
   mdck:       mdck_perm
+  mdck_inh:   permeability_inh   # NOT yet measured against RF — the first run sets the champion
   ppb:        ppb_fu
 
 ## ==================== MODELS ====================
@@ -108,8 +140,8 @@ RF_SINGLETASK:
 # One finetune per (endpoint, fold); never score several endpoints from one finetuned model.
 CHEMPROP_TRANSFER:
   chemprop_bin: ~/miniconda3/envs/chemprop/bin/chemprop   # shelled out to, so the runner can live in env ML
-  output_dir: output/predictions_runs_chemprop_transfer
-  pretrain_dir: output/chemprop_models/transfer_pretrain  # persisted stage-1 checkpoints (reused across folds)
+  output_dir: *cp_output_dir      # set in RUN PATHS at the top of this file
+  pretrain_dir: *cp_pretrain_dir  # set in RUN PATHS at the top of this file
   epochs_pretrain: 30
   epochs_finetune: 30
   patience: 15
@@ -127,22 +159,33 @@ CHEMPROP_TRANSFER:
   groupings:
     clearance:    [hlm, mlm, rlm]
     permeability: [caco2, mdck]         # same assay family (Papp A->B) — the clearance analogue for permeability
+    permeability_inh: [caco2, mdck, mdck_inh]   # the same family plus the P-gp-inhibited MDCK arm (mdck_inh only)
     sol_lipo:     [solubility, logd]     # retest as a PRETRAIN block (2026-07 verdict was for multitask prediction)
     all8:         [solubility, logd, hlm, mlm, rlm, caco2, mdck, ppb]
   # CLUSTER groupings: tasks are the internal target endpoint + related raw Novartis pred(...) columns as
   # auxiliary co-training tasks (prebuilt by python/build_novartis_clusters.py). Aux column names are read
   # from the parquet schema (everything except smiles/_ik), so they are not duplicated here.
+  # PUBLIC PROXY — a task with NO public label breaks stage 1. Chemprop fits one target scaler per task,
+  # so an all-NaN column gives a NaN scaler and that head predicts NaN forever; the frozen-encoder
+  # finetune inherits the scaler and cannot repair it (seen 2026-09-22 on mdck_inh: every fold rmse=nan).
+  # A proxy fills that task's PUBLIC rows from a related public column. INTERNAL rows keep their real
+  # labels, so only stage 1 is affected, and the stage-2 head re-learns any offset on internal data.
+  # CAUTION: this is a modelling assumption, not a measurement. Record it in the wiki when you add one.
+  public_proxy:
+    mdck_inh: {file: tf_novartis_mdck_perm.parquet, column: LE_MDCKv2_LogPapp}   # wild-type MDCK (no P-gp) ~ MDR1-MDCK + P-gp inhibitor; std 0.557 vs internal 0.568, offset +1.49 log
   clusters:
     mdck_perm: {target: mdck, file: tf_novartis_mdck_perm.parquet}   # MDCKv1/v2, Caco-2, MDR1 LogER, logPAMPA
     ppb_fu:    {target: ppb,  file: tf_novartis_ppb_fu.parquet}      # LogFu x5 species, HSA, Fubrain, Fumic, LogP/LogD
 
 ## ==================== PATHS / CV POLICY ====================
-## ---- ML model training and deployment ---- ##
+## The run-dated paths moved to RUN PATHS at the top of this file. What stays here carries no run date.
 MF_features_all_path: 'output/features/'   # DATA.build_MF_features writes/loads <date>_MF_features.parquet here (all compounds in df_all)
-METRICS_PKL_RF_DIR: 'output/results/20260909_metrics_rf' # 'output/results/20260825_metrics'    # OUTPUT.assess_predictions writes <k>.pkl here (6 RF arms).
-                                                        # ALSO the fold source for chemprop: DATA._cp_folds reads the
-                                                        # `fold` column of <k>.pkl, so both models score identical folds.
-METRICS_PKL_CP_DIR: 'output/results/20260909_metrics_cp' # 'output/results/20260907_metrics_cp'   # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
+# Minimum compounds for a public ORIGIN to enter an RF arm (get_internal_public_sets keeps count > this).
+# RF ONLY — chemprop reads ENDPOINT_PUBLIC_FILES straight from df_all and ignores both this and BEST_PUBLIC.
+# Lowered 1000 -> 100 on 2026-09-22 so mdck_inh's 289 ChEMBL compounds reach the RF augmented arm.
+# Verified the same day: at 100 no OTHER endpoint's combo changes, because every origin BEST_PUBLIC
+# names is far above either threshold. `--min_n` on the CLI still overrides this.
+PUBLIC_ORIGIN_MIN_N: 100
 FOLD_GROUP_BY_INCHIKEY: true   # CV folds grouped by InChIKey so a molecule's twins never split across train/test (anti-leakage)
 
 ## ==================== DEPLOYMENT ====================
@@ -165,7 +208,7 @@ SERAC_C:                    # named palette: name -> hex (quote hex; '#' is a YA
 webapp:
   host: '127.0.0.1'                # bind localhost only — chemistry data must not leave the box
   port: 8050
-  endpoint_order: [solubility, logd, mdck, hlm, mlm, rlm, caco2, ppb]   # column order in the grid
+  endpoint_order: [solubility, logd, mdck, mdck_inh, hlm, mlm, rlm, caco2, ppb]   # column order in the grid
   confidence_split: 0.5            # confidence > split -> azure, <= split -> ember (diverging gradient)
   color_slope: 2.0                 # value-fade steepness per modelling-space unit from the cutoff (higher = harder edge)
   cutoffs:                         # raw-unit triage cutoff + the comparison that means FAVORABLE
@@ -176,6 +219,7 @@ webapp:
     rlm:        {value: 12, favorable: '<'}     # uL/min/mg
     caco2:      {value: 10, favorable: '>='}    # 1e-6 cm/s
     mdck:       {value: 10, favorable: '>='}    # 1e-6 cm/s
+    mdck_inh:   {value: 10, favorable: '>='}    # 1e-6 cm/s, P-gp inhibited
     ppb:        {value: 1,  favorable: '<'}     # % unbound
   # Which model supplies the VALUE per endpoint (winners of the AUGMENTED arm, r2, wiki 2026-09-09).
   # The CONFIDENCE always comes from the RF model adme_<ep>_h237 — a chemprop regression head
@@ -191,6 +235,7 @@ webapp:
     mlm:        chemprop     # 0.662 (clearance) — margin over RF 0.664 internal is 0.002, inside the noise
     rlm:        chemprop     # 0.527 (clearance) beats RF 0.109
     mdck:       rf           # near-shell 0.542 wins but is not deployable yet
+    mdck_inh:   rf           # new endpoint — RF until the chemprop arm is measured
     caco2:      rf           # near-shell 0.765 wins but is not deployable yet
     ppb:        rf           # 0.548 (all public) — RF wins outright
 

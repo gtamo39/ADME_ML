@@ -116,10 +116,10 @@ class DATA():
         return None: (self.df_all — compound, smiles, <endpoint labels...>, source, origin)
         """
         eps = list(params.ADME_ENDPOINTS)
-        # build any endpoint dfs not already present
+        # build any endpoint dfs not already present (generic: a new config endpoint needs no alias)
         for ep in eps:
             if ep not in self.dfs:
-                getattr(self, f'get_{ep}_data')(params)
+                self._endpoint_dfs(params, ep)
         # long -> wide: one label column per endpoint, collapsed per compound (first non-null)
         frames = [self.dfs[ep][['compound', 'smiles', 'source', 'origin', 'label']].rename(columns={'label': ep}) for ep in eps]
         df = pd.concat(frames, ignore_index=True).groupby('compound', as_index=False).first()
@@ -196,7 +196,8 @@ class DATA():
         """
         -Generic augmented-dataset builder: internal endpoint column mapped to modelling space via the config
          transform (log10 / identity / logit_pct), plus the concatenated public EXP parquets listed in
-         params.ENDPOINT_PUBLIC_FILES[endpoint] (their 'value' is already in modelling space). Store self.dfs[endpoint].
+         params.ENDPOINT_PUBLIC_FILES[endpoint] (their 'value' is already in modelling space). An endpoint
+         with no entry there (or an empty one, e.g. mdck_inh) is internal-only. Store self.dfs[endpoint].
         return None: (self.dfs[endpoint] — compound, smiles, label, source, origin, raw)
         """
         ep = params.ADME_ENDPOINTS[endpoint]; col = ep['col']; fwd, inv = _TF[ep['transform']]
@@ -207,8 +208,10 @@ class DATA():
         internal = (df0[['name', 'smiles', col]].dropna(subset=[col]).rename(columns={'name': 'compound', col: 'label'}))
         internal['label'] = fwd(internal['label'].astype(float))           # raw -> modelling space
         internal['source'] = 'internal'; internal['origin'] = 'internal'
+        # public EXP rows; an endpoint with no public file stays internal-only (empty EXP block)
+        files = params.ENDPOINT_PUBLIC_FILES.get(endpoint, [])
         exp = pd.concat([pd.read_parquet(f"{params.ADME_CACHE}/{f}", columns=['compound', 'smiles', 'value', 'origin'])
-                         for f in params.ENDPOINT_PUBLIC_FILES[endpoint]], ignore_index=True).rename(columns={'value': 'label'})
+                         for f in files], ignore_index=True).rename(columns={'value': 'label'}) if files else internal.iloc[:0].copy()
         exp['source'] = 'EXP'
         df = pd.concat([internal, exp[internal.columns]], ignore_index=True)
         df['raw'] = inv(df['label'])                                       # inverse transform -> raw units
@@ -294,6 +297,19 @@ class DATA():
         if aux is not None:
             wide = wide.merge(aux, on='smiles', how='left')
             wide.loc[wide.source == 'internal', [c for c in aux.columns if c != 'smiles']] = np.nan
+        # public proxy: a task with NO public label makes chemprop's stage-1 target scaler NaN, and that
+        # head then predicts NaN for ever. Fill its PUBLIC rows from a related public column (config
+        # CHEMPROP_TRANSFER.public_proxy); INTERNAL rows keep their real labels, so only stage 1 changes.
+        for t, prox in cfg.get('public_proxy', {}).items():
+            if t not in self.cp_tasks:
+                continue
+            src = pd.read_parquet(os.path.join(getattr(params, 'ADME_CACHE', 'autoresearch/predict_adme'),
+                                               prox['file']), columns=['smiles', prox['column']]).drop_duplicates('smiles')
+            pubrow = wide.source != 'internal'
+            wide.loc[pubrow, t] = wide.loc[pubrow, t].fillna(          # a MEASURED public label wins
+                wide.loc[pubrow, 'smiles'].map(dict(zip(src.smiles, src[prox['column']]))))
+            print(f"> public proxy: '{t}' <- {prox['column']} ({prox['file']}) on "
+                  f"{int(wide.loc[pubrow, t].notna().sum())} public rows")
         # a non-finite label (log10 of 0, logit_pct of 0/100 %) breaks chemprop's target scaler -> mask it as
         # NaN, so the multitask loss ignores that one task and the row keeps its other labels
         n_inf = int(np.isinf(wide[self.cp_tasks].to_numpy(dtype=float)).sum())
@@ -304,6 +320,12 @@ class DATA():
         self.cp_int = wide[(wide.source == 'internal') & wide[k].notna()].reset_index(drop=True)
         # leak control: a public molecule that also exists internally must not pretrain the model
         self.cp_pub, _ = fn.drop_internal_twins(self.cp_pub, self.cp_int, level=leak)
+        # stage 1 fits one target scaler per task, so a scored task with 0 public labels gets a NaN scaler
+        # and predicts NaN for every fold. Fail here, not after an hour of training.
+        assert int(self.cp_pub[k].notna().sum()), (
+            f"'{k}' has 0 public labels in the '{self.cp_grouping}' pretrain pool -> chemprop's stage-1 "
+            f"target scaler for it is NaN and every prediction would be NaN. Add a "
+            f"CHEMPROP_TRANSFER.public_proxy entry for '{k}', or drop it from BEST_CHEMPROP_GROUPINGS.")
         self.cp_folds, self.cp_fold_source = self._cp_folds(params, k, n_splits, seed)
         print(f"> CP_data '{self.cp_grouping}' for '{k}': tasks={self.cp_tasks} | DS_ features={len(self.cp_ds_cols)}")
         print(f"  cp_pub  {len(self.cp_pub):>7} public rows   non-null: "
@@ -345,17 +367,19 @@ class DATA():
         ik = fn.inchikeys_for(self.cp_int) if getattr(params, 'FOLD_GROUP_BY_INCHIKEY', True) else None
         return self._grouped_folds(n_splits, seed, df=self.cp_int.assign(_ik=ik)), 'independent'
 
-    def get_internal_public_sets(self, k, min_n=1000):
+    def get_internal_public_sets(self, k, min_n=None):
         """
         -Split endpoint k's modelling frame (self.ML_data[k]) into internal vs public sets and rank the
          public origins. Add an InChIKey column, keep the internal rows, keep the public (EXP) rows whose
          InChIKey is NOT an internal twin (drop leaks), and list public origins with more than min_n compounds.
         param str k: endpoint key (index into self.ML_data)
         param int min_n: keep a public origin only when it has more than this many compounds
+            (default: config PUBLIC_ORIGIN_MIN_N, via the params stored by build_ML_data_RF)
         return None: (sets self.k, self.d, self.internal, self.pub, self.origins)
         """
         # remember the current endpoint key (used downstream by OUTPUT.assess_predictions)
         self.k = k
+        min_n = getattr(self.params, 'PUBLIC_ORIGIN_MIN_N', 1000) if min_n is None else min_n
         # add an InChIKey column for leak detection between internal and public
         self.d = self.ML_data[k].assign(_ik=fn.smiles_to_inchikeys(self.ML_data[k].smiles))
         # internal rows
@@ -511,7 +535,8 @@ class OUTPUT():
         """
         -Compute (or load if outpath already exists) the 6 prediction arms for endpoint data.k and store them
          in self.metrics_results[data.k]. Arms: ext->internal, internal_cv, augmented_cv, internal_temp,
-         augmented_temp, ext->temp. Then add the 4 conf_* columns (conf_labelstd / conf_rmse / conf_recal /
+         augmented_temp, ext->temp. An internal-only endpoint has no public train set, so the two ext->* arms
+         are skipped and 4 arms remain (the augmented ones then equal their internal twins). Then add the 4 conf_* columns (conf_labelstd / conf_rmse / conf_recal /
          conf_conformal) leakage-controlled: CV arms via leave-one-fold-out (each fold scored by the others),
          single-block arms via a calibration fit on augmented_cv EXCLUDING that arm's test compounds. The
          pooled augmented_cv calibration is stored under '_calibration' for the webapp. On first compute, pickle.
@@ -526,8 +551,9 @@ class OUTPUT():
         k = data.k
         if not os.path.exists(outpath):
             r = {}
-            # external public -> internal
-            r = self.predict_and_record(data.d, r, 'ext_->_internal', [[data.pub_ids, data.int_ids]])
+            # external public -> internal (an internal-only endpoint has no public train set -> arm skipped)
+            if data.pub_ids:
+                r = self.predict_and_record(data.d, r, 'ext_->_internal', [[data.pub_ids, data.int_ids]])
             # internal 5-fold CV
             r = self.predict_and_record(data.internal, r, 'internal_cv', data.fold_ids)
             # augmented 5-fold CV (public added to TRAIN only) — this arm calibrates the confidence
@@ -536,8 +562,9 @@ class OUTPUT():
             r = self.predict_and_record(data.d, r, 'internal_temp', [[data.train_temp_ids, data.test_temp_ids]])
             # augmented temporal (public added to the temporal TRAIN)
             r = self.predict_and_record(data.d, r, 'augmented_temp', [[data.train_temp_ids + data.pub_ids, data.test_temp_ids]])
-            # external public -> temporal hold-out test
-            r = self.predict_and_record(data.d, r, 'ext_->_temp', [[data.pub_ids, data.test_temp_ids]])
+            # external public -> temporal hold-out test (skipped with no public rows, as above)
+            if data.pub_ids:
+                r = self.predict_and_record(data.d, r, 'ext_->_temp', [[data.pub_ids, data.test_temp_ids]])
             # confidence (leakage-controlled). deploy params = pooled augmented_cv, stored for the webapp
             acv = r['augmented_cv_preddf']
             r['_calibration'] = ML_Reg.calibrate_confidence_params(acv)
@@ -547,7 +574,8 @@ class OUTPUT():
                 r[a + '_preddf'] = lofo if lofo is not None else ML_Reg.apply_confidences(r[a + '_preddf'], r['_calibration'])
             # single-block arms (1 test block, can't LOFO): calibrate on augmented_cv EXCLUDING this arm's
             # test compounds (fully honest); fall back to the pooled deploy calibration if too few rows remain
-            for a in ['ext_->_internal', 'internal_temp', 'augmented_temp', 'ext_->_temp']:
+            for a in [a for a in ['ext_->_internal', 'internal_temp', 'augmented_temp', 'ext_->_temp']
+                      if a + '_preddf' in r]:
                 cal_rows = acv[~acv['compound'].isin(set(r[a + '_preddf']['compound']))]
                 calib_a = ML_Reg.calibrate_confidence_params(cal_rows) if len(cal_rows) >= 30 else r['_calibration']
                 r[a + '_preddf'] = ML_Reg.apply_confidences(r[a + '_preddf'], calib_a)
@@ -641,7 +669,7 @@ class OUTPUT():
               f"{list(self.metrics_results_cp)})")
         return r
 
-    def assess_all_endpoints(self, data, params, endpoints=None, min_n=1000):
+    def assess_all_endpoints(self, data, params, endpoints=None, min_n=None):
         """
         -used in CLI: python/ADME_build_ML.py --assess_RF_all_endpoints
         -Run the full single-task RF assessment for every endpoint: build the ML frame, split internal vs
@@ -651,10 +679,11 @@ class OUTPUT():
         param DATA data: a DATA with load_combine_dfs + build_MF_features already run
         param class params: PARAMS instance (ADME_ENDPOINTS, BEST_PUBLIC, METRICS_PKL_RF_DIR)
         param list endpoints: endpoints to run (default: all params.ADME_ENDPOINTS)
-        param int min_n: public-origin minimum-count filter (get_internal_public_sets)
+        param int min_n: public-origin minimum-count filter (default config PUBLIC_ORIGIN_MIN_N)
         return dict: self.metrics_results (endpoint -> arm results)
         """
         eps = endpoints or list(params.ADME_ENDPOINTS)
+        min_n = params.PUBLIC_ORIGIN_MIN_N if min_n is None else min_n
         for k in eps:
             # build the modelling frame (features from MF_features['all']) + integrity check
             data.build_ML_data_RF(params, k=k)
@@ -871,7 +900,7 @@ class OUTPUT():
                   f"n_train={s['n_train']} -> {s['model_dir']}")
         return summaries
 
-    def deploy_all_endpoints(self, data, params, endpoints=None, min_n=1000, dry_run=False):
+    def deploy_all_endpoints(self, data, params, endpoints=None, min_n=None, dry_run=False):
         """
         -Fit + deploy the RF for every endpoint: build the ML frame, split internal vs public, select the
          BEST_PUBLIC combo, then deploy_endpoint (fit on internal+public, calibrate conf_recal, register a new
@@ -879,11 +908,12 @@ class OUTPUT():
         param DATA data: a DATA with load_combine_dfs + build_MF_features already run
         param class params: PARAMS instance (ADME_ENDPOINTS, BEST_PUBLIC, DEPLOY)
         param list endpoints: endpoints to deploy (default: all params.ADME_ENDPOINTS)
-        param int min_n: public-origin minimum-count filter (get_internal_public_sets)
+        param int min_n: public-origin minimum-count filter (default config PUBLIC_ORIGIN_MIN_N)
         param bool dry_run: fit + calibrate but do not register to MLTrail
         return list: one summary dict per endpoint
         """
         registry = None if dry_run else __import__('mltrail').Registry.from_default()
+        min_n = params.PUBLIC_ORIGIN_MIN_N if min_n is None else min_n
         summaries = []
         for k in (endpoints or list(params.ADME_ENDPOINTS)):
             # build the modelling frame (features from MF_features['all']) + integrity check
@@ -920,7 +950,8 @@ if __name__ == "__main__":
     ap.add_argument('--force_pretrain', action='store_true',
                     help="chemprop: retrain stage 1 instead of reusing the cached grouping checkpoint")
     ap.add_argument('--endpoints', default=None, help="comma-separated subset for --assess/--deploy")
-    ap.add_argument('--min_n', type=int, default=1000, help="public-origin minimum-count filter")
+    ap.add_argument('--min_n', type=int, default=None,
+                    help="public-origin minimum-count filter (default: config PUBLIC_ORIGIN_MIN_N)")
     args = ap.parse_args()
 
     ## params:

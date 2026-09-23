@@ -1,0 +1,46 @@
+# ADME_ML — config for python/harvest_chembl_mdck_inh.py
+#
+# Kept OUT of config/config.yaml on purpose: that file serves exactly three consumers
+# (ADME_build_ML.py, the notebook, webapp/app.py) and every key in it is read by one of them.
+# This harvester is a fourth, occasional tool, so it carries its own YAML.
+#
+# WHAT IT BUILDS: the public parquet for `mdck_inh` — MDR1-MDCK apparent permeability, apical to
+# basolateral, measured WITH a P-gp inhibitor (i.e. passive permeability). Output columns follow the
+# public contract DATA._endpoint_dfs reads: compound / smiles / value / origin.
+
+API: 'https://www.ebi.ac.uk/chembl/api/data'   # ChEMBL REST root (public data only)
+CACHE_DIR: 'data/public_adme/chembl_mdck_inh'  # raw API pages, so a re-run needs no network
+OUT_DIR: 'autoresearch/predict_adme'           # same directory as the other public_*.parquet
+OUT_FILE: 'public_chembl_mdck_inh.parquet'
+PAGE_SIZE: 1000                                # rows per API page
+ID_BATCH: 20                                   # assay ids per activity request (keeps the URL short)
+
+ORIGIN: 'ChEMBL:MDCK-MDR1_PgP-inhibitor'       # the provenance string BEST_PUBLIC would select on
+ID_PREFIX: 'PUB_mdck_inh'                      # compound ids, matching the PUB_<ep>_<i> convention
+
+# ---- assay selection: regex matched against the lower-cased assay description ----
+# The funnel is deliberate. `cell` demands the MDR1 line, `quantity` a permeability value, `inhibitor`
+# a blocked P-gp, and `direction` the A->B leg. Drop a rule here and the harvest stops being the
+# in-house quantity (see the wiki, 2026-09-22).
+ASSAY_QUERY: MDCK                              # the server-side description__icontains filter
+ASSAY_RULES:
+  cell:       '(mdr1|mdck-?ii?[- ]?mdr|p-?gp|p-?glycoprotein|abcb1)'
+  quantity:   '(permeability|papp)'
+  inhibitor:  '(inhibitor|elacridar|gf120918|gf-120918|valspodar|psc[- ]?833|zosuquidar|ly335979|tariquidar|xr9576|verapamil|cyclosporin|quinidine|ketoconazole)'
+  direction:  '(apical to basolateral|apical-to-basolateral|a to b|a2b|a->b)'
+EXCLUDE_DIRECTION: '(basolateral to apical|basolateral-to-apical|b to a|b2a|b->a)'   # reject the reverse leg
+ACTIVITY_TYPE: '^(papp|permeability)'          # a VALUE, not a ratio or a recovery
+
+# ---- units -> 1e-6 cm/s (the in-house unit for this endpoint) ----
+# 1 nm/s = 1e-7 cm/s = 0.1 x 1e-6 cm/s. Everything else is already 1e-6 cm/s under another spelling.
+UNIT_FACTOR:
+  '10^-6 cm/s': 1.0
+  '10E-6 cm/s': 1.0
+  "10'-6 cm/s": 1.0
+  'ucm/s':      1.0
+  'nm/s':       0.1
+  'nM/s':       0.1
+
+DROP_CENSORED: true      # drop standard_relation other than '=' (a '<' is a detection limit, not a value)
+DEDUP: median            # several assays measure one molecule -> aggregate in MODELLING space
+TRANSFORM: log10         # must match config/config.yaml ADME_ENDPOINTS.mdck_inh.transform
