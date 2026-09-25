@@ -81,6 +81,7 @@ STAGE_DIR = Path(tempfile.mkdtemp(prefix="adme_webapp_"))
 atexit.register(lambda: shutil.rmtree(STAGE_DIR, ignore_errors=True))
 
 VALUE_MODEL = WEBAPP.get("value_model", {})   # endpoint -> 'rf' | 'chemprop' (which model gives the VALUE)
+MLTRAIL_IDS = CONFIG.get("MLTRAIL_IDS", {})   # framework -> endpoint -> pinned vault id (None = not deployed)
 
 CHAMPIONS = {}          # endpoint -> {model, feature_cols, sigma, transform, unit, cutoff, favorable, model_id}
 CP_VALUES = {}          # endpoint -> {checkpoint, tasks, descriptor_cols, transform, model_id} (value only)
@@ -93,26 +94,25 @@ _LAST_BLOCKS = None     # original SDF record per row of _LAST_CSV, or None when
 # ---------- startup: discover + load the champions ----------
 
 def _discover_champions():
-    """Load the deployed RF models from the MLTrail vault, per endpoint. Prefer the new H237 models
-    (`adme_<ep>_h237`, conf_recal calibration bundled) over the older H236 champions (`adme_<ep>`,
-    training-label-std fallback). Loads model + feature_cols + calibration from each model bundle."""
+    """Load the deployed RF model for every endpoint, by the id pinned in config MLTRAIL_IDS.rf.
+    The pin is authoritative: the vault listing is never scanned and its order never matters. Loads
+    model + feature_cols + calibration from each bundle; an H236 entry has no conf_recal, so its
+    confidence scale falls back to the std of the archived training labels. These models supply the
+    CONFIDENCE for every endpoint, so an endpoint with no usable pin is dropped from the app."""
     reg = Registry.from_default()
     cutoffs = WEBAPP.get("cutoffs", {})
-    # gather adme_ sklearn models keyed by (endpoint, features_type); prefer H237 below
-    found = {}
-    for _, row in reg.list().iterrows():
-        d = reg.details(row["id"])
-        name = str(d.get("experiment_name", ""))
-        if not (name.startswith("adme_") and d.get("framework") == "sklearn"):
+    # bind the id pinned in config MLTRAIL_IDS.rf; an unpinned or missing entry drops the endpoint
+    for ep in ENDPOINT_CFG:
+        mid = MLTRAIL_IDS.get("rf", {}).get(ep)
+        if mid is None:
+            print(f"WARN: {ep}: no MLTRAIL_IDS.rf pin; endpoint dropped (it has no confidence)", flush=True)
+            continue
+        try:
+            d = reg.details(int(mid))
+        except Exception as ex:
+            print(f"WARN: {ep}: MLTRAIL_IDS.rf id {mid} unavailable ({ex}); endpoint dropped", flush=True)
             continue
         ft = d.get("features_type")
-        if ft not in ("H236", "H237"):
-            continue
-        ep = name[len("adme_"):].removesuffix("_h237")
-        found.setdefault(ep, {})[ft] = d
-    for ep, by_ft in found.items():
-        d = by_ft.get("H237") or by_ft.get("H236")
-        ft = "H237" if "H237" in by_ft else "H236"
         # the bundle carries model + trained columns + (for H237) the conf_recal calibration
         bundle = joblib.load(d["model_path"])
         model = bundle["model"] if isinstance(bundle, dict) else bundle
@@ -138,8 +138,8 @@ def _discover_champions():
 
 
 def _discover_cp_values():
-    """Load the deployed chemprop models (`adme_<ep>_cp`) for every endpoint that config
-    `webapp.value_model` sends to chemprop. These supply the VALUE only — the confidence keeps coming
+    """Load the deployed chemprop model for every endpoint that config `webapp.value_model` sends to
+    chemprop, by the id pinned in config MLTRAIL_IDS.chemprop. These supply the VALUE only — the confidence keeps coming
     from the RF champion, because a chemprop regression head returns no per-row std. Each model
     directory describes itself in `deploy_meta.json` (task list, target index, DS_ descriptor columns),
     written by OUTPUT.deploy_endpoint_cp; MLTrail's own chemprop_predict is not used, because it sends
@@ -151,13 +151,16 @@ def _discover_cp_values():
     if not want:
         return
     reg, cp_bin = Registry.from_default(), CONFIG["CHEMPROP_TRANSFER"]["chemprop_bin"]
-    for _, row in reg.list().iterrows():
-        d = reg.details(row["id"])
-        name = str(d.get("experiment_name", ""))
-        if d.get("framework") != "chemprop" or not name.startswith("adme_") or not name.endswith("_cp"):
+    for ep in sorted(want):
+        mid = MLTRAIL_IDS.get("chemprop", {}).get(ep)
+        if mid is None:
+            print(f"WARN: {ep}: value_model says chemprop but MLTRAIL_IDS.chemprop has no pin; "
+                  f"falling back to the RF value", flush=True)
             continue
-        ep = name[len("adme_"):-len("_cp")]
-        if ep not in want:
+        try:
+            d = reg.details(int(mid))
+        except Exception as ex:
+            print(f"WARN: {ep}: MLTRAIL_IDS.chemprop id {mid} unavailable ({ex}); using the RF value", flush=True)
             continue
         meta_path = Path(d["model_path"]) / "deploy_meta.json"
         if not meta_path.exists():

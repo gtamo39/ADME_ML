@@ -722,11 +722,71 @@ class OUTPUT():
             self.assess_predictions_cp(data, os.path.join(out, f'{k}.pkl'))
         return self.metrics_results_cp
 
+    @staticmethod
+    def vault_id(params, registry, k, framework, name):
+        """
+        -Resolve the MLTrail id a deploy must APPEND to. config MLTRAIL_IDS[framework][k] is the pin and
+         wins; `null` or a missing key means "not deployed yet", and `name` is then looked up so an
+         unpinned but existing entry still gets a version instead of a duplicate.
+        param class params: PARAMS instance (MLTRAIL_IDS)
+        param class registry: mltrail Registry
+        param str k: endpoint key
+        param str framework: 'rf' | 'chemprop'
+        param str name: expected experiment_name; verifies the pin, and is the fallback lookup
+        return int: the id to append to, or None when the entry must be created
+        """
+        pinned = getattr(params, 'MLTRAIL_IDS', {}).get(framework, {}).get(k)
+        if pinned is not None:
+            # a pin aimed at another model would serve the wrong property under the right name
+            got = registry.details(int(pinned)).get('experiment_name')
+            assert got == name, (f"MLTRAIL_IDS.{framework}.{k} = {pinned} carries '{got}', not '{name}'. "
+                                 f"Fix config/config.yaml; never repoint an id at another endpoint.")
+            return int(pinned)
+        # unpinned: match the name so a pre-existing entry gets a version, not a twin
+        l = registry.list()
+        hit = l.loc[l['experiment_name'] == name, 'id'] if len(l) else []
+        return int(max(hit)) if len(hit) else None
+
+    @staticmethod
+    def pin_notice(params, k, framework, model_id):
+        """Print the config line to paste when an endpoint had no pinned id, so the next deploy appends."""
+        if getattr(params, 'MLTRAIL_IDS', {}).get(framework, {}).get(k) is None:
+            print(f'> PIN THIS in config/config.yaml -> MLTRAIL_IDS.{framework}.{k}: {model_id}')
+
+    def check_mltrail_ids(self, params, registry):
+        """
+        -Audit config MLTRAIL_IDS against the vault: a pinned id must exist and carry the expected
+         experiment_name. An rf id is required for every endpoint (it is the confidence source); a
+         chemprop id is required only where webapp.value_model sends the value to chemprop.
+        param class params: PARAMS instance (MLTRAIL_IDS, ADME_ENDPOINTS, DEPLOY, webapp)
+        param class registry: mltrail Registry
+        return list: the problems found; empty when the config and the vault agree
+        """
+        ids, problems = getattr(params, 'MLTRAIL_IDS', {}), []
+        suffix = params.DEPLOY.get('experiment_suffix', '_h237')
+        value_model = params.webapp.get('value_model', {})
+        for k in params.ADME_ENDPOINTS:
+            for fw, name in (('rf', f'adme_{k}{suffix}'), ('chemprop', f'adme_{k}_cp')):
+                pinned = ids.get(fw, {}).get(k)
+                # an unpinned id only matters when the webapp actually serves that framework
+                if pinned is None:
+                    if fw == 'rf' or value_model.get(k) == 'chemprop':
+                        problems.append(f'{fw}.{k}: not pinned, but the webapp needs it')
+                    continue
+                try:
+                    got = registry.details(int(pinned)).get('experiment_name')
+                except Exception as ex:
+                    problems.append(f'{fw}.{k}: id {pinned} is not in the vault ({ex})')
+                    continue
+                if got != name:
+                    problems.append(f"{fw}.{k}: id {pinned} carries '{got}', expected '{name}'")
+        return problems
+
     def deploy_endpoint(self, data, params, registry, k, dry_run=False):
         """
         -Fit the deployable RF for endpoint k on internal + selected-public (BEST_PUBLIC) rows, calibrate the
          conf_recal confidence on the augmented CV, bundle the model + feature columns + calibration, and
-         register a NEW MLTrail model (adme_<k><DEPLOY.experiment_suffix>, features_type from config DEPLOY;
+         append a VERSION to adme_<k><DEPLOY.experiment_suffix> (a first deploy creates it; features_type from DEPLOY;
          the champions adme_<k> stay untouched). The full internal+public training set is archived. Requires
          build_ML_data_<k> + get_internal_public_sets + select_best_combo_and_update already run for k.
 
@@ -795,18 +855,20 @@ class OUTPUT():
                    'cv_rmse': cvm.get('rmse'), 'cv_r2': cvm.get('r2')}
         if dry_run or registry is None:
             return summary
-        # register a NEW model; mirror the recal scalars into metrics for details()/trail without an artifact load
+        # append a version to the endpoint's entry; recal scalars go into metrics so details()/trail need no artifact
         name = f"adme_{k}{dep.get('experiment_suffix', '_h237')}"
         metrics = {'rmse_cv': calibration['rmse_cv'], 'r2_cv': cvm.get('r2'), 'rho_cv': cvm.get('spearman_rho'),
                    'recal_a': calibration['recal_a'], 'recal_b': calibration['recal_b']}
         comment = (f"deployed RF on {dep['features_type']}; internal + BEST_PUBLIC ({'+'.join(bundle['sources'])}); "
                    f"fit on {len(train)} rows; conf_recal calibrated on augmented CV; full trainset archived.")
         summary['model_id'] = int(registry.add(
-            model_id=None, model=bundle, experiment_name=name,
+            model_id=self.vault_id(params, registry, k, 'rf', name), model=bundle, experiment_name=name,
             experiment_measure=ep['col'].split('_', 1)[1], unit=ep.get('unit', ''),
             model_type='single_task_regression', framework='sklearn', features_type=dep['features_type'],
             training_set=train[['compound', 'smiles', 'label']], smiles_column='smiles',
             compound_id_column='compound', label_column='label', metrics=metrics, comment=comment))
+        # a brand-new entry has no pin yet; print the config line so the next deploy appends to it
+        self.pin_notice(params, k, 'rf', summary['model_id'])
         return summary
 
     def deploy_endpoint_cp(self, data, params, registry, k, dry_run=False, force_pretrain=False):
@@ -852,12 +914,10 @@ class OUTPUT():
                    'pretrain_checkpoint': fit['pretrain_checkpoint']}
         if dry_run or registry is None:
             return summary
-        # register the model DIRECTORY (the adme_mt_* convention); idempotent on the endpoint's name
+        # register the model DIRECTORY (the adme_mt_* convention); appends a version under the endpoint's name
         name = f'adme_{k}_cp'
-        listing = registry.list()
-        hit = listing.loc[listing['experiment_name'] == name, 'id'] if len(listing) else pd.Series([], dtype=int)
         summary['model_id'] = int(registry.add(
-            model_id=int(hit.iloc[0]) if len(hit) else None, overwrite=len(hit) > 0,
+            model_id=self.vault_id(params, registry, k, 'chemprop', name),
             model=fit['model_dir'], experiment_name=name, experiment_measure=ep['col'].split('_', 1)[1],
             unit=ep.get('unit', ''), model_type='single_task_regression', framework='chemprop',
             features_type='smiles+DS', target_columns=fit['tasks'],
@@ -865,6 +925,8 @@ class OUTPUT():
                      f"{'frozen-encoder ' if cfg['freeze_encoder'] else 'full '}finetune on {fit['n_train']} "
                      f"internal rows; scored task index {meta['target_index']} of {fit['tasks']}; "
                      f"needs the {len(fit['descriptor_cols'])} DS_ descriptors; confidence comes from adme_{k}_h237.")))
+        # a brand-new entry has no pin yet; print the config line so the next deploy appends to it
+        self.pin_notice(params, k, 'chemprop', summary['model_id'])
         return summary
 
     def deploy_all_endpoints_cp(self, data, params, endpoints=None, leak='exact', dry_run=False,
@@ -903,7 +965,7 @@ class OUTPUT():
     def deploy_all_endpoints(self, data, params, endpoints=None, min_n=None, dry_run=False):
         """
         -Fit + deploy the RF for every endpoint: build the ML frame, split internal vs public, select the
-         BEST_PUBLIC combo, then deploy_endpoint (fit on internal+public, calibrate conf_recal, register a new
+         BEST_PUBLIC combo, then deploy_endpoint (fit on internal+public, calibrate conf_recal, append a new
          MLTrail model). Requires data.df_all + data.MF_features['all'] to be built first.
         param DATA data: a DATA with load_combine_dfs + build_MF_features already run
         param class params: PARAMS instance (ADME_ENDPOINTS, BEST_PUBLIC, DEPLOY)
@@ -952,11 +1014,22 @@ if __name__ == "__main__":
     ap.add_argument('--endpoints', default=None, help="comma-separated subset for --assess/--deploy")
     ap.add_argument('--min_n', type=int, default=None,
                     help="public-origin minimum-count filter (default: config PUBLIC_ORIGIN_MIN_N)")
+    ap.add_argument('--check_mltrail_ids', action='store_true',
+                    help="audit config MLTRAIL_IDS against the vault, then exit; loads no data")
     args = ap.parse_args()
 
     ## params:
     params = PARAMS(args.config)
     params.load_params()
+
+    # audit the pinned ids and stop; deliberately before any data load, so it stays instant
+    if args.check_mltrail_ids:
+        from mltrail import Registry
+        problems = OUTPUT(params).check_mltrail_ids(params, Registry.from_default())
+        for x in problems:
+            print(f'! {x}')
+        print(f"> MLTRAIL_IDS: {'OK' if not problems else str(len(problems)) + ' problem(s)'}")
+        sys.exit(1 if problems else 0)
 
     ## data:
     data = DATA()

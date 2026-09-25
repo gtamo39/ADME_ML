@@ -48,9 +48,18 @@ def _fake_data(n_int=60, n_pub=200, n_feat=8, seed=0):
 
 
 class _FakeRegistry:
-    """Captures the registry.add(...) call instead of writing a vault; returns a fixed model id."""
-    def __init__(self):
+    """Captures the registry.add(...) call instead of writing a vault; returns a fixed model id.
+    `entries` seeds the vault listing so OUTPUT.vault_id can resolve a name to an existing id."""
+    def __init__(self, entries=()):
         self.calls = []
+        self.entries = pd.DataFrame(list(entries), columns=['id', 'experiment_name'])
+    def list(self):
+        return self.entries
+    def details(self, model_id):
+        row = self.entries.loc[self.entries['id'] == int(model_id), 'experiment_name']
+        if not len(row):
+            raise KeyError(model_id)
+        return {'id': int(model_id), 'experiment_name': row.iloc[0]}
     def add(self, **kw):
         self.calls.append(kw)
         return 99
@@ -96,6 +105,54 @@ def test_deploy_registers_new_h237_model_with_calibration():
     # the archived training set is sliced to the canonical [compound, smiles, label]
     assert list(kw['training_set'].columns) == ['compound', 'smiles', 'label']
     assert len(kw['training_set']) == len(data.int_ids) + len(data.pub_ids)
+    # an empty vault has no id to append to, so this first deploy creates the entry
+    assert kw['model_id'] is None
+
+
+def test_deploy_appends_a_version_to_the_existing_entry():
+    """A vault that already holds adme_sol_h237 gets a new VERSION on that id, never a duplicate entry."""
+    params, data = _fake_params(), _fake_data()
+    reg = _FakeRegistry(entries=[(7, 'adme_other_h237'), (12, 'adme_sol_h237')])
+    OUTPUT(params).deploy_endpoint(data, params, registry=reg, k='sol', dry_run=False)
+    # the existing id is passed back, which MLTrail reads as "append a version"
+    assert reg.calls[0]['model_id'] == 12
+    # overwrite is never sent: it would reset the latest version instead of adding one
+    assert 'overwrite' not in reg.calls[0]
+
+
+def test_vault_id_falls_back_to_the_name_when_unpinned():
+    """With no MLTRAIL_IDS pin, vault_id matches experiment_name so an existing entry still gets a version."""
+    params = _fake_params()
+    reg = _FakeRegistry(entries=[(3, 'adme_sol_h237'), (9, 'adme_sol_h237'), (4, 'adme_ppb_h237')])
+    # duplicates can exist from older deploys; the newest must win
+    assert OUTPUT.vault_id(params, reg, 'sol', 'rf', 'adme_sol_h237') == 9
+    # an unknown name gives None, so registry.add mints a new entry
+    assert OUTPUT.vault_id(params, reg, 'mdck', 'chemprop', 'adme_mdck_cp') is None
+    # an empty vault must not raise
+    assert OUTPUT.vault_id(params, _FakeRegistry(), 'sol', 'rf', 'adme_sol_h237') is None
+
+
+def test_vault_id_prefers_the_config_pin():
+    """A pinned MLTRAIL_IDS id wins over any name match, so the vault listing order cannot matter."""
+    params = _fake_params()
+    params.MLTRAIL_IDS = {'rf': {'sol': 3}, 'chemprop': {}}
+    reg = _FakeRegistry(entries=[(3, 'adme_sol_h237'), (9, 'adme_sol_h237')])
+    # the name also matches id 9, but the pin is authoritative
+    assert OUTPUT.vault_id(params, reg, 'sol', 'rf', 'adme_sol_h237') == 3
+
+
+def test_vault_id_rejects_a_pin_aimed_at_another_model():
+    """A pin pointing at a different experiment_name must raise, not silently serve the wrong property."""
+    params = _fake_params()
+    params.MLTRAIL_IDS = {'rf': {'sol': 4}}
+    reg = _FakeRegistry(entries=[(3, 'adme_sol_h237'), (4, 'adme_ppb_h237')])
+    try:
+        OUTPUT.vault_id(params, reg, 'sol', 'rf', 'adme_sol_h237')
+    except AssertionError as ex:
+        # the message must name the config key, the wrong name and the expected one
+        assert 'MLTRAIL_IDS.rf.sol' in str(ex) and 'adme_ppb_h237' in str(ex)
+    else:
+        raise AssertionError('a mispointed pin was accepted')
 
 
 # ---- the deployment recipe: 5 CV fits for the calibration + 1 shipped fit ----

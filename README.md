@@ -333,10 +333,44 @@ the RF model an endpoint has no confidence and the webapp drops it.
 
 ### Deploying ONE endpoint, and refreshing the webapp
 
-**CAUTION: the RF deploy is NOT idempotent.** `OUTPUT.deploy_endpoint` calls
-`registry.add(model_id=None, ...)`, and MLTrail reads "no model_id" as *new model, auto id, version 1*.
-So `--deploy_RF_all_endpoints` with no `--endpoints` registers a NEW entry for every endpoint and
-duplicates the ones already in the vault. Name the endpoint you mean:
+Every deployed model is **pinned by id** in config `MLTRAIL_IDS`, one id per endpoint per framework:
+
+```yaml
+MLTRAIL_IDS:
+  rf:                    # adme_<ep>_h237 — confidence for all 9, value where value_model says rf
+    solubility: 20
+    ...
+  chemprop:              # adme_<ep>_cp — value only, where value_model says chemprop
+    mdck_inh:   null     # not deployed yet; the first deploy creates it and prints the id to pin
+```
+
+`OUTPUT.vault_id` reads that pin and hands it to `registry.add`, which MLTrail reads as *append a new
+version, identity inherited*. `webapp/app.py` binds the same ids, so the deploy and the app always
+agree and the vault listing order never matters. A `null` pin means "not deployed yet": the deploy
+falls back to an `experiment_name` lookup, creates the entry if there is none, and prints
+
+```
+> PIN THIS in config/config.yaml -> MLTRAIL_IDS.chemprop.mdck_inh: 46
+```
+
+which you paste back into the config. So an endpoint's id never changes, `--endpoints` is optional,
+and re-running a deploy cannot duplicate a vault entry.
+
+Audit the pins against the vault at any time — it loads no data and is instant:
+
+```bash
+$ML_PY python/ADME_build_ML.py --check_mltrail_ids
+```
+
+It fails if a pinned id is absent from the vault, if it carries the wrong `experiment_name`, or if an
+id the webapp needs is still `null`. Exit code 1 means a problem.
+
+CAUTION: an append REFUSES to change an identity field (`experiment_name`, `experiment_measure`, `unit`,
+`model_type`, `framework`, `features_type`). Edit `ADME_ENDPOINTS[k].unit` or `DEPLOY.features_type` and
+the deploy raises `ValidationError`. That is deliberate — a changed unit means a different model, so
+register it under a new name rather than hiding it in a version.
+
+To deploy one endpoint:
 
 ```bash
 ML_PY=~/miniconda3/envs/ML/bin/python
@@ -352,8 +386,11 @@ $ML_PY -c "from mltrail import Registry; l = Registry.from_default().list(); \
   print(l[l.experiment_name.astype(str).str.startswith('adme_')][['id','experiment_name']].to_string(index=False))"
 ```
 
-The chemprop deploy IS idempotent — `deploy_endpoint_cp` looks the name up and overwrites — so only the
-RF side needs this care.
+Check the version trail of an endpoint with `Registry.from_default().trail(<id>)`.
+
+History: until 2026-09-24 the RF path passed `model_id=None`, so every deploy minted a duplicate entry.
+The 9 duplicates that produced (ids 37-45) were deleted, and the chemprop path moved off
+`overwrite=True`, which reset the latest version instead of adding one.
 
 ### Running the webapp
 

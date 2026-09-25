@@ -359,11 +359,52 @@ the artifact. Features = **H237** (4469; `MF_features['all']`); MLTrail's built-
 predict time (**needs `descriptastorus` in the predict env — present in `ML`**). Run:
 `python python/ADME_build_ML.py --config config/config.yaml --deploy_RF_all_endpoints [--endpoints a,b] [--dry_run]`.
 Tests: `tests/test_deploy.py` (synthetic, fake registry — no vault write).
-**CAUTION (found 2026-09-23): the RF deploy is NOT idempotent.** It calls `registry.add(model_id=None, ...)`,
-and MLTrail's contract is `No model_id -> new model (auto id), version 1`. So running it WITHOUT
-`--endpoints` registers a NEW entry for every endpoint and duplicates whatever is already in the vault.
-Always name the endpoint. `deploy_endpoint_cp` does NOT have this problem — it looks the name up and
-passes `model_id=<hit>, overwrite=True`. Documented in the README under 'Deploying ONE endpoint'.
+**MLTRAIL IDS PINNED IN CONFIG (2026-09-24).** New top-level `MLTRAIL_IDS: {rf: {ep: id}, chemprop:
+{ep: id}}`. It is the single source of truth for which vault entry each endpoint uses, read by BOTH
+`OUTPUT.vault_id` (which entry a deploy appends to) and `webapp/app.py` (which entry serves). Neither
+scans the vault by `experiment_name` any more, so `registry.list()` order is no longer load-bearing.
+
+- `null` = not deployed yet. The deploy falls back to a name lookup, creates the entry when there is
+  none, then prints `> PIN THIS in config/config.yaml -> MLTRAIL_IDS.<fw>.<ep>: <id>` to paste back.
+- A pin that carries a different `experiment_name` raises immediately in `vault_id`. Without that
+  check a mispointed id would serve the wrong property under the right column header.
+- `python python/ADME_build_ML.py --check_mltrail_ids` audits the pins: every pinned id must exist and
+  carry the expected name; an `rf` id is required for all 9 (it is the confidence source), a `chemprop`
+  id only where `webapp.value_model` says chemprop. Loads no data, exits 1 on a problem.
+- Current state: rf 20-27 + 36, chemprop 28-35, `chemprop.mdck_inh: null`. The audit reports exactly
+  that one gap, and the webapp now names it in a WARN instead of falling back to RF in silence.
+- `webapp.extra_models[].model_id` already worked this way; `MLTRAIL_IDS` extends the pattern to the
+  ADME endpoints.
+
+**FIXED 2026-09-24 — both deploys now APPEND a version.** New `OUTPUT.vault_id(registry, name)` resolves
+the `experiment_name` to its id; `deploy_endpoint` and `deploy_endpoint_cp` pass that id to
+`registry.add`, whose contract is `model_id -> append a new version (identity inherited)`. A first
+deploy resolves to None and creates the entry. An endpoint's id is therefore stable, `--endpoints` is
+optional, and a repeat deploy cannot duplicate an entry.
+
+What was wrong. Until 2026-09-24 `deploy_endpoint` passed `model_id=None` (`No model_id -> new model,
+auto id, version 1`), so the 2026-09-24 RF deploy minted ids 37-45 beside the 2026-08-26 originals —
+9 duplicate names. Those 9 were deleted with `Registry.delete`, which also removes the artifacts, leaving
+17 entries and no duplicate name. `deploy_endpoint_cp` did look the name up, but passed
+`overwrite=True` (`reset the latest version in place`), so a redeploy replaced the 2026-09-09 model
+rather than adding v2. Both now use the append form.
+
+The webapp was never wrong during this: `_discover_champions` lets the last row per (endpoint,
+features_type) win, and `reg.list()` sorts by `experiment_name` with ties on ascending id, so the
+newest duplicate loaded. That was luck, not contract.
+
+CAUTION: an append REFUSES to change an `IDENTITY_FIELDS` entry (`experiment_name`,
+`experiment_measure`, `unit`, `model_type`, `framework`, `features_type`) and raises `ValidationError`.
+Checked all 17 entries against what the current config would send before the switch: all match.
+Change `ADME_ENDPOINTS[k].unit` or `DEPLOY.features_type` and the next deploy fails loudly — by design,
+because a changed unit is a different model and belongs under a new name.
+
+**OPEN (2026-09-24): `tests/test_roundtrip_cells.py` is red — 11 of its tests fail.** Cause is the
+mdck_inh endpoint, not the deploy change. `_fake_raw` at line 54 builds `mdck_Cell line` only, while
+`ADME_ENDPOINTS.mdck_inh.filter.col` is `mdck_Cell line - PgP inhibitor`, so every cell that runs the
+endpoint loop raises `KeyError`. Verified present at HEAD, so it arrived with the endpoint. Fix = add
+that column plus `mdck_Mean Papp A to B - PgP Inhibitor` to the synthetic frame. The rest of the suite
+is green: 46 passed, and `tests/test_deploy.py` is 8/8 including the 2 new append tests.
 
 **CLI runner (2026-08-27, `python/run_nvs_cellab.py`).** Runs Cell A+B headless with crash-safe incremental saves
 (SSH-drop cost the user 40 min of interactive compute). `python python/run_nvs_cellab.py --config … --outdir
@@ -1766,7 +1807,32 @@ change to `ENDPOINT_PUBLIC_FILES`, deploy with `--force_pretrain`.**
 
 The **VALUE** comes from whichever model wins the augmented arm. The **CONFIDENCE** always comes
 from `adme_<ep>_h237`, because a chemprop `regression` head returns no per-row std. RF therefore
-stays deployed for all 8 endpoints regardless of the map.
+stays deployed for all 9 endpoints regardless of the map.
+
+**★ CURRENT MAP (2026-09-24), from the 2026-09-23 retrain. Supersedes the 2026-09-09 map below.**
+Augmented-arm r², read from `output/results/20260923_metrics_rf` vs `output/results/20260923_metrics_cp`.
+Near-shell wins logd (0.824), mdck (0.542) and caco2 (0.765) but still has no deploy path, so each
+falls to the best model that ships. Chemprop now takes 8 of 9; only ppb stays RF.
+
+| endpoint | value model | chemprop r² | RF r² | note |
+|---|---|---|---|---|
+| solubility | chemprop (all8) | **0.707** | 0.704 | +0.003, inside the noise |
+| logd | chemprop (sol_lipo) | **0.798** | 0.792 | +0.006, inside the noise |
+| hlm | chemprop (clearance) | **0.635** | 0.493 | |
+| mlm | chemprop (clearance) | **0.671** | 0.558 | |
+| rlm | chemprop (clearance) | **0.537** | 0.303 | |
+| mdck | chemprop (mdck_perm) | **0.456** | 0.357 | FLIPPED from rf |
+| mdck_inh | chemprop (permeability_inh) | **0.693** | 0.669 | first measurement of this arm |
+| caco2 | chemprop (permeability) | **0.669** | 0.539 | FLIPPED from rf |
+| ppb | rf (all public) | 0.146 | **0.481** | RF wins outright |
+
+**OPEN — `BEST_PUBLIC` now HURTS three endpoints.** RF's internal-only CV beats its own augmented CV
+for caco2 (0.763 vs 0.539), mlm (0.682 vs 0.558) and logd (0.802 vs 0.792). caco2's internal-only RF
+would beat the chemprop model we are about to ship. `DATA.select_best_combo_and_update` always trains
+the deployed RF on internal + `BEST_PUBLIC`, and an empty list falls back to ALL origins, so there is
+no "internal only" setting today. Re-scan `BEST_PUBLIC` for these three before the next deploy.
+
+The earlier map, kept for provenance:
 
 | endpoint | value model | r² | note |
 |---|---|---|---|
@@ -2704,15 +2770,15 @@ alternative): **1163 high / 3037 low (27.7%)**. Folds and model copy FP_preds ex
 
 Confusion: TN 2571, FP 466, FN 649, TP 514.
 
-**This is a genuinely HARD task, unlike the UBR2 hit call — and that is the useful contrast.**
+**This is a genuinely HARD task, unlike the U2 hit call — and that is the useful contrast.**
 Plain accuracy 0.73 barely clears the **0.723 majority-class** bar, so read MCC (0.305) and balanced
 accuracy (0.644) instead. Recall is only 0.44: the tree misses more lipophilic compounds than it
 finds. A label shuffle returns ROC-AUC **0.500**, so the signal is real but weak. logD is a
 whole-molecule property, and a single tree on sparse substructure bits is the wrong shape of model
 for it — which is exactly why it makes a good interpretability subject: the tree has real, non-
-trivial structure to inspect, instead of the one dominant bit that UBR2 collapsed onto.
+trivial structure to inspect, instead of the one dominant bit that U2 collapsed onto.
 
-The tree emits **69 distinct probabilities** here (vs 5 on UBR2), so its ROC curve has usable
+The tree emits **69 distinct probabilities** here (vs 5 on U2), so its ROC curve has usable
 resolution for once.
 
 **Step 4 is now ONE LINE (trimmed 2026-09-15).** Cell 5 referenced exactly one name from it —
@@ -2816,10 +2882,10 @@ Data Privacy section of all 7 sibling `CLAUDE.md` files; the helper itself lives
 CAUTION: `apply` rewrites the live notebook. Ask the user to close it in Jupyter first, or the
 editor may save its in-memory copy over the change.
 
-## UBR2 FP IC50 — first RF baseline (2026-09-14, `vignettes/FP_preds.ipynb` cells 6-7)
+## U2 FP IC50 — first RF baseline (2026-09-14, `vignettes/FP_preds.ipynb` cells 6-7)
 
-New workstream, separate from ADME: potency regression on the UBR2 fluorescence-polarisation assay
-(`data/FP/20260914_UBR2.csv`, a UBR1 file sits next to it). Not an ADME endpoint, so it does **not**
+New workstream, separate from ADME: potency regression on the U2 fluorescence-polarisation assay
+(`data/FP/20260914_U2.csv`, a U1 file sits next to it). Not an ADME endpoint, so it does **not**
 go through `ADME_build_ML.py`; the notebook calls `Rdkit_tools.compute_H237_features` and
 `ML_Reg.run_K_Fold_Xval_Regression` directly.
 
@@ -3021,7 +3087,7 @@ so the choice of variant is about the SCALE it reports, not about ranking power.
 
 Panel: `vignettes/FP_preds.ipynb` cell 9 reuses the SAME single-panel style as
 `Multitask_adme_preds.ipynb` cell 17 (scatter + 5-bin mean trend + the webapp 0.5 split with a
-per-half RMSE box), so UBR2 reads directly against the 8 ADME panels. Split at 0.5:
+per-half RMSE box), so U2 reads directly against the 8 ADME panels. Split at 0.5:
 
 | side of split | n | RMSE (uM) |
 |---|---|---|
@@ -3071,8 +3137,8 @@ merge on that column raises `TypeError: unhashable type: 'numpy.ndarray'`. Flatt
 
 ### Section 4 — UB selectivity (2026-09-16, cells `2d1ead8c`, `e744e10e`)
 
-`UB_sel` keeps the compounds with BOTH a UBR1 and a UBR2 value. Cell `2d1ead8c` plots UBR2 against
-UBR1 with cutoff lines at `UB1_CUT` / `UB2_CUT` (both 10 uM as set) and a quadrant share table
+`UB_sel` keeps the compounds with BOTH a U1 and a U2 value. Cell `2d1ead8c` plots U2 against
+U1 with cutoff lines at `UB1_CUT` / `UB2_CUT` (both 10 uM as set) and a quadrant share table
 placed OUTSIDE the axes, so no label hides a datapoint.
 
 **Selectivity label definition.** Positive = potent on UB2 AND weak on UB1, which is the "UB2 only"
