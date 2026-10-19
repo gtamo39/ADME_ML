@@ -1,37 +1,41 @@
 #!/usr/bin/env python3
-"""app.py — Local-only FastAPI server for drag-drop ADME property prediction.
+"""app.py — FastAPI server for drag-drop ADME property prediction.
 
-LOCALHOST ONLY. This app handles SMILES / compound ids / predicted values, so it
-MUST NOT be exposed off this machine — it binds to 127.0.0.1 (see config webapp.host).
+This app handles SMILES / compound ids / predicted values. It binds config webapp.host
+(127.0.0.1 by default). On a shared server, reach it only through an authenticating reverse
+proxy on the same host — see docs/handoff.md.
 
 Pipeline (reusing the MLTrail vault + the ADME config):
-  startup -> discover the deployed RF models in the MLTrail vault (prefer new H237 over H236)
+  startup -> open the vault at config MLTRAIL_VAULT
+          -> bind each RF model by the id pinned in config MLTRAIL_IDS.rf (every endpoint)
           -> load each estimator + trained feature columns + conf_recal calibration (from the bundle)
           -> fallback scale = std of the archived training-set labels when no calibration is bundled
-          -> discover the chemprop value models (adme_<ep>_cp) for the endpoints that config
-             `webapp.value_model` sends to chemprop; RF still loads for ALL 8 endpoints
+          -> bind the chemprop value models (MLTRAIL_IDS.chemprop) for the endpoints that config
+             `webapp.value_model` sends to chemprop; RF still loads for every endpoint
           -> load any config `webapp.extra_models` (non-ADME MLTrail models, own grid column)
+          -> with config webapp.strict_startup, stop when a required model did not load
   upload  -> read the dropped SDF/CSV once -> featurize H237 once
           -> per model: mean (raw value) + per-tree std (-> conf_recal confidence) -> favorable flag
           -> chemprop endpoints: REPLACE the value with the chemprop prediction, KEEP the RF confidence
           -> per extra classifier: P(positive class) + the decision margin |2p-1| as the confidence
+          -> keep the run under a random run id; the SDF export must send that id back
   render  -> LiveDesign-style grid, one diagonal-split cell per endpoint
 
-Predictions/SMILES/ids render only in the LOCAL browser (localhost); nothing crosses to any cloud.
+Predictions/SMILES/ids go only to the browser that uploaded them; nothing crosses to any cloud.
 """
 import atexit
-import io
 import json
 import os
 import re
+import secrets
 import shutil
 import sys
 import tempfile
+import threading
+import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-
-sys.path.insert(0, os.path.expanduser('~/Scripts'))       # shared helpers (ML_Reg.chemprop_predict_from_checkpoint)
 
 import joblib
 import numpy as np
@@ -44,8 +48,8 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit.Chem.Draw import rdMolDraw2D
 
-import ML_Reg
 from mltrail import Registry
+from mltrail.config import default_config
 from mltrail.backends import align_features, resolve_checkpoint
 from mltrail.featurizers import get_featurizer
 from mltrail.readers import read_dataset
@@ -57,6 +61,10 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 CONFIG = yaml.safe_load(CONFIG_PATH.read_text())
 WEBAPP = CONFIG.get("webapp", {})
 ENDPOINT_CFG = CONFIG["ADME_ENDPOINTS"]                 # transform + unit per endpoint
+
+# shared helpers from the configured Scripts checkout
+sys.path.insert(0, os.path.expanduser(WEBAPP.get("scripts_dir", "~/Scripts")))
+import ML_Reg
 
 # Favorable/unfavorable cell colors (olive / red); confidence uses SERAC azure/ember (config).
 PALETTE = {
@@ -86,12 +94,26 @@ MLTRAIL_IDS = CONFIG.get("MLTRAIL_IDS", {})   # framework -> endpoint -> pinned 
 CHAMPIONS = {}          # endpoint -> {model, feature_cols, sigma, transform, unit, cutoff, favorable, model_id}
 CP_VALUES = {}          # endpoint -> {checkpoint, tasks, descriptor_cols, transform, model_id} (value only)
 EXTRAS = {}             # key -> {model, feature_cols, pos_idx, label, unit, threshold, model_id} (extra columns)
-_FEATURIZE = None       # H236 featurizer (built once at startup)
-_LAST_CSV = None        # flat DataFrame of the most recent prediction run (for /api/download)
-_LAST_BLOCKS = None     # original SDF record per row of _LAST_CSV, or None when the input was a csv
+_FEATURIZE = None       # H237 featurizer (built once at startup)
+RUNS = {}               # run id -> {flat, blocks, t}: the scored runs the SDF export can ask for
+RUNS_LOCK = threading.Lock()
 
 
 # ---------- startup: discover + load the champions ----------
+
+def _registry():
+    """Open the MLTrail vault at config MLTRAIL_VAULT; raise FileNotFoundError when it holds no
+    registry.json."""
+    vault = Path(CONFIG["MLTRAIL_VAULT"])
+    # fail on a vault that is not mounted
+    if not (vault / "registry.json").exists():
+        raise FileNotFoundError(f"MLTRAIL_VAULT: no registry.json in {vault}")
+
+    # MLTrail defaults, with the three vault paths from this config
+    return Registry.from_config({**default_config(), "registry_path": str(vault / "registry.json"),
+                                 "trained_models_dir": str(vault / "models"),
+                                 "training_sets_dir": str(vault / "training_sets")})
+
 
 def _discover_champions():
     """Load the deployed RF model for every endpoint, by the id pinned in config MLTRAIL_IDS.rf.
@@ -99,7 +121,7 @@ def _discover_champions():
     model + feature_cols + calibration from each bundle; an H236 entry has no conf_recal, so its
     confidence scale falls back to the std of the archived training labels. These models supply the
     CONFIDENCE for every endpoint, so an endpoint with no usable pin is dropped from the app."""
-    reg = Registry.from_default()
+    reg = _registry()
     cutoffs = WEBAPP.get("cutoffs", {})
     # bind the id pinned in config MLTRAIL_IDS.rf; an unpinned or missing entry drops the endpoint
     for ep in ENDPOINT_CFG:
@@ -150,7 +172,7 @@ def _discover_cp_values():
         print(f"WARN: webapp.value_model has unsupported model(s) {sorted(bad)}; those endpoints use RF", flush=True)
     if not want:
         return
-    reg, cp_bin = Registry.from_default(), CONFIG["CHEMPROP_TRANSFER"]["chemprop_bin"]
+    reg, cp_bin = _registry(), CONFIG["CHEMPROP_TRANSFER"]["chemprop_bin"]
     for ep in sorted(want):
         mid = MLTRAIL_IDS.get("chemprop", {}).get(ep)
         if mid is None:
@@ -184,7 +206,7 @@ def _load_extras():
     """Load the config `webapp.extra_models` — MLTrail models that are NOT ADME endpoints (e.g. the
     Px single/low activity classifier, id 19). They get their own grid column and their own CSV columns,
     but they stay OUT of the MPO formula scope. Classification only: the column shows P(positive class)."""
-    reg = Registry.from_default()
+    reg = _registry()
     for spec in WEBAPP.get("extra_models", []):
         mid = int(spec["model_id"])
         try:
@@ -344,9 +366,11 @@ def _predict_iter(df):
         for ep, c in CP_VALUES.items():
             if ep not in ep_out:
                 continue
-            pred = ML_Reg.chemprop_predict_from_checkpoint(
-                cp_in, "compound", c["checkpoint"], c["chemprop_bin"], target=ep, targets=c["tasks"],
-                descriptor_cols=c["descriptor_cols"])
+            # score in a temp workdir that is removed after the call
+            with tempfile.TemporaryDirectory(prefix="cp_pred_") as wd:
+                pred = ML_Reg.chemprop_predict_from_checkpoint(
+                    cp_in, "compound", c["checkpoint"], c["chemprop_bin"], target=ep, targets=c["tasks"],
+                    descriptor_cols=c["descriptor_cols"], workdir=wd)
             ep_out[ep] = (_INV[c["transform"]](pred["pred_y"].to_numpy(float)), ep_out[ep][1])
             done += 1
             yield "step", f"{ep} (chemprop)", done, total
@@ -396,6 +420,46 @@ def _predict_iter(df):
     yield "done", rows, pd.DataFrame(flat)
 
 
+def _store_run(flat, blocks):
+    """Keep one scored run under a new random id, for the SDF export. Drops the runs older than
+    config webapp.run_ttl_min, then the oldest beyond webapp.max_runs.
+    param DataFrame flat: one row per compound (compound, smiles, <ep>_pred, <ep>_confidence)
+    param list blocks: the original SDF record per row; None for a row from a csv
+    return str: the run id the client must send back
+    """
+    run_id, now = secrets.token_urlsafe(16), time.time()
+    ttl, cap = 60 * float(WEBAPP.get("run_ttl_min", 60)), int(WEBAPP.get("max_runs", 50))
+    with RUNS_LOCK:
+        # drop expired runs
+        for k in [k for k, r in RUNS.items() if now - r["t"] > ttl]:
+            del RUNS[k]
+
+        # drop the oldest runs beyond the cap
+        for k in list(RUNS)[:max(0, len(RUNS) + 1 - cap)]:
+            del RUNS[k]
+
+        # keep this run
+        RUNS[run_id] = {"flat": flat, "blocks": blocks, "t": now}
+    return run_id
+
+
+def _get_run(run_id):
+    """Return the stored run for run_id; raise HTTP 404 when the id is unknown or expired."""
+    ttl = 60 * float(WEBAPP.get("run_ttl_min", 60))
+    with RUNS_LOCK:
+        run = RUNS.get(run_id or "")
+    if run is None or time.time() - run["t"] > ttl:
+        raise HTTPException(404, "unknown or expired run; drop the file again to score it")
+    return run
+
+
+def _missing_models():
+    """Required models that did not load: the RF model of every endpoint, plus the chemprop model
+    of every endpoint that config webapp.value_model sends to chemprop."""
+    return ([ep for ep in ENDPOINT_CFG if ep not in CHAMPIONS] +
+            [f"{ep} (chemprop)" for ep, m in VALUE_MODEL.items() if m == "chemprop" and ep not in CP_VALUES])
+
+
 # ---------- app ----------
 
 @asynccontextmanager
@@ -405,6 +469,11 @@ async def lifespan(app):
     _discover_cp_values()                 # chemprop models that override the VALUE (config webapp.value_model)
     _load_extras()                        # non-ADME extra-column models (config webapp.extra_models)
     _FEATURIZE = get_featurizer("H237", CONFIG)   # H237 featurizer (H237 columns cover H236 fallbacks)
+
+    # stop the service when a required model did not load
+    missing = _missing_models()
+    if missing and WEBAPP.get("strict_startup", False):
+        raise RuntimeError(f"strict_startup: no model for {missing}; see the WARN lines above")
     yield
 
 
@@ -448,7 +517,7 @@ async def predict(files: list[UploadFile] = File(...)):
     """Accept one or more dropped .sdf/.csv files; STREAM per-compound predictions for the grid.
 
     The body is newline-delimited JSON: one {"label","done","total"} line per finished stage, then a
-    final {"result": {...}} line. Streaming, not one JSON blob, because a run takes tens of seconds —
+    final {"result": {...}} line that carries this run's random run_id. Streaming, not one JSON blob, because a run takes tens of seconds —
     every chemprop endpoint is its own CLI subprocess — and the browser draws a real progress bar
     from these lines. An error mid-run arrives as a final {"error": "..."} line.
     """
@@ -466,18 +535,16 @@ async def predict(files: list[UploadFile] = File(...)):
     df = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["compound", "smiles"])
 
     def stream():
-        global _LAST_CSV, _LAST_BLOCKS
         if len(df) == 0:
-            yield json.dumps({"result": {"rows": [], "n": 0, "n_valid": 0}}) + "\n"
+            yield json.dumps({"result": {"rows": [], "n": 0, "n_valid": 0, "run_id": None}}) + "\n"
             return
         try:
             for item in _predict_iter(df):
                 if item[0] == "step":
                     yield json.dumps({"label": item[1], "done": item[2], "total": item[3]}) + "\n"
                 else:
-                    _, rows, _LAST_CSV = item
-                    _LAST_BLOCKS = blocks
-                    yield json.dumps({"result": {"rows": rows, "n": len(rows),
+                    _, rows, flat = item
+                    yield json.dumps({"result": {"rows": rows, "n": len(rows), "run_id": _store_run(flat, blocks),
                                                  "n_valid": int(sum(r["valid"] for r in rows))}}) + "\n"
         except Exception as ex:                       # a half-written stream needs an explicit error line
             yield json.dumps({"error": f"{type(ex).__name__}: {ex}"}) + "\n"
@@ -489,26 +556,27 @@ async def predict(files: list[UploadFile] = File(...)):
 
 @app.post("/api/download_sdf")
 async def download_sdf(payload: dict):
-    """Return the selected predictions as an SDF, generated locally and never written to the repo.
+    """Return the selected rows of one run (payload `run`, the run_id) as an SDF, generated locally
+    and never written to the repo. An unknown or expired run id gets HTTP 404.
 
     When the run came from a dropped SDF, each record is re-emitted **verbatim** — same atoms,
     coordinates, charges, stereo flags and original data fields — and only the prediction fields are
     appended, so a round trip through the app cannot alter a structure. When the run came from a csv
     there is no original record, so a 2D depiction is generated from the SMILES instead.
     """
-    if _LAST_CSV is None:
-        raise HTTPException(404, "no predictions yet")
+    run = _get_run(payload.get("run"))
+    flat, blocks = run["flat"], run["blocks"]
     rows = payload.get("rows") or []
     if not rows:
         raise HTTPException(400, "no rows selected")
-    n = len(_LAST_CSV)
+    n = len(flat)
     out, made = [], 0
     for item in rows:
         i = int(item.get("idx", -1))
         if not 0 <= i < n:
-            raise HTTPException(400, f"row index {i} is outside the last run (0..{n - 1})")
-        rec = _LAST_CSV.iloc[i]
-        block = _LAST_BLOCKS[i] if _LAST_BLOCKS and i < len(_LAST_BLOCKS) else None
+            raise HTTPException(400, f"row index {i} is outside this run (0..{n - 1})")
+        rec = flat.iloc[i]
+        block = blocks[i] if blocks and i < len(blocks) else None
         if block is None:
             # csv input: no original record exists, so depict the molecule from its SMILES
             mol = Chem.MolFromSmiles(str(rec["smiles"]))
@@ -518,7 +586,7 @@ async def download_sdf(payload: dict):
             mol.SetProp("_Name", str(rec["compound"]))
             block = Chem.MolToMolBlock(mol)
             made += 1
-        fields = {c: rec[c] for c in _LAST_CSV.columns if c not in ("compound", "smiles")}
+        fields = {c: rec[c] for c in flat.columns if c not in ("compound", "smiles")}
         fields.update({k: v for k, v in item.items() if k in ("mpo", "score") and v not in (None, "")})
         out.append(_sdf_record(block, fields))
     body = "".join(out)
@@ -537,16 +605,6 @@ def _sdf_record(block, fields):
         parts.append(f"> <{k}>\n{v}\n\n")
     parts.append("$$$$\n")
     return "".join(parts)
-
-
-@app.get("/api/download")
-def download():
-    """Return the most recent prediction run as a CSV (generated locally, never written to the repo)."""
-    if _LAST_CSV is None:
-        raise HTTPException(404, "no predictions yet")
-    buf = io.StringIO(); _LAST_CSV.to_csv(buf, index=False)
-    return Response(buf.getvalue(), media_type="text/csv",
-                    headers={"Content-Disposition": "attachment; filename=adme_predictions.csv"})
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

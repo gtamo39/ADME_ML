@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // \"\"' | grep -qiE '\\.ipynb$' && printf '%s' '{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"DENIED by project data-privacy policy (CLAUDE.md): opening a .ipynb returns its saved cell OUTPUTS - df.head() tables, structure thumbnails, per-compound SMILES/IDs/predictions - which would cross the wire to Anthropic. Extract cell SOURCES only: use python3 to json.load the notebook and print cells[i][source], or edit by known cell id.\"}}' || true",
+            "statusMessage": "checking notebook-read policy"
+          }
+        ]
+      }
+    ]
+  }
+}

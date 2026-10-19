@@ -10,10 +10,11 @@
 #                                        CHEMPROP_OUTPUT_DIR, CHEMPROP_PRETRAIN_DIR), ADME_ENDPOINTS,
 #                                        ENDPOINT_PUBLIC_FILES, BEST_PUBLIC, RF_SINGLETASK,
 #                                        BEST_CHEMPROP_GROUPINGS, CHEMPROP_TRANSFER, MF_features_all_path,
-#                                        FOLD_GROUP_BY_INCHIKEY, DEPLOY, MLTRAIL_IDS
+#                                        FOLD_GROUP_BY_INCHIKEY, DEPLOY, MLTRAIL_IDS, MLTRAIL_VAULT
 #   vignettes/Multitask_adme_preds.ipynb: ADME_ENDPOINTS, BEST_PUBLIC, RF_SINGLETASK, METRICS_PKL_RF_DIR,
 #                                        METRICS_PKL_CP_DIR, SERAC_C, webapp
-#   webapp/app.py                      : ADME_ENDPOINTS, SERAC_C, webapp, MLTRAIL_IDS, CHEMPROP_TRANSFER
+#   webapp/app.py                      : ADME_ENDPOINTS, SERAC_C, webapp, MLTRAIL_IDS, MLTRAIL_VAULT,
+#                                        CHEMPROP_TRANSFER
 #
 # CAUTION: PARAMS.load_params does __dict__.update(yaml), so every top-level key becomes params.<KEY>.
 # Removing a key that a method reads fails only at that call site — grep before deleting one.
@@ -27,12 +28,12 @@
 # overwrites that snapshot and the old internal data is not recoverable.
 # NOT dated, so NOT here: MF_features_all_path (the public feature cache is keyed by its own `date`
 # argument and public SMILES never change; the internal block is always recomputed).
-ADME_RAW_CSV: 'data/20260923_all_adme.csv' # 'data/20260707_all_adme.csv'                 # DATA.load_df_internal_exp_all reads this csv; --overwrite re-pulls from CDD Vault and rewrites it
-METRICS_PKL_RF_DIR: 'output/results/20260923_metrics_rf'   # OUTPUT.assess_predictions writes <k>.pkl here (6 RF arms); ALSO the fold source for chemprop
-METRICS_PKL_CP_DIR: 'output/results/20260923_metrics_cp'   # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
+ADME_RAW_CSV: 'data/20261019_all_adme.csv' # Change with new data! 'data/20260707_all_adme.csv'                 # DATA.load_df_internal_exp_all reads this csv; --overwrite re-pulls from CDD Vault and rewrites it
+METRICS_PKL_RF_DIR: 'output/results/20261019_metrics_rf'   # OUTPUT.assess_predictions writes <k>.pkl here (6 RF arms); ALSO the fold source for chemprop
+METRICS_PKL_CP_DIR: 'output/results/20261019_metrics_cp'   # OUTPUT.assess_predictions_cp writes <k>.pkl here (3 chemprop arms)
 # The next two are read as CHEMPROP_TRANSFER.output_dir / .pretrain_dir. They are YAML anchors, so the
 # value lives HERE and the CHEMPROP_TRANSFER entries below are aliases (*name). Edit them here only.
-CHEMPROP_OUTPUT_DIR:   &cp_output_dir   'output/predictions_runs_chemprop_transfer_20260923'   # per-endpoint chemprop workdirs <grouping>_<ep>
+CHEMPROP_OUTPUT_DIR:   &cp_output_dir   'output/predictions_runs_chemprop_transfer_20261019'   # per-endpoint chemprop workdirs <grouping>_<ep>
 # SAFE TO REUSE, including after a crash: chemprop rewrites fold*/model/model_0 on every run, and the
 # transfer path never passes --ensemble-size, so no model_1 is ever left behind for ML_Reg's
 # model_*/best.pt glob to pick up. Bump it only to KEEP a finished run's workdirs for comparison.
@@ -128,7 +129,7 @@ RF_SINGLETASK:
   seed: 42
   n_jobs: 32
   cv_folds: 5
-  champion: {n_estimators: 200, max_depth: 20, max_features: 0.3, min_samples_leaf: 2}
+  champion: {n_estimators: 1000, max_depth: 20, max_features: 0.3, min_samples_leaf: 2}
 # --- Chemprop TRANSFER LEARNING arm (ADME_build_ML.py: build_ML_data_CP + assess_predictions_cp) ---
 # Public pretrain -> frozen-encoder multitask finetune on internal, evaluated on RF's EXACT folds.
 # Stage 1: multitask chemprop train on PUBLIC ONLY per grouping (never sees an internal label -> cannot
@@ -205,6 +206,9 @@ DEPLOY:
 # CAUTION: an id is an identity, not a version. Repointing one at another endpoint makes the webapp
 # serve the wrong property under the right name. Audit with:
 #   python python/ADME_build_ML.py --check_mltrail_ids
+# The vault: registry.json + models/ + training_sets/. The deploy writes here and the webapp reads here.
+# CAUTION: registry.json stores ABSOLUTE model paths, so mount the vault at this same path on every machine.
+MLTRAIL_VAULT: '/data2/MLTrail_vault'
 MLTRAIL_IDS:
   rf:                        # adme_<ep>_h237 — confidence for all 9, value where value_model says rf
     solubility: 20
@@ -224,7 +228,7 @@ MLTRAIL_IDS:
     rlm:        30
     caco2:      33
     mdck:       34
-    mdck_inh:   null         # not deployed yet — the first --deploy_CP_all_endpoints creates it
+    mdck_inh:   46           # adme_mdck_inh_cp, created by the 2026-09-24 --deploy_CP_all_endpoints
     ppb:        35           # kept for provenance; value_model says rf, so the webapp ignores it
 
 ## ==================== WEBAPP ====================
@@ -241,6 +245,10 @@ SERAC_C:                    # named palette: name -> hex (quote hex; '#' is a YA
 webapp:
   host: '127.0.0.1'                # bind localhost only — chemistry data must not leave the box
   port: 8050
+  scripts_dir: '~/Scripts'         # git clone of github.com/gtamo39/Scripts (ML_Reg, Statistics_tools)
+  strict_startup: true             # refuse to start when a pinned model does not load (no silent RF fallback)
+  run_ttl_min: 60                  # minutes a scored run stays available to the SDF export
+  max_runs: 50                     # scored runs held in memory at most; the oldest go first
   endpoint_order: [solubility, logd, mdck, mdck_inh, hlm, mlm, rlm, caco2, ppb]   # column order in the grid
   confidence_split: 0.5            # confidence > split -> azure, <= split -> ember (diverging gradient)
   color_slope: 2.0                 # value-fade steepness per modelling-space unit from the cutoff (higher = harder edge)

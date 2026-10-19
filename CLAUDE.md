@@ -125,7 +125,7 @@ Operational rules for the assistant in this project:
 - **Don't run `Bash`** that prints rows of `serac_df`, `df_raw`, `MF_features`, or any DataFrame with a `smiles` column. Schema is fine (`df.columns.tolist()`, `df.shape`, `df.dtypes`); values are not (`df.head()`).
 - **Don't `Grep`** file *contents* for compound IDs (`SRB-XXXXXXX-NNN` format). Searching file names / paths is fine.
 - **Don't echo** notebook outputs that render structure thumbnails, top-K SMILES tables, or per-compound logfc.
-- **Don't `Read` Jupyter notebooks (or any file with saved/executed outputs) that may contain structures.** Opening a `.ipynb` returns its cell *outputs* — `df.head()` tables, structure thumbnails, top-K SMILES, per-compound values — which cross the wire even if you only wanted the code. To inspect or edit a notebook, extract **cell sources only** (strip `outputs`) with a small script, or edit by known cell-id; never read the whole notebook blind. Keep notebook outputs cleared before any tooling reads them.
+- **Don't `Read` Jupyter notebooks (or any file with saved/executed outputs) that may contain structures.** Opening a `.ipynb` returns its cell *outputs* — `df.head()` tables, structure thumbnails, top-K SMILES, per-compound values — which cross the wire even if you only wanted the code. To inspect or edit a notebook, extract **cell sources only** (strip `outputs`) with a small script, or edit by known cell-id; never read the whole notebook blind. Keep notebook outputs cleared before any tooling reads them. **This is now enforced mechanically**, not left to discipline: a `PreToolUse` hook on `Read` in `.claude/settings.json` denies any `*.ipynb` path and replies with the source-extraction workaround. It was copied on 2026-10-19 from `MS_ML`, where it was added after a `Read` of a notebook leaked compound IDs and per-compound predictions. Caveat: the hook guards the `Read` **tool** only — reading a notebook via Bash (`cat` / `head` / `jq` / `grep`) is still possible and still prohibited by this rule.
 - **Never clear the outputs of the notebook the user works in.** Those outputs are the user's record
   of the run, and they are not recoverable once gone. Use the scratch-copy workflow instead:
   1. `python python/nb_edit.py checkout <nb>.ipynb` — copies to `<nb>.claude.ipynb`, clears the COPY only.
@@ -165,6 +165,18 @@ If a tool would meaningfully accelerate the work but only runs as a hosted API, 
 
 ## Coding Conventions
 
+### Write code the way I write it — read `/home/gtamo/Simplify/rules.md` first
+
+**Before you write any code, read `/home/gtamo/Simplify/rules.md`.** It holds the house style,
+taken from the pairs in `/home/gtamo/Simplify/examples.md`, which also holds a CONFIRMED four-cell
+sequence that is the target shape. In short: one `##` title per cell, a constants block under it, a
+short `#` label above each block, no rationale in comments, no `def` and no `_` names in a cell, at
+most one `print(df.shape)`, a `.head(3)` as the last line, and every cell must re-run safely. The explanation is not lost — it moves to the
+chat reply and to `wiki/wiki.md`.
+
+When I show you a new before/after pair, add it to `examples.md`, write the notes under
+`Xx Notes xX`, and correct `rules.md`. The example always wins over the rule.
+
 ### Do
 
 - **Read before writing** — always read a file before editing it
@@ -172,7 +184,6 @@ If a tool would meaningfully accelerate the work but only runs as a hosted API, 
 - **Never re-import** — before adding an import in a notebook cell or script, check the imports already available above (the notebook's import cell / module header); never duplicate one that is already in scope
 - **Write simplified code** — the fewest clear statements: inline single-use intermediates, derive lists directly, collapse verbose literals; no redundant variables or steps. Prefer a vectorized/built-in expression over a hand-rolled helper function when equally clear (e.g. `.str.extract(...).astype(float)` over a custom `apply` function). Simplify before reporting done — readability first (simple ≠ cryptic one-liner).
 - **Keep comments to 1 line** — 2 lines max, and only if really necessary. Applies to inline/block comments (incl. notebook cell-top `##` comments); docstrings are exempt.
-- **Comment every step** — put one short `#` line above each logical step in a cell or function (what the step does), even when the code looks explicit; keep it to a single line.
 - **Encapsulate state properly** — use classes or function parameters instead of global variables
 - **Update docs when changing code** — keep documentation in sync
 - **Break complex tasks into a todo list** — write out the steps, get approval, then execute

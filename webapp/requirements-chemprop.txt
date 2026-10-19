@@ -1,0 +1,12 @@
+# chemprop env for the webapp's chemprop VALUE models — a SEPARATE conda env from `ML`.
+# app.py runs the chemprop CLI as a subprocess; point config CHEMPROP_TRANSFER.chemprop_bin at it.
+# The vault holds chemprop 2.2 checkpoints, so keep chemprop on 2.2.x.
+#
+#   conda create -n chemprop python=3.11.15
+#   conda run -n chemprop pip install -r webapp/requirements-chemprop.txt
+#
+# The training box runs torch 2.13.0+cu126 (CUDA 12.6). On a CPU-only server, install the CPU build of
+# the same torch version, then run the end-to-end smoke test in docs/handoff.md section 10.
+chemprop==2.2.4
+torch==2.13.0
+lightning==2.6.5

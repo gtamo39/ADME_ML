@@ -395,12 +395,25 @@ The 9 duplicates that produced (ids 37-45) were deleted, and the chemprop path m
 ### Running the webapp
 
 ```bash
-conda run -n ML python webapp/app.py     # -> http://127.0.0.1:8050, localhost only
+conda run -n ML python webapp/app.py     # -> http://127.0.0.1:8050 (config webapp.host/port)
 ```
 
-The app discovers its models ONCE at startup (`_discover_champions`), so a newly deployed endpoint
-appears only after a **restart**. Column order comes from `webapp.endpoint_order`, the triage colour
-from `webapp.cutoffs`, and which model supplies the value from `webapp.value_model`.
+The app binds its models ONCE at startup, by the ids pinned in `MLTRAIL_IDS`, from the vault at
+`MLTRAIL_VAULT`. So a redeployed model appears only after a **restart**. Column order comes from
+`webapp.endpoint_order`, the triage colour from `webapp.cutoffs`, and which model supplies the value
+from `webapp.value_model`.
+
+| config key | effect |
+|---|---|
+| `MLTRAIL_VAULT` | the vault the deploy writes and the app reads. Its `registry.json` holds absolute paths, so mount it at this same path everywhere |
+| `webapp.scripts_dir` | the Scripts clone that holds `ML_Reg` (default `~/Scripts`) |
+| `webapp.strict_startup` | `true`: refuse to start when a pinned model does not load, and name it |
+| `webapp.run_ttl_min`, `webapp.max_runs` | how long, and how many, scored runs stay available to the SDF export |
+
+Each scored run gets a random `run_id`, and the SDF export serves only the run its id names. So one
+user cannot download another user's compounds. The CSV export is built in the browser.
+`webapp/requirements.txt` and `webapp/requirements-chemprop.txt` pin both envs. To run the app as a
+service on another machine, read `docs/handoff.md`.
 
 CAUTION when testing it from a shell: a multi-line command collapsed onto one line silently chains the
 steps and leaves a STALE uvicorn answering. Put webapp test sequences in a script file and run

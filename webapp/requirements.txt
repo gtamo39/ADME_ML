@@ -1,13 +1,32 @@
-# ADME_ML prediction webapp (webapp/app.py) — LOCALHOST-ONLY drag-drop scorer.
-# The `ML` conda env already has the scientific stack (mltrail, rdkit, scikit-learn, pandas,
-# numpy, pyyaml). Only the web framework is missing — install these two into `ML` with pip
-# (pure-Python; they do NOT disturb the numpy/pandas/sklearn/rdkit stack):
+# ADME_ML prediction webapp (webapp/app.py) — the `ML` env, pinned to the versions tested 2026-10-19.
+# scikit-learn, numpy and joblib MUST match exactly: the 9 RF models in the vault are joblib pickles.
+# rdkit and descriptastorus must reproduce the training features (H237 featurizer).
 #
+#   conda create -n ML python=3.12.13
 #   conda run -n ML pip install -r webapp/requirements.txt
+#   conda run -n ML pip install -e <clone of github.com/gtamo39/MLTrail>    # mltrail 0.1.0, not on PyPI
 #
-# Then run:  conda run -n ML python webapp/app.py   ->  http://127.0.0.1:8050
-#
-# Everything runs offline; the app binds 127.0.0.1 only (chemistry data must not leave the box).
-fastapi==0.139.0
-uvicorn==0.50.2
+# The chemprop value models run in a SEPARATE env: see webapp/requirements-chemprop.txt.
+# Everything runs offline once installed.
+
+# model pickles: exact
+scikit-learn==1.8.0
+numpy==1.26.4
+joblib==1.5.3
+
+# featurization: exact
+rdkit==2025.9.3
+descriptastorus==2.7.0.3
+
+# web app
+fastapi==0.141.1
+uvicorn==0.52.4
 python-multipart==0.0.32   # required by FastAPI to parse multipart file uploads (/api/predict)
+pandas==3.0.3
+PyYAML==6.0.3
+
+# shared helpers in the Scripts clone (ML_Reg, Statistics_tools)
+scipy==1.17.1
+matplotlib==3.7.5
+tqdm==4.67.3
+dill==0.4.0

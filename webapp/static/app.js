@@ -9,6 +9,7 @@ const drop = $('drop'), fileInput = $('file'), grid = $('grid'),
 
 let MODELS = null;         // {endpoints:[{key,unit,cutoff,favorable,transform}], palette:{...}}
 let ROWS = [];             // every prediction row (kept client-side for sort + MPO retune)
+let RUN_ID = null;         // random id of the scored run; the SDF export sends it back
 let VISIBLE = [];          // the subset of ROWS the filter terms let through (what the grid shows)
 let SORT = { key: null, dir: 1 };   // active sort column + direction (1 asc, -1 desc)
 let FILTERS = [];          // filter terms [{field, op, value}] — an incomplete term is ignored
@@ -433,8 +434,9 @@ async function upload(files) {
     setProgress(null);
     if (err) { setStatus('error: ' + err); return; }
     if (!data) { setStatus('error: the prediction stream ended with no result'); return; }
-    // idx = position in the server's last run; the SDF export needs it to find the original record
+    // idx = row position in this run
     ROWS = data.rows.map((r, i) => ({ ...r, idx: i, score: null, mpo: null, selected: true }));
+    RUN_ID = data.run_id;
     recomputeMPO();
     if (SORT.key) sortRows();
     renderRows();
@@ -516,7 +518,7 @@ sdfBtn.addEventListener('click', async () => {
   try {
     const res = await fetch('/api/download_sdf', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rows: sel.map((r) => ({ idx: r.idx, mpo: r.mpo, score: r.score })) }),
+      body: JSON.stringify({ run: RUN_ID, rows: sel.map((r) => ({ idx: r.idx, mpo: r.mpo, score: r.score })) }),
     });
     if (!res.ok) { setStatus('error: ' + (await res.text()).slice(0, 200)); return; }
     const url = URL.createObjectURL(await res.blob());
@@ -527,7 +529,7 @@ sdfBtn.addEventListener('click', async () => {
 });
 
 clearBtn.addEventListener('click', () => {
-  ROWS = []; VISIBLE = []; SORT = { key: null, dir: 1 };
+  ROWS = []; VISIBLE = []; SORT = { key: null, dir: 1 }; RUN_ID = null;
   renderRows(); legend.style.display = 'none'; dlBtn.disabled = sdfBtn.disabled = true;
   preview.style.display = 'none';
   const sa = $('selall'); if (sa) { sa.checked = true; sa.indeterminate = false; }

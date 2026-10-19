@@ -251,3 +251,16 @@ def test_webapp_applies_the_same_confidence_formula_as_the_deployed_calibration(
     assert np.allclose(got, want), np.abs(got - want).max()
     # a confidence is a probability-like score in (0, 1]
     assert (got > 0).all() and (got <= 1.0 + 1e-12).all()
+
+
+def test_open_vault_refuses_a_missing_folder():
+    """Input: MLTRAIL_VAULT naming a folder that does not exist. Expect: FileNotFoundError before any
+    deploy writes, never MLTrail's fallback to a relative data/registry.json."""
+    params = types.SimpleNamespace(MLTRAIL_VAULT='/nonexistent/MLTrail_vault')
+    try:
+        OUTPUT.open_vault(params)
+    except FileNotFoundError as ex:
+        # the message names the configured path
+        assert '/nonexistent/MLTrail_vault' in str(ex)
+    else:
+        raise AssertionError('open_vault accepted a missing vault folder')

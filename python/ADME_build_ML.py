@@ -723,6 +723,26 @@ class OUTPUT():
         return self.metrics_results_cp
 
     @staticmethod
+    def open_vault(params):
+        """
+        -Open the MLTrail vault at config MLTRAIL_VAULT (registry.json, models/, training_sets/), the vault
+         the webapp reads. Raises FileNotFoundError when the vault folder does not exist.
+        param class params: PARAMS instance (MLTRAIL_VAULT)
+        return Registry: the opened vault
+        """
+        from mltrail import Registry
+        from mltrail.config import default_config
+        # fail on a vault that is not mounted
+        if not os.path.isdir(params.MLTRAIL_VAULT):
+            raise FileNotFoundError(f'MLTRAIL_VAULT: no folder {params.MLTRAIL_VAULT}')
+
+        # MLTrail defaults, with the three vault paths from this config
+        return Registry.from_config({**default_config(),
+                                     'registry_path': os.path.join(params.MLTRAIL_VAULT, 'registry.json'),
+                                     'trained_models_dir': os.path.join(params.MLTRAIL_VAULT, 'models'),
+                                     'training_sets_dir': os.path.join(params.MLTRAIL_VAULT, 'training_sets')})
+
+    @staticmethod
     def vault_id(params, registry, k, framework, name):
         """
         -Resolve the MLTrail id a deploy must APPEND to. config MLTRAIL_IDS[framework][k] is the pin and
@@ -950,7 +970,7 @@ class OUTPUT():
             after a change to ENDPOINT_PUBLIC_FILES, because the cache holds the OLD public pool
         return list: one summary dict per endpoint
         """
-        registry = None if dry_run else __import__('mltrail').Registry.from_default()
+        registry = None if dry_run else self.open_vault(params)
         summaries = []
         for k in (endpoints or list(params.ADME_ENDPOINTS)):
             # build the pretrain/finetune pools for this endpoint's winning grouping
@@ -974,7 +994,7 @@ class OUTPUT():
         param bool dry_run: fit + calibrate but do not register to MLTrail
         return list: one summary dict per endpoint
         """
-        registry = None if dry_run else __import__('mltrail').Registry.from_default()
+        registry = None if dry_run else self.open_vault(params)
         min_n = params.PUBLIC_ORIGIN_MIN_N if min_n is None else min_n
         summaries = []
         for k in (endpoints or list(params.ADME_ENDPOINTS)):
@@ -1024,8 +1044,7 @@ if __name__ == "__main__":
 
     # audit the pinned ids and stop; deliberately before any data load, so it stays instant
     if args.check_mltrail_ids:
-        from mltrail import Registry
-        problems = OUTPUT(params).check_mltrail_ids(params, Registry.from_default())
+        problems = OUTPUT(params).check_mltrail_ids(params, OUTPUT.open_vault(params))
         for x in problems:
             print(f'! {x}')
         print(f"> MLTRAIL_IDS: {'OK' if not problems else str(len(problems)) + ' problem(s)'}")

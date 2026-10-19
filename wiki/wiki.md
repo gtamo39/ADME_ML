@@ -371,10 +371,50 @@ scans the vault by `experiment_name` any more, so `registry.list()` order is no 
 - `python python/ADME_build_ML.py --check_mltrail_ids` audits the pins: every pinned id must exist and
   carry the expected name; an `rf` id is required for all 9 (it is the confidence source), a `chemprop`
   id only where `webapp.value_model` says chemprop. Loads no data, exits 1 on a problem.
-- Current state: rf 20-27 + 36, chemprop 28-35, `chemprop.mdck_inh: null`. The audit reports exactly
-  that one gap, and the webapp now names it in a WARN instead of falling back to RF in silence.
+- Current state (2026-10-19): rf 20-27 + 36, chemprop 28-35 + **mdck_inh 46** (`adme_mdck_inh_cp`,
+  created by the 2026-09-24 deploy, pinned 2026-10-19). `--check_mltrail_ids` exits 0, and the
+  webapp binds RF 9/9 + chemprop 8 with no WARN (mdck_inh value now from `permeability_inh`).
 - `webapp.extra_models[].model_id` already worked this way; `MLTRAIL_IDS` extends the pattern to the
   ADME endpoints.
+
+**WEBAPP SERVER HANDOFF + HARDENING (2026-10-19, `docs/handoff.md`).** The handoff is written for the
+engineer who moves the webapp to a company server. The code gaps it found were then closed, and the
+result verified end to end against the live vault (3 public molecules, uvicorn started as in the unit):
+- **Cross-user leak — FIXED.** The download routes used to read the process-global `_LAST_CSV` /
+  `_LAST_BLOCKS`, so user B could download user A's last run. Now `/api/predict` stores each run under
+  `secrets.token_urlsafe(16)` and returns that `run_id`; `/api/download_sdf` needs it (404 when
+  unknown, absent or expired). Store: in memory, `webapp.run_ttl_min` 60, `webapp.max_runs` 50. The
+  unused `GET /api/download` was removed (the CSV is built in the browser). Still one worker: the
+  store is per process, so a second worker returns 404 (safe, but broken).
+- **Vault path — config `MLTRAIL_VAULT: /data2/MLTrail_vault`.** The deploy (`OUTPUT.open_vault`) and
+  the webapp (`_registry`) both open it from there, over MLTrail's `default_config()`. The webapp
+  raises `FileNotFoundError` when `registry.json` is absent, which replaces MLTrail's silent fallback
+  to a relative `data/registry.json` and an empty grid. `registry.json` stores ABSOLUTE model paths,
+  so the server must mount the vault at that same path.
+- **Strict startup — `webapp.strict_startup: true`.** The app refuses to start and names each missing
+  model (`_missing_models`: every RF model, plus each chemprop model that `value_model` needs). The
+  unit file needs `StartLimitBurst`, or systemd restarts it every 5 s forever.
+- **Scripts path — `webapp.scripts_dir`** (default `~/Scripts`); the server clones
+  `github.com/gtamo39/Scripts`. Importing `ML_Reg` also loads `Statistics_tools` (needs `dill`);
+  `Rdkit_tools` loads lazily and the app never needs it.
+- **chemprop temp folders — FIXED in the webapp.** Each call gets a `TemporaryDirectory` as `workdir`;
+  8 chemprop predictions left `/tmp/cp_pred_*` at 177 before and after. The shared `ML_Reg` function
+  still leaves its folder when a caller passes no `workdir`.
+- **Pins:** `webapp/requirements.txt` (scikit-learn 1.8.0 + numpy 1.26.4 + joblib 1.5.3 exact: the RF
+  models are pickles) and `webapp/requirements-chemprop.txt` (chemprop 2.2.4, torch 2.13.0, lightning
+  2.6.5).
+- The webapp needs no `output/`, `data/` or `python/`; every chemprop checkpoint resolves inside the
+  vault. `--check_mltrail_ids` stays a training-box check, because `ADME_build_ML.py` loads the CDD
+  Vault client at import.
+- Tests: `tests/test_webapp.py` (unittest, 9 cases: run store, SDF export isolation, startup check);
+  `tests/test_deploy.py` gained an `open_vault` case. 49 function-style tests pass plus the 9 unittest
+  cases; the 11 `test_roundtrip_cells` failures predate this work (the mdck_inh filter column).
+
+**CLAUDE.md aligned with MS_ML (2026-10-19).** Added "Write code the way I write it" (read
+`/home/gtamo/Simplify/rules.md` before writing code) and the notebook-read guard: a `PreToolUse` hook
+on `Read` in `.claude/settings.json` that denies any `*.ipynb` (copied verbatim from MS_ML; proven
+live). Dropped "Comment every step" (rules 1-3 own comment style). Kept "Never re-import", which
+`rules.md` does not cover.
 
 **FIXED 2026-09-24 — both deploys now APPEND a version.** New `OUTPUT.vault_id(registry, name)` resolves
 the `experiment_name` to its id; `deploy_endpoint` and `deploy_endpoint_cp` pass that id to
@@ -3563,3 +3603,43 @@ practice a CDD pull does NOT invalidate a stage-1 checkpoint; check that line to
 
 CAUTION: the reuse is SILENT — `assess_predictions_cp` passes no `force_pretrain`. The log says which
 happened: `> PRETRAIN <n> public rows ...` (fresh) vs `> PRETRAIN reused checkpoint -> <path>` (cached).
+
+## Confidence progression boxplots — transfer -> augmented CV -> round trip (2026-10-19, cell `bd89b82a`)
+
+Question (user): does the RF confidence rise when more relevant data enters the training set?
+Cell `bd89b82a` ("## show confidence boxplots") in `vignettes/Multitask_adme_preds.ipynb` answers it.
+It draws one panel per endpoint, with three boxes from left to right:
+
+| box | model | source of `uq_std` |
+|---|---|---|
+| transfer | RF on public rows only | `ext_->_internal_preddf` in `METRICS_PKL_RF_DIR/<ep>.pkl` |
+| augmented CV | RF on 4/5 internal + public, scores the held-out fold | `augmented_cv_preddf` |
+| round trip | deployed MLTrail RF (`MLTRAIL_IDS.rf`), trained on all internal + public | computed in the cell |
+
+- **Paired.** The three boxes hold the same compounds: the `augmented_cv_preddf` compounds of the endpoint.
+- **One calibration per endpoint.** The cell applies the deployed bundle calibration to all three arms
+  (`ML_Reg.apply_confidences`), so a box moves only when the tree spread moves. The stored augmented-CV
+  `conf_recal` uses leave-one-fold-out calibrations, so the cell does not use it.
+- **Fact:** the stored transfer `conf_recal` already uses the pooled augmented-CV calibration.
+  `assess_predictions` removes the arm's test compounds from the calibration rows. That arm tests every
+  internal compound, so 0 rows remain and the code falls back to `_calibration`.
+- The 2026-09-23 pickle `_calibration` equals the deployed v2 bundle calibration (2026-09-24) on 7 endpoints.
+  mdck and mdck_inh differ in the third decimal only.
+- The round trip reads the internal H237 rows from `data.MF_features['all']`. The bundle `feature_cols`
+  are the same 4469 columns in the same order (checked on 3 bundles), so the cell featurizes nothing.
+- Bundles reach 0.89 GB on disk (hlm). The box has 377 GB RAM, so the cell does not free them in the loop.
+  On synthetic data the cell runs in 6 s.
+- **Env fact:** the notebook kernel (`chemprop` env, scikit-learn 1.9.0) loads the 1.8.0 bundles with an
+  `InconsistentVersionWarning` only. Per-tree predictions are bit-identical to the `ML` env (synthetic X).
+- rlm has `recal_b` < 0, so its confidence RISES with the tree spread. The panel title flags every endpoint
+  with `recal_b` < 0. For rlm, compare the spread instead: `conf.groupby(['endpoint', 'arm'])['uq_std'].median()`.
+- **Output:** the cell saves `output/figures/20261019_confidence_200_trees.png` before `plt.show()`
+  (constants `OUT_PNG`, `DPI = 150`, the dpi of the other saved figures). 200 trees =
+  `RF_SINGLETASK.champion.n_estimators`. `conf` holds the long frame (endpoint, arm, compound, uq_std, conf_*).
+- **House style since 2026-10-19** (`/home/gtamo/Simplify/rules.md`). Behaviour changes: no median print;
+  `fn._load_metrics_pkls` loads the arms (in-memory first); no guard for a missing transfer arm (all 9
+  endpoints have one); no spare-panel hiding (9 endpoints fill the 3 x 3 grid).
+- Colours: one-hue ramp from `SERAC_C.azure` (`#57c0dd` / `#0ea4cd` / `#08627b`), passes the ordinal checks.
+- Test: synthetic compounds + the real vault bundles. Asserts: paired compounds, closed-form `conf_recal`,
+  the pickle load, the global `k` unchanged, the PNG at 150 dpi, a safe re-run (same frame).
+- **RESULT: PENDING.** The user runs the cell on the real data; record the medians here.
