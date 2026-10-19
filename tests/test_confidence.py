@@ -5,6 +5,7 @@ with the tree-variance std, and that a degenerate (constant real_y) calibration 
 """
 import numpy as np
 import pandas as pd
+import unittest
 
 import python.ADME_build_ML  # noqa: F401  (adds ~/Scripts to sys.path so `import ML_Reg` resolves)
 import ML_Reg
@@ -21,38 +22,6 @@ def _synthetic_cv(n=400, under_disperse=3.0, seed=0):
     return pd.DataFrame({'real_y': real, 'pred_y': pred, 'uq_std': uq})
 
 
-def test_apply_confidences_columns_bounded_and_monotone():
-    """All 4 conf_* columns exist, lie in [0,1], and decrease as the tree-std rises."""
-    cv = _synthetic_cv()
-    calib = ML_Reg.calibrate_confidence_params(cv)
-    out = ML_Reg.apply_confidences(cv, calib)
-    # all four comparison columns are present
-    assert all(c in out.columns for c in CONF_COLS)
-    for c in CONF_COLS:
-        v = out[c].to_numpy()
-        # every confidence is a valid probability-like score in [0, 1]
-        assert np.nanmin(v) >= -1e-9 and np.nanmax(v) <= 1 + 1e-9
-        # higher tree-variance std -> lower confidence (negative correlation)
-        assert np.corrcoef(out['uq_std'], v)[0, 1] < 0
-
-
-def test_calibration_recovers_underdispersion_slope():
-    """The recal fit |resid| ~ a + b*std recovers a positive slope for under-dispersed tree-std."""
-    calib = ML_Reg.calibrate_confidence_params(_synthetic_cv(under_disperse=3.0))
-    # slope is clearly positive (std tracks error) and rmse_cv is finite
-    assert calib['recal_b'] > 0.5
-    assert np.isfinite(calib['rmse_cv']) and calib['rmse_cv'] > 0
-
-
-def test_degenerate_calibration_is_safe():
-    """A constant-real_y calibration arm must not crash; columns still produced."""
-    deg = pd.DataFrame({'real_y': np.ones(10), 'pred_y': np.linspace(0, 1, 10), 'uq_std': np.linspace(0.1, 1, 10)})
-    calib = ML_Reg.calibrate_confidence_params(deg)
-    out = ML_Reg.apply_confidences(deg, calib)
-    # columns present even though the calibration arm is degenerate
-    assert all(c in out.columns for c in CONF_COLS)
-
-
 def _synthetic_folds(n=500, k=5, seed=0):
     """A CV pred_df with a fold column; residual scales with tree-std (learnable, under-dispersed)."""
     df = _synthetic_cv(n=n, seed=seed).copy()
@@ -61,24 +30,59 @@ def _synthetic_folds(n=500, k=5, seed=0):
     return df
 
 
-def test_lofo_preserves_order_bounded_monotone():
-    """apply_confidences_lofo returns all rows in original order, bounded [0,1], monotone-decreasing with std."""
-    pdf = _synthetic_folds()
-    out = ML_Reg.apply_confidences_lofo(pdf)
-    assert out is not None and len(out) == len(pdf)
-    # original row order is restored
-    assert (out['compound'].to_numpy() == pdf['compound'].to_numpy()).all()
-    for c in CONF_COLS:
-        v = out[c].to_numpy()
-        assert np.nanmin(v) >= -1e-9 and np.nanmax(v) <= 1 + 1e-9
-        assert np.corrcoef(out['uq_std'], v)[0, 1] < 0
+class TestConfidence(unittest.TestCase):
+    """The conf_* confidence variants and their leave-one-fold-out calibration."""
+
+    def test_apply_confidences_columns_bounded_and_monotone(self):
+        """All 4 conf_* columns exist, lie in [0,1], and decrease as the tree-std rises."""
+        cv = _synthetic_cv()
+        calib = ML_Reg.calibrate_confidence_params(cv)
+        out = ML_Reg.apply_confidences(cv, calib)
+        # all four comparison columns are present
+        assert all(c in out.columns for c in CONF_COLS)
+        for c in CONF_COLS:
+            v = out[c].to_numpy()
+            # every confidence is a valid probability-like score in [0, 1]
+            assert np.nanmin(v) >= -1e-9 and np.nanmax(v) <= 1 + 1e-9
+            # higher tree-variance std -> lower confidence (negative correlation)
+            assert np.corrcoef(out['uq_std'], v)[0, 1] < 0
+
+    def test_calibration_recovers_underdispersion_slope(self):
+        """The recal fit |resid| ~ a + b*std recovers a positive slope for under-dispersed tree-std."""
+        calib = ML_Reg.calibrate_confidence_params(_synthetic_cv(under_disperse=3.0))
+        # slope is clearly positive (std tracks error) and rmse_cv is finite
+        assert calib['recal_b'] > 0.5
+        assert np.isfinite(calib['rmse_cv']) and calib['rmse_cv'] > 0
+
+    def test_degenerate_calibration_is_safe(self):
+        """A constant-real_y calibration arm must not crash; columns still produced."""
+        deg = pd.DataFrame({'real_y': np.ones(10), 'pred_y': np.linspace(0, 1, 10), 'uq_std': np.linspace(0.1, 1, 10)})
+        calib = ML_Reg.calibrate_confidence_params(deg)
+        out = ML_Reg.apply_confidences(deg, calib)
+        # columns present even though the calibration arm is degenerate
+        assert all(c in out.columns for c in CONF_COLS)
+
+    def test_lofo_preserves_order_bounded_monotone(self):
+        """apply_confidences_lofo returns all rows in original order, bounded [0,1], monotone-decreasing with std."""
+        pdf = _synthetic_folds()
+        out = ML_Reg.apply_confidences_lofo(pdf)
+        assert out is not None and len(out) == len(pdf)
+        # original row order is restored
+        assert (out['compound'].to_numpy() == pdf['compound'].to_numpy()).all()
+        for c in CONF_COLS:
+            v = out[c].to_numpy()
+            assert np.nanmin(v) >= -1e-9 and np.nanmax(v) <= 1 + 1e-9
+            assert np.corrcoef(out['uq_std'], v)[0, 1] < 0
+
+    def test_lofo_needs_two_folds(self):
+        """LOFO returns None when it can't hold a fold out (single fold, or no fold column)."""
+        pdf = _synthetic_folds()
+        one = pdf.copy(); one['fold'] = 1
+        # a single fold cannot be left out
+        assert ML_Reg.apply_confidences_lofo(one) is None
+        # missing the fold column entirely
+        assert ML_Reg.apply_confidences_lofo(pdf.drop(columns='fold')) is None
 
 
-def test_lofo_needs_two_folds():
-    """LOFO returns None when it can't hold a fold out (single fold, or no fold column)."""
-    pdf = _synthetic_folds()
-    one = pdf.copy(); one['fold'] = 1
-    # a single fold cannot be left out
-    assert ML_Reg.apply_confidences_lofo(one) is None
-    # missing the fold column entirely
-    assert ML_Reg.apply_confidences_lofo(pdf.drop(columns='fold')) is None
+if __name__ == '__main__':
+    unittest.main()

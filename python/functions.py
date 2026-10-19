@@ -390,6 +390,165 @@ def score_round_trip(preds, truth, endpoints, id_col='id', truth_id='name',
     return long, pd.DataFrame(metrics).set_index('endpoint')
 
 
+def sol_binary_frames(test, test_MF, public, public_MF, cutoff):
+    """
+    -Internal and public solubility frames for a binary soluble/insoluble model, plus the two stacked.
+     Each side merges its labels onto its H236 features and keeps one row per SMILES; the label becomes
+     1 at or above the raw-unit cutoff. Used by the 4 evaluation arms of
+     vignettes/Solubility_sticky_cmps, which each rebuilt it (moved here 2026-10-19).
+    param dataframe test: internal labels (compound, smiles, label in raw uM)
+    param dataframe test_MF: internal H236 features (compound + feature columns)
+    param dataframe public: harmonized public rows (compound, smiles, solubility)
+    param dataframe public_MF: public H236 features
+    param float cutoff: raw-unit solubility cutoff; label 1 at or above it
+    return tuple: (internal, public, both) — all three carry the binary label
+    """
+    # one row per smiles on each side
+    internal = pd.merge(test, test_MF).drop_duplicates('smiles')
+    public = pd.merge(public.rename(columns={'solubility': 'label'})[['compound', 'smiles', 'label']],
+                      public_MF).drop_duplicates('smiles')
+
+    # binarize at the cutoff, on both sides at once
+    both = pd.concat([public, internal], ignore_index=True)
+    for d in (internal, public, both):
+        d['label'] = (d['label'] >= cutoff) * 1
+
+    return internal, public, both
+
+
+def plot_confidence_panel(ax, conf, resid, split, colors, title='', xlabel='RF confidence', ylabel='|residual|'):
+    """
+    -One confidence panel: |residual| against the confidence, the binned mean |residual| (5 bins over
+     0-1), a dashed line at `split`, and the RMSE + n of each half in the two top corners. A working
+     confidence puts the larger RMSE on the left (least confident) half. The title carries the
+     Spearman rho of confidence vs |residual| (NaN with 2 points or fewer). Moved on 2026-10-19 from
+     3 notebook cells (Multitask_adme_preds 560d161e / eb77e860, FP_preds 36f4fb87).
+    param Axes ax: the panel to draw on
+    param series conf: confidence per row, 0-1
+    param series resid: residual per row (signed or absolute; the panel uses |resid|)
+    param float split: the confidence cut (config webapp.confidence_split)
+    param dict colors: params.SERAC_C (azure points, ember trend line)
+    param str title: text before the rho in the title
+    return tuple: (rho, pval)
+    """
+    from scipy import stats
+
+    # rank association of confidence and |residual|
+    absr = resid.abs()
+    rho, pval = stats.spearmanr(conf, absr) if len(conf) > 2 else (np.nan, np.nan)
+
+    # points and the binned mean |residual|
+    ax.scatter(conf, absr, s=16, alpha=.55, lw=.4, color=colors['azure'], edgecolor='white')
+    g = absr.groupby(pd.cut(conf, np.linspace(0, 1, 6)), observed=True).mean()
+    ax.plot([iv.mid for iv in g.index], g.values, '-o', ms=4, lw=1.6, color=colors['ember'])
+
+    # split line, RMSE and n of each half
+    ax.axvline(split, color='#6f675c', ls='--', lw=1.1, zorder=1)
+    for half, x, ha in ((conf < split, .03, 'left'), (conf >= split, .97, 'right')):
+        r = absr[half]
+        txt = f'RMSE {np.sqrt(np.mean(r ** 2)):.3f}\nn={len(r)}' if len(r) else 'no points'
+        ax.text(x, .97, txt, transform=ax.transAxes, ha=ha, va='top', fontsize=9,
+                bbox=dict(fc='white', ec='#e3ddd0', boxstyle='round,pad=0.3', alpha=.9))
+
+    # title and axes
+    ax.set_title(f'{title} — rho={rho:.2f} (p={pval:.2g}), n={len(conf)}', fontsize=10)
+    ax.set_xlabel(xlabel); ax.set_ylabel(ylabel)
+    ax.set_xlim(0, 1); ax.grid(alpha=.25)
+    return rho, pval
+
+
+# metrics-table columns: label -> key in <arm>_metrics, then the triage columns; the better direction
+_REG_COLS = {'R2_det': 'r2det', 'R2_pears': 'r2', 'RMSE': 'rmse', 'N': 'n_test', 'n_train': 'n_train'}
+_TABLE_COLS = list(_REG_COLS) + ['Accuracy', 'PPV', 'NPV', 'F1(+)', 'F1(-)', 'MCC']
+_HIGHER = {'R2_det', 'R2_pears', 'Accuracy', 'PPV', 'NPV', 'F1(+)', 'F1(-)', 'MCC'}
+_LOWER = {'RMSE'}
+
+
+def _classif_metrics(pdf, ctf, favorable):
+    """
+    -Binary triage metrics of a regression pred_df at one cutoff (modelling space).
+    param dataframe pdf: pred_df with real_y / pred_y
+    param float ctf: cutoff in modelling space
+    param str favorable: '<' (below the cutoff is the positive class) | '>=' (at or above it is)
+    return dict: {Accuracy, PPV, NPV, F1(+), F1(-), MCC}; MCC is NaN when a side holds one class only
+    """
+    from sklearn import metrics as m
+
+    # positive class on both sides
+    d = pdf.dropna(subset=['real_y', 'pred_y'])
+    yo, yp = d['real_y'].to_numpy(float), d['pred_y'].to_numpy(float)
+    rc, pc = (yo < ctf, yp < ctf) if favorable == '<' else (yo >= ctf, yp >= ctf)
+
+    return {'Accuracy': m.accuracy_score(rc, pc), 'PPV': m.precision_score(rc, pc, zero_division=0),
+            'NPV': m.precision_score(~rc, ~pc, zero_division=0), 'F1(+)': m.f1_score(rc, pc, zero_division=0),
+            'F1(-)': m.f1_score(rc, pc, pos_label=False, zero_division=0),
+            'MCC': m.matthews_corrcoef(rc, pc) if (rc.min() != rc.max() and pc.min() != pc.max()) else np.nan}
+
+
+def _td(col, v, best, worst, sep=''):
+    """One right-aligned HTML table cell: the best value bold cyan, the worst orange."""
+    s = 'nan' if pd.isna(v) else (f'{int(v)}' if col in ('N', 'n_train') else f'{v:.3g}')
+    base = f'text-align:right;padding:2px 8px{sep}'
+    if col in best and not pd.isna(v):
+        if v == best[col]:
+            return f'<td style="color:#0097A7;font-weight:700;{base}">{s}</td>'
+        if v == worst[col] and worst[col] != best[col]:
+            return f'<td style="color:#F57C00;{base}">{s}</td>'
+    return f'<td style="{base}">{s}</td>'
+
+
+def endpoint_metrics_table(metrics_dict, endpoint, params):
+    """
+    -Display one endpoint's arms as an HTML table and return the numbers. One row per arm: the
+     regression metrics of <arm>_metrics, plus the triage metrics of <arm>_preddf at the config cutoff
+     webapp.cutoffs[endpoint] (moved to modelling space with the endpoint's transform; `favorable`
+     names the positive side). CV rows come first, temporal rows (name holds 'temp') after a double
+     rule, R2det descending in each block. Inside a block the best value per column is bold cyan and
+     the worst orange. Moved on 2026-10-19 from the FUNCTIONS cell of vignettes/Multitask_adme_preds.
+    param dict metrics_dict: one endpoint's arm store (output.metrics_results[k] or metrics_results_cp[k])
+    param str endpoint: endpoint key
+    param class params: PARAMS instance (ADME_ENDPOINTS, webapp.cutoffs)
+    return DataFrame: one row per arm, the columns of _TABLE_COLS
+    """
+    from IPython.display import HTML, display
+
+    # triage cutoff in modelling space
+    cut = params.webapp['cutoffs'][endpoint]   #_> dict={value:10,favorable:>=}
+    ctf = _ROUND_TRIP_TF[params.ADME_ENDPOINTS[endpoint]['transform']](cut['value'])
+
+    # one row per arm: regression from <arm>_metrics, triage from <arm>_preddf
+    arms = [a[:-len('_metrics')] for a in metrics_dict if a.endswith('_metrics')]   #_> list[str]=[ext_->_internal,internal_cv,...]
+    rows = {a: {**{c: metrics_dict[a + '_metrics'].get(src) for c, src in _REG_COLS.items()},
+                **(_classif_metrics(metrics_dict[a + '_preddf'], ctf, cut['favorable']) if a + '_preddf' in metrics_dict else {})}
+            for a in arms}
+    df = pd.DataFrame(rows).T.reindex(columns=_TABLE_COLS).apply(pd.to_numeric, errors='coerce')
+
+    # CV block, then the temporal block
+    temp = df.index.str.contains('temp', case=False)
+    blocks = [b.sort_values('R2_det', ascending=False) for b in (df[~temp], df[temp]) if len(b)]
+
+    # body: best / worst per column inside each block, a double rule between blocks
+    body = ''
+    for i, b in enumerate(blocks):
+        best = {c: b[c].max() if c in _HIGHER else b[c].min() for c in _HIGHER | _LOWER}
+        worst = {c: b[c].min() if c in _HIGHER else b[c].max() for c in _HIGHER | _LOWER}
+        for j, (arm, r) in enumerate(b.iterrows()):
+            sep = ';border-top:3px double #666' if (i > 0 and j == 0) else ''
+            body += (f'<tr><td style="text-align:left;font-weight:600;padding:2px 8px{sep}">{arm}</td>'
+                     + ''.join(_td(c, r[c], best, worst, sep) for c in _TABLE_COLS) + '</tr>')
+
+    # caption, header, display
+    th = ''.join(f'<th style="text-align:right;padding:2px 8px;border-bottom:1px solid #999">{c}</th>' for c in _TABLE_COLS)
+    cap = (f'<b>{endpoint}</b> — regression + classification @ cutoff {cut["value"]:g} (sign {cut["favorable"]}) · '
+           f'<span style="color:#0097A7;font-weight:700">best</span>/<span style="color:#F57C00">worst</span> per column, '
+           f'within each category (double rule = CV / temporal boundary)')
+    display(HTML(f'<div style="font:13px sans-serif"><p>{cap}</p><table style="border-collapse:collapse">'
+                 f'<thead><tr><th style="text-align:left;padding:2px 8px;border-bottom:1px solid #999">pred_df</th>{th}</tr></thead>'
+                 f'<tbody>{body}</tbody></table></div>'))
+
+    return pd.concat(blocks)[_TABLE_COLS]
+
+
 # -------------------------------
 # UNHASHED Morgan fingerprints — MOVED to Scripts/Rdkit_tools.py on 2026-09-15
 # -------------------------------

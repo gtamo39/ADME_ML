@@ -56,6 +56,9 @@ chemprop only after RF finishes, or it builds its own, incomparable folds.
 Watch them with `screen -r rf` / `screen -r cp`, or `tail -f output/logs/20260922_rf.log`.
 
 ```bash
+# 0. the log folder (tee cannot create it)
+mkdir -p output/logs
+
 # 1. pull the new CDD data + assess RF, all 9 endpoints (detached)
 screen -dmS rf bash -c '~/miniconda3/envs/ML/bin/python python/ADME_build_ML.py \
   --overwrite --assess_RF_all_endpoints 2>&1 | tee output/logs/20260922_rf.log'
@@ -91,10 +94,10 @@ Write it to `autoresearch/predict_adme/public_<name>.parquet` (config `ADME_CACH
 You do **not** need a feature block. The older parquets carry ~4,469 feature columns, but that is
 legacy from the retired runner. `DATA.build_MF_features` derives every feature from the SMILES.
 
-The existing harmonizer is `autoresearch/predict_adme/build_public_features.py`, which calls
-`python/harmonize_adme.py` for the unit conversions and writes the id + the legacy feature block.
-**CAUTION:** it reads `ADME_PUBLIC`, `ADME_SCALING` and `BIOGEN_ADME_CSV`, which the lean config no
-longer holds. Point it at `config/config_legacy_20260903.yaml`, or convert the units yourself.
+No harmonizer script remains. The 2026-10-19 cleanup deleted `autoresearch/predict_adme/build_public_features.py`
+and `config/config_legacy_20260903.yaml`. `python/harmonize_adme.py` still holds the unit conversions, but it
+reads `ADME_PUBLIC`, `ADME_SCALING` and `BIOGEN_ADME_CSV`, which only that legacy config held. Restore it with
+`git checkout d1cf116 -- config/config_legacy_20260903.yaml`, or convert the units yourself.
 
 ### 2. Register the file in the config
 
@@ -152,6 +155,7 @@ fold of that grouping. New public data does not invalidate it by itself — you 
 
 ```bash
 ML_PY=~/miniconda3/envs/ML/bin/python
+mkdir -p output/logs
 
 # assess: bump CHEMPROP_PRETRAIN_DIR in config/config.yaml first, then
 screen -dmS cp bash -c "$ML_PY python/ADME_build_ML.py --assess_CP_all_endpoints \
@@ -219,12 +223,13 @@ pip install chemprop descriptastorus PyTDC
 Pinned versions in `requirements.txt`. All libraries run fully offline after install;
 PyTDC downloads only **public** datasets (Harvard Dataverse), never in-house data.
 
-### Which env runs what (multitask ADME, `autoresearch/predict_adme/`)
+### Which env runs what
 
-- **`chemprop` env** — `build_public_features.py` (needs PyTDC + Descriptastorus) and the
-  Chemprop multitask model. Compute Descriptastorus features here.
-- **`ML` env** — internal baselines and the single-task **XGBoost** arms (`xgboost` is not in
-  the `chemprop` env). RandomForest / ExtraTrees / HistGB arms run in either env.
+- **`ML` env** — `python/ADME_build_ML.py` in every CLI mode, the webapp, and the test suite
+  (`python -m unittest discover -s tests`, from the repo root).
+- **`chemprop` env** — the chemprop CLI. `ADME_build_ML.py` calls it through
+  `CHEMPROP_TRANSFER.chemprop_bin`, so the runner itself stays in `ML`. The notebooks record this env
+  as their kernel; its scikit-learn 1.9.0 loads the 1.8.0 RF bundles with a version warning only.
 - **Note:** the two envs have different rdkit versions (2025.9.3 vs 2023.9.6). Keep features
   that feed one model from a single env; MF fingerprint parquets are portable, but rebuild
   rather than mix versions if calibration matters.

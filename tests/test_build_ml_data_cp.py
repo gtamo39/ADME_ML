@@ -9,6 +9,7 @@ import os
 import pickle
 import tempfile
 import types
+import unittest
 
 import numpy as np
 import pandas as pd
@@ -63,117 +64,119 @@ def _write_rf_pkl(rf_dir, ep, compounds, folds):
         pickle.dump({ep: {'internal_cv_preddf': pd.DataFrame({'compound': compounds, 'fold': folds})}}, fh)
 
 
-def test_pools_tasks_and_features():
-    """cp_pub is public-only, cp_int is internal-and-measured, and only DS_ features come along.
+class TestBuildMLDataCP(unittest.TestCase):
+    """DATA.build_ML_data_CP: pools, leak filter, folds and cluster groupings."""
 
-    Rows: I_1..I_5 internal (I_5 has no logd) · P_1/P_2 public with a task · P_3 public with none.
-    Expect cp_int = 4 internal rows measured for logd, cp_pub = 2 public rows, MF_0 excluded.
-    """
-    with tempfile.TemporaryDirectory() as td:
-        data = _data_with_wide()
-        data.build_ML_data_CP(_fake_params(td), k='logd', leak='none', n_splits=2)
+    def test_pools_tasks_and_features(self):
+        """cp_pub is public-only, cp_int is internal-and-measured, and only DS_ features come along.
 
-        # cp_int keeps only internal rows that measure logd (I_5 has NaN logd)
-        assert list(data.cp_int.compound) == ['I_1', 'I_2', 'I_3', 'I_4']
-        # cp_pub keeps only public rows with >=1 grouping task measured (P_3 has none)
-        assert list(data.cp_pub.compound) == ['P_1', 'P_2']
-        # the grouping's task columns come from CHEMPROP_TRANSFER.groupings
-        assert data.cp_tasks == ['solubility', 'logd'] and data.cp_grouping == 'sol_lipo' and data.cp_k == 'logd'
-        # only the DS_ descriptor columns are carried; the MF_ fingerprint columns are not
-        assert data.cp_ds_cols == ['DS_a', 'DS_b'] and 'MF_0' not in data.cp_int.columns
+        Rows: I_1..I_5 internal (I_5 has no logd) · P_1/P_2 public with a task · P_3 public with none.
+        Expect cp_int = 4 internal rows measured for logd, cp_pub = 2 public rows, MF_0 excluded.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            data = _data_with_wide()
+            data.build_ML_data_CP(_fake_params(td), k='logd', leak='none', n_splits=2)
+
+            # cp_int keeps only internal rows that measure logd (I_5 has NaN logd)
+            assert list(data.cp_int.compound) == ['I_1', 'I_2', 'I_3', 'I_4']
+            # cp_pub keeps only public rows with >=1 grouping task measured (P_3 has none)
+            assert list(data.cp_pub.compound) == ['P_1', 'P_2']
+            # the grouping's task columns come from CHEMPROP_TRANSFER.groupings
+            assert data.cp_tasks == ['solubility', 'logd'] and data.cp_grouping == 'sol_lipo' and data.cp_k == 'logd'
+            # only the DS_ descriptor columns are carried; the MF_ fingerprint columns are not
+            assert data.cp_ds_cols == ['DS_a', 'DS_b'] and 'MF_0' not in data.cp_int.columns
+
+    def test_leak_filter_drops_internal_twins(self):
+        """A public row that is the same molecule as an internal compound must leave cp_pub.
+
+        P_1 is ethanol, the same molecule as internal I_1. leak='exact' must drop it; leak='none' must keep it.
+        P_2 is naphthalene, which no internal compound matches, so it must survive both levels.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            data = _data_with_wide()
+            data.build_ML_data_CP(_fake_params(td), k='logd', leak='exact', n_splits=2)
+            # the ethanol twin of I_1 is gone, the naphthalene public row stays
+            assert list(data.cp_pub.compound) == ['P_2']
+
+            data.build_ML_data_CP(_fake_params(td), k='logd', leak='none', n_splits=2)
+            # with the filter off both public rows survive
+            assert list(data.cp_pub.compound) == ['P_1', 'P_2']
+
+    def test_folds_from_rf_pickle(self):
+        """When <METRICS_PKL_RF_DIR>/<k>.pkl exists, cp_folds must be RF's exact folds and the source says so."""
+        with tempfile.TemporaryDirectory() as td:
+            _write_rf_pkl(td, 'logd', ['I_1', 'I_2', 'I_3', 'I_4'], [0, 1, 0, 1])
+            data = _data_with_wide()
+            data.build_ML_data_CP(_fake_params(td), k='logd', leak='none')
+
+            # two folds, and each test set is exactly the RF fold membership
+            assert len(data.cp_folds) == 2
+            assert sorted(data.cp_folds[0][1]) == ['I_1', 'I_3'] and sorted(data.cp_folds[1][1]) == ['I_2', 'I_4']
+            # the source string names the pickle it read
+            assert data.cp_fold_source == f'rf:{os.path.join(td, "logd.pkl")}'
+
+    def test_folds_independent_when_no_pickle(self):
+        """With no RF pickle, cp_folds must be an independent grouped split that still partitions cp_int once."""
+        with tempfile.TemporaryDirectory() as td:
+            data = _data_with_wide()
+            data.build_ML_data_CP(_fake_params(td), k='logd', leak='none', n_splits=2, seed=1)
+
+            # the split is flagged as independent, not RF's
+            assert data.cp_fold_source == 'independent'
+            # every cp_int compound appears in exactly one test fold
+            test_ids = [c for _, te in data.cp_folds for c in te]
+            assert sorted(test_ids) == sorted(data.cp_int.compound)
+            # train and test never share a compound within a fold
+            assert all(not set(tr) & set(te) for tr, te in data.cp_folds)
+
+    def test_cluster_grouping_joins_the_novartis_aux_tasks(self):
+        """A cluster grouping must take its auxiliary tasks from the cluster parquet, joined on SMILES.
+
+        The fake parquet gives 2 aux columns for the public molecules only. Expect cp_tasks = [mdck] + the 2 aux,
+        aux VALUES on the public rows that match by SMILES, and aux NaN on every internal row (the multitask loss
+        masks those), so a cluster endpoint no longer needs run_chemprop_transfer.py.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            data = _data_with_wide()
+            # internal + public mdck labels, so the target task exists on both sides
+            data.df_all['mdck'] = [1.0, 1.2, np.nan, 1.4, 1.5, 0.9, 1.1, np.nan]
+            # the cluster parquet carries the aux tasks for two PUBLIC molecules (ethanol, naphthalene)
+            pd.DataFrame({'smiles': [CCO, NAPH], '_ik': ['A' * 27, 'B' * 27],
+                          'LE_MDCKv2_LogPapp': [0.5, 0.7], 'Caco_2_LogPapp': [0.4, 0.6]}
+                         ).to_parquet(os.path.join(tmp, 'tf_fake_cluster.parquet'))
+            data.build_ML_data_CP(_fake_params(tmp), k='mdck', leak='none', n_splits=2)
+
+            # the target comes first, then the parquet's aux columns; _ik is never a task
+            assert data.cp_tasks == ['mdck', 'LE_MDCKv2_LogPapp', 'Caco_2_LogPapp'], data.cp_tasks
+            assert data.cp_grouping == 'mdck_perm'
+            # the public ethanol row picked up its aux values through the SMILES join
+            p1 = data.cp_pub[data.cp_pub.compound == 'P_1']
+            assert len(p1) == 1 and p1['LE_MDCKv2_LogPapp'].iloc[0] == 0.5
+            # no internal row has an aux value: internal molecules are not in the Novartis frame
+            assert data.cp_int[['LE_MDCKv2_LogPapp', 'Caco_2_LogPapp']].isna().all().all()
+            # cp_int still holds every internal row measured for mdck
+            assert sorted(data.cp_int.compound) == ['I_1', 'I_2', 'I_4', 'I_5']
+
+    def test_real_config_verdicts_resolve_to_a_catalogue_entry(self):
+        """Every BEST_CHEMPROP_GROUPINGS value must name a real CHEMPROP_TRANSFER grouping or cluster.
+
+        The block used to restate `tasks` / `target` / `file` and carry `r2det` / `beats_rf`. It is now a bare
+        endpoint -> grouping-name map: the catalogue defines the tasks and the wiki holds the measurements, so
+        this invariant is all that must hold. Reads the live config.
+        """
+        import yaml
+        cfg = yaml.safe_load(open('config/config.yaml'))
+        cat = set(cfg['CHEMPROP_TRANSFER']['groupings']) | set(cfg['CHEMPROP_TRANSFER']['clusters'])
+
+        # no entry points at a grouping that does not exist
+        unknown = {ep: g for ep, g in cfg['BEST_CHEMPROP_GROUPINGS'].items() if g not in cat}
+        assert not unknown, unknown
+        # every endpoint is mapped, and each value is a bare grouping NAME (no measurements in the config)
+        assert set(cfg['BEST_CHEMPROP_GROUPINGS']) == set(cfg['ADME_ENDPOINTS'])
+        assert all(isinstance(g, str) for g in cfg['BEST_CHEMPROP_GROUPINGS'].values())
+        # the retired duplicate mapping is gone (it contradicted the verdicts)
+        assert 'endpoint_grouping' not in cfg['CHEMPROP_TRANSFER']
 
 
-def test_leak_filter_drops_internal_twins():
-    """A public row that is the same molecule as an internal compound must leave cp_pub.
-
-    P_1 is ethanol, the same molecule as internal I_1. leak='exact' must drop it; leak='none' must keep it.
-    P_2 is naphthalene, which no internal compound matches, so it must survive both levels.
-    """
-    with tempfile.TemporaryDirectory() as td:
-        data = _data_with_wide()
-        data.build_ML_data_CP(_fake_params(td), k='logd', leak='exact', n_splits=2)
-        # the ethanol twin of I_1 is gone, the naphthalene public row stays
-        assert list(data.cp_pub.compound) == ['P_2']
-
-        data.build_ML_data_CP(_fake_params(td), k='logd', leak='none', n_splits=2)
-        # with the filter off both public rows survive
-        assert list(data.cp_pub.compound) == ['P_1', 'P_2']
-
-
-def test_folds_from_rf_pickle():
-    """When <METRICS_PKL_RF_DIR>/<k>.pkl exists, cp_folds must be RF's exact folds and the source says so."""
-    with tempfile.TemporaryDirectory() as td:
-        _write_rf_pkl(td, 'logd', ['I_1', 'I_2', 'I_3', 'I_4'], [0, 1, 0, 1])
-        data = _data_with_wide()
-        data.build_ML_data_CP(_fake_params(td), k='logd', leak='none')
-
-        # two folds, and each test set is exactly the RF fold membership
-        assert len(data.cp_folds) == 2
-        assert sorted(data.cp_folds[0][1]) == ['I_1', 'I_3'] and sorted(data.cp_folds[1][1]) == ['I_2', 'I_4']
-        # the source string names the pickle it read
-        assert data.cp_fold_source == f'rf:{os.path.join(td, "logd.pkl")}'
-
-
-def test_folds_independent_when_no_pickle():
-    """With no RF pickle, cp_folds must be an independent grouped split that still partitions cp_int once."""
-    with tempfile.TemporaryDirectory() as td:
-        data = _data_with_wide()
-        data.build_ML_data_CP(_fake_params(td), k='logd', leak='none', n_splits=2, seed=1)
-
-        # the split is flagged as independent, not RF's
-        assert data.cp_fold_source == 'independent'
-        # every cp_int compound appears in exactly one test fold
-        test_ids = [c for _, te in data.cp_folds for c in te]
-        assert sorted(test_ids) == sorted(data.cp_int.compound)
-        # train and test never share a compound within a fold
-        assert all(not set(tr) & set(te) for tr, te in data.cp_folds)
-
-
-def test_cluster_grouping_joins_the_novartis_aux_tasks():
-    """A cluster grouping must take its auxiliary tasks from the cluster parquet, joined on SMILES.
-
-    The fake parquet gives 2 aux columns for the public molecules only. Expect cp_tasks = [mdck] + the 2 aux,
-    aux VALUES on the public rows that match by SMILES, and aux NaN on every internal row (the multitask loss
-    masks those), so a cluster endpoint no longer needs run_chemprop_transfer.py.
-    """
-    with tempfile.TemporaryDirectory() as tmp:
-        data = _data_with_wide()
-        # internal + public mdck labels, so the target task exists on both sides
-        data.df_all['mdck'] = [1.0, 1.2, np.nan, 1.4, 1.5, 0.9, 1.1, np.nan]
-        # the cluster parquet carries the aux tasks for two PUBLIC molecules (ethanol, naphthalene)
-        pd.DataFrame({'smiles': [CCO, NAPH], '_ik': ['A' * 27, 'B' * 27],
-                      'LE_MDCKv2_LogPapp': [0.5, 0.7], 'Caco_2_LogPapp': [0.4, 0.6]}
-                     ).to_parquet(os.path.join(tmp, 'tf_fake_cluster.parquet'))
-        data.build_ML_data_CP(_fake_params(tmp), k='mdck', leak='none', n_splits=2)
-
-        # the target comes first, then the parquet's aux columns; _ik is never a task
-        assert data.cp_tasks == ['mdck', 'LE_MDCKv2_LogPapp', 'Caco_2_LogPapp'], data.cp_tasks
-        assert data.cp_grouping == 'mdck_perm'
-        # the public ethanol row picked up its aux values through the SMILES join
-        p1 = data.cp_pub[data.cp_pub.compound == 'P_1']
-        assert len(p1) == 1 and p1['LE_MDCKv2_LogPapp'].iloc[0] == 0.5
-        # no internal row has an aux value: internal molecules are not in the Novartis frame
-        assert data.cp_int[['LE_MDCKv2_LogPapp', 'Caco_2_LogPapp']].isna().all().all()
-        # cp_int still holds every internal row measured for mdck
-        assert sorted(data.cp_int.compound) == ['I_1', 'I_2', 'I_4', 'I_5']
-
-
-def test_real_config_verdicts_resolve_to_a_catalogue_entry():
-    """Every BEST_CHEMPROP_GROUPINGS value must name a real CHEMPROP_TRANSFER grouping or cluster.
-
-    The block used to restate `tasks` / `target` / `file` and carry `r2det` / `beats_rf`. It is now a bare
-    endpoint -> grouping-name map: the catalogue defines the tasks and the wiki holds the measurements, so
-    this invariant is all that must hold. Reads the live config.
-    """
-    import yaml
-    cfg = yaml.safe_load(open('config/config.yaml'))
-    cat = set(cfg['CHEMPROP_TRANSFER']['groupings']) | set(cfg['CHEMPROP_TRANSFER']['clusters'])
-
-    # no entry points at a grouping that does not exist
-    unknown = {ep: g for ep, g in cfg['BEST_CHEMPROP_GROUPINGS'].items() if g not in cat}
-    assert not unknown, unknown
-    # every endpoint is mapped, and each value is a bare grouping NAME (no measurements in the config)
-    assert set(cfg['BEST_CHEMPROP_GROUPINGS']) == set(cfg['ADME_ENDPOINTS'])
-    assert all(isinstance(g, str) for g in cfg['BEST_CHEMPROP_GROUPINGS'].values())
-    # the retired duplicate mapping is gone (it contradicted the verdicts)
-    assert 'endpoint_grouping' not in cfg['CHEMPROP_TRANSFER']
+if __name__ == '__main__':
+    unittest.main()

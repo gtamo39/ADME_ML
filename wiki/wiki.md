@@ -2,6 +2,10 @@
 
 Durable aggregate memory for this repo. Survives context compaction. Aggregate-only (no SMILES / compound IDs / per-compound values).
 
+> **2026-10-19 cleanup.** The user deleted 157 old paths (about 44 GB); see "Repo cleanup done" at the end.
+> Many older sections name code or folders that no longer exist. Their findings and numbers stay valid.
+> Deleted tracked code is in git history (`git checkout d1cf116 -- <path>`); deleted untracked files are gone.
+
 ---
 
 ## Solubility cleaning sweep — thermo-only augmentation wins (2026-07-20, `python/solubility_cleaning_sweep.py`)
@@ -172,6 +176,9 @@ MS_ML documents for Dropbox-over-SSH).
 
 ## Unit tests for the systematic runners (`tests/`, 2026-07-20)
 
+**SUPERSEDED 2026-10-19:** the cleanup deleted both runners, and both test files are deleted too.
+For the current suite, see "Test suite under unittest" at the end.
+
 `unittest` (stdlib — no pytest dep, mirrors MS_ML). Run in env `ML` from repo root:
 `python -m unittest discover -s tests` (**22 tests, ~57s**, 1 skipped). `tests/_adme_fixture.py` builds a
 ~1K-compound **LOCAL subset** of the real cache into a temp dir (first-batch parquet slice, values never
@@ -250,6 +257,9 @@ grouping sweep. KEPT UNTOUCHED: everything under `output/predictions_runs_chempr
 `output/chemprop_models/transfer_pretrain/` (the checkpoints `assess_predictions_cp` reuses). The last of those holds
 `summary_transfer.csv`, which is the PROVENANCE for every grouping number in the champion table and for the
 relatedness law — deleting it would orphan those wiki claims.
+**UPDATE 2026-10-19 (cleanup):** `archive/` is deleted (git history keeps it). Of
+`output/predictions_runs_chemprop_transfer/`, only `summary_transfer.csv` remains (notebook cell `9fb460e4`
+reads it). `transfer_pretrain/` keeps its 7 groupings; only the 3 `*_smoke` leftovers are gone.
 ONE CAPABILITY GAP: the runner scored several groupings PER ENDPOINT and keyed its summary by
 (endpoint, arm, grouping). `assess_predictions_cp` stores `metrics_results_cp[<endpoint>]`, so two groupings
 for one endpoint overwrite each other in memory; only the caller-chosen `outpath` separates them on disk.
@@ -445,6 +455,8 @@ mdck_inh endpoint, not the deploy change. `_fake_raw` at line 54 builds `mdck_Ce
 endpoint loop raises `KeyError`. Verified present at HEAD, so it arrived with the endpoint. Fix = add
 that column plus `mdck_Mean Papp A to B - PgP Inhibitor` to the synthetic frame. The rest of the suite
 is green: 46 passed, and `tests/test_deploy.py` is 8/8 including the 2 new append tests.
+**RESOLVED 2026-10-19:** all 11 pass. 8 were this `KeyError`; the other 3 (`test_cv_panel_*`) raised
+`NameError: fn`. See "Test suite under unittest" at the end.
 
 **CLI runner (2026-08-27, `python/run_nvs_cellab.py`).** Runs Cell A+B headless with crash-safe incremental saves
 (SSH-drop cost the user 40 min of interactive compute). `python python/run_nvs_cellab.py --config … --outdir
@@ -2477,7 +2489,8 @@ collect; the 2 files that DO use `unittest.TestCase` (`test_rf_systematic`,
 keys they read (`CHEMPROP_SYSTEMATIC`, `PARAMS.features_type`). So `discover` reports
 "Ran 0 tests ... FAILED (errors=2)". The 55 function tests all pass when a runner calls them
 directly. Open item: either convert the 8 files to `TestCase`, or repair the 2 stale files and
-agree on a runner.
+agree on a runner. **RESOLVED 2026-10-19:** all files are `TestCase` now, and the CLAUDE.md command
+runs 63 tests; see "Test suite under unittest" at the end.
 
 **SDF export.** New `Download SDF` button beside `Download CSV`, and a `POST /api/download_sdf`
 route. The CSV export is built client-side; the SDF cannot be, because the browser never holds the
@@ -2882,7 +2895,8 @@ collect; only `test_chemprop_systematic` and `test_rf_systematic` use `unittest.
 error at setUp because the 2026-09-08 lean-config pass removed `CHEMPROP_SYSTEMATIC` and
 `features_type`, which those retired runners still read. So the suite currently verifies nothing.
 Pre-existing, unrelated to this change, but it means notebook/probe checks are the only real
-verification today.
+verification today. **RESOLVED 2026-10-19:** the CLAUDE.md command runs 63 tests, all pass; see
+"Test suite under unittest" at the end.
 
 ## Notebook editing — `python/nb_edit.py`, never clear the live notebook (2026-09-15)
 
@@ -3297,6 +3311,8 @@ SMILES. `value` must ALREADY be in modelling space; `origin` is the exact string
 CAUTION: `build_public_features.py` -> `harmonize_adme.harmonize_all()` reads `ADME_PUBLIC` /
 `ADME_SCALING` / `BIOGEN_ADME_CSV`, which the lean config dropped on 2026-09-08. It defaults to
 `config/config.yaml` and would raise a KeyError; pass `config/config_legacy_20260903.yaml`.
+**UPDATE 2026-10-19:** the cleanup deleted `build_public_features.py` (untracked, gone for good) and
+`config_legacy_20260903.yaml` (in git history). Nothing in the repo can rebuild the public parquets now.
 
 **2. The two config keys gate DIFFERENT models.** `ENDPOINT_PUBLIC_FILES` builds the wide `df_all`, so
 it gates BOTH RF and chemprop. `BEST_PUBLIC` is read only by `select_best_combo_and_update`, so it gates
@@ -3392,6 +3408,8 @@ treat them as a good estimate, not an exact audit.
 
 Built by the new runner `python/harvest_chembl_mdck_inh.py` (PARAMS/DATA/OUTPUT/MAIN), config
 `config/chembl_harvest.yaml` — kept OUT of `config/config.yaml`, which serves three consumers only.
+**UPDATE 2026-10-19:** the cleanup deleted `config/chembl_harvest.yaml` but kept the runner, so the runner
+cannot start. Restore the config with `git checkout d1cf116 -- config/chembl_harvest.yaml`.
 Raw API pages cache under `data/public_adme/chembl_mdck_inh/`, so a re-run needs no network (`--refresh`
 re-queries, `--dry_run` reports the funnel and writes nothing).
 
@@ -3643,3 +3661,156 @@ It draws one panel per endpoint, with three boxes from left to right:
 - Test: synthetic compounds + the real vault bundles. Asserts: paired compounds, closed-form `conf_recal`,
   the pickle load, the global `k` unchanged, the PNG at 150 dpi, a safe re-run (same frame).
 - **RESULT: PENDING.** The user runs the cell on the real data; record the medians here.
+
+## RF 1000-tree run + new CDD pull (2026-10-19)
+
+Purpose (user): find out if more trees give a better RF confidence. Config changes:
+- `RF_SINGLETASK.champion.n_estimators` 200 -> **1000**. The other hyperparameters and seed 42 stay.
+- `RUN PATHS` moved to `20261019`: `ADME_RAW_CSV` (`data/20261019_all_adme.csv`), both metrics dirs and
+  `CHEMPROP_OUTPUT_DIR`. `CHEMPROP_PRETRAIN_DIR` stays (no change to the public pool).
+- Run: `--overwrite --assess_RF_all_endpoints`, env `ML`, inside screen `gene_SAR`, with no log file.
+  It writes `output/results/20261019_metrics_rf/`.
+- Duration of the 200-tree run on 2026-09-23 (from pickle mtimes): 6 h 10 min. Each of hlm/mlm/rlm/caco2/mdck
+  took 62-87 min, and the other 4 took seconds. Expect about 28-30 h at 1000 trees and `n_jobs: 32`.
+- CAUTION: this run changes the data AND the tree count, so a difference from 20260923 mixes both causes.
+- The deployed RF models stay at 200 trees on the 2026-09-23 data until a `--deploy_RF_all_endpoints`.
+  Until then, the round-trip box of cell `bd89b82a` does not match a 1000-tree run.
+
+## Repo inventory — what the targets need (2026-10-19, `docs/f2rm.md`)
+
+`docs/f2rm.md` lists every file per folder with a tag: KEEP / KEEP (cache) / IN USE / YOUR CALL / safe to
+delete. Targets: the webapp, `ADME_build_ML.py` (all CLI modes) and every code cell of the 5 notebooks.
+Method: file names, sizes, code and config only; no data file opened. The user deletes; Claude deleted nothing.
+- `safe to delete` frees about 44 GB (`du -h`): autoresearch 39.3, output 4.5, data 0.2. Of that, 36 GB is
+  `autoresearch/predict_adme/chemprop_run/` + `chemprop_transfer_run/` (2026-07 runs).
+- `ADME_build_ML.py` reads 14 public parquets + 2 `tf_novartis_*` files from `autoresearch/predict_adme`
+  (`ADME_CACHE`), plus the `_ikcache/` InChIKey cache (`fn.inchikeys_for`).
+- The webapp needs nothing in `output/`, `data/` or `python/`. All 18 pinned models (RF + chemprop) live
+  inside the vault (checked 2026-10-19).
+- The vault holds 18 `adme_*` models, all current, so `remove_adme_ml.sh` has nothing left to delete.
+- **Broken now:** cell `01a26a07` reads `tmp/20260909_pred_internal.csv`, which is gone, so `01a26a07` and
+  `eb77e860` fail (STILL OPEN; the test passes only because it swaps in a synthetic csv). Cell `7b74aef2`
+  of `Solubility_sticky_cmps` uses `CHEMLIB_PATH` / `CHEMLIB_OVERWRITE`, and no cell defines them.
+  **FIXED 2026-10-19** by the house-style pass: both are cell constants now, and `CHEMLIB_PATH` reads
+  `data/chemical_libs/SERAC_lib.csv`, so that file is KEEP.
+- `nb:ADME_ML_results` pins `D = '20260909'` and `'20260923'`. Those 4 result dirs stay KEEP until `D` moves.
+- `delete_old_files.sh` (repo root) holds one `rm -rf` line per path: 117 active (`safe to delete`), 57
+  commented (`YOUR CALL`). It `cd`s to its own folder and exits 1 outside the ADME_ML root. Tested in a
+  sandbox: as written, all lines uncommented, and the guard. It deletes nothing the RF run of 2026-10-19 uses.
+
+## Repo cleanup done (2026-10-19)
+
+The user ran `delete_old_files.sh` with 40 of the 57 `YOUR CALL` lines turned on. Result: 157 paths gone
+(117 `safe to delete` + 40 `YOUR CALL`). The 17 kept `YOUR CALL` paths stay as commented lines in the script.
+Sizes: autoresearch 41 GB -> 1.4 GB, output 11 GB -> 6.4 GB, data 292 MB -> 129 MB, tmp 365 KB -> 126 KB.
+Checked after the run: every KEEP path of `docs/f2rm.md` exists, and the 1000-tree RF run still runs.
+
+The 40 `YOUR CALL` deletions:
+- all autoresearch scripts: 26 in `predict_adme/`, plus 4 scripts and `config.yaml` in `predict_solubility/`.
+  They were untracked, so they are gone for good.
+- `autoresearch/predict_adme/internal_targets.parquet` and `internal_MF.parquet` (the test fixture sources).
+- `config/chembl_harvest.yaml` and `config/config_legacy_20260903.yaml`.
+- `python/run_RF_SingleTask_systematic.py`, `run_Chemprop_SystematicGroups.py`, `nvs_subset_search.py`,
+  `nvs_campaign.py`, `build_novartis_clusters.py`.
+
+Kept files that cannot run now, because a dependency is gone (restore with `git checkout d1cf116 -- <path>`):
+- `python/run_adme_nearshell.py` imports `nvs_campaign` + `nvs_subset_search`. Its result folder
+  `output/results/20260831_ADME_nearshell/` stays, so both bar figures still work.
+- `python/harvest_chembl_mdck_inh.py` reads `config/chembl_harvest.yaml`. Its parquet and raw API cache stay.
+- `python/harmonize_adme.py` (+ `extract_adme.py`) needs `config_legacy_20260903.yaml`, and its caller
+  `build_public_features.py` is gone. The public parquets stay, but nothing can rebuild them.
+- `tf_novartis_*.parquet` stay, but `build_novartis_clusters.py` is gone, so nothing can rebuild them.
+
+**Test state after the cleanup** (env `ML`, from the repo root):
+- `python -m unittest discover -s tests` (the CLAUDE.md command) runs 12 tests. The 9 in `test_webapp.py`
+  pass. 3 modules fail to import: `test_rf_systematic`, `test_chemprop_systematic`, `test_nvs_subset_search`.
+- 9 of the 12 test files hold plain `test_*` functions, which `unittest` never collects. A runner that
+  imports each `tests/test_*.py` and calls its `test_*` functions directly (no pytest, about 13 s):
+  **43 pass, 14 fail**. The same runner on a `git archive` of `d1cf116` (before the cleanup): 49 pass, 12 fail.
+- The cleanup removed only the 8 tests of `test_nvs_subset_search.py`, whose module is gone.
+  `test_rf_systematic` and `test_chemprop_systematic` already failed at setup since 2026-09-08.
+- `test_roundtrip_cells.py`: the same 11 failures before and after (8 `KeyError`, 3 `NameError: fn`); see
+  the 2026-09-24 OPEN item.
+- `tests/test_metrics_table.py` (new, untracked) passes 2/2.
+- Dead files left in `tests/`: `test_rf_systematic.py`, `test_chemprop_systematic.py`,
+  `test_nvs_subset_search.py`, and `_adme_fixture.py` (only the first two use it).
+  **DONE 2026-10-19:** all 4 deleted, and the suite repaired; see "Test suite under unittest" below.
+
+## Test suite under unittest — 63 tests, all pass (2026-10-19)
+
+`python -m unittest discover -s tests` (env `ML`, repo root) now runs the WHOLE suite: **63 tests, OK,
+about 13 s**. Before today it ran only `test_webapp.py`.
+- **Converted to `unittest.TestCase`:** the 8 files that held plain `test_*` functions. Each now has one
+  class at its end (`TestAssessPredictionsCP`, `TestBuildMLDataCP`, `TestBuildMLData`, `TestConfidence`,
+  `TestDeploy`, `TestMetricsTable`, `TestMFFeatures`, `TestRoundTripCells`) and a `unittest.main()` block.
+  The helpers stay at module level. A script proved every method body AST-identical to the old
+  function body (docstrings compared after `inspect.cleandoc`).
+- **RULE for a new test:** write it as a method of a `unittest.TestCase` class. `unittest` does not
+  collect a plain top-level `test_*` function, so such a test never runs.
+- **Deleted:** `test_rf_systematic.py`, `test_chemprop_systematic.py`, `test_nvs_subset_search.py`,
+  `_adme_fixture.py`. Their modules were gone after the cleanup.
+- **`test_roundtrip_cells.py` repaired (11 of 11 pass):**
+  - The fixture now builds every config `filter` column; it lacked the mdck_inh column.
+  - The panel tests take the grid size from the endpoint count (9 endpoints = 5 x 2 with one hidden
+    spare axis), and pair the axes with `fn.ordered_endpoints`, the order the cells draw in.
+  - The CV-panel namespace now holds `fn`.
+- Per file: assess_predictions_cp 6, build_ml_data_cp 6, build_ml_data 6, confidence 5, deploy 11,
+  metrics_table 2, mf_features 7, roundtrip_cells 11, webapp 9.
+- README: the stale harmonizer paragraph and the "which env runs what" section now match the code, and
+  the retrain commands run `mkdir -p output/logs` first, because the cleanup deleted that folder.
+
+## HOUSE STYLE APPLIED TO THE BUILDER AND ALL 5 VIGNETTES (2026-10-19)
+
+Scope: `python/ADME_build_ML.py` and every notebook in `vignettes/`, to the rules in
+`/home/gtamo/Simplify/rules.md`. Verified by `python -m unittest discover -s tests`: **63 tests OK**,
+which includes the 11 `test_roundtrip_cells` cases that failed before. (Correction, same day: the test
+repair and the TestCase conversion in "Test suite under unittest" fixed those 11, not this pass.)
+
+**New rule 21 — type tags.** A name whose type the line does not show now carries `#_> type=sample`
+at the end of the line. Forms: `float=0.5`, `list[str]=[solubility,logd,...]`,
+`df=cols:[compound,F0,F1,...]`, `dict{dict:df}={solubility:{ext_->_internal_preddf,...}...}`,
+and `#_> data.df_all: df=cols:[...]` for a call that sets attributes. The sample holds names and
+config values ONLY — never a smiles, a compound id, a label or a prediction. Added to
+`Simplify/rules.md` + `examples.md` from the user's `bd89b82a` pair.
+
+**Code moved out of the notebooks into `python/functions.py`** (a cell must hold no `def`):
+- `endpoint_metrics_table(metrics_dict, endpoint, params)` — was the 108-line FUNCTIONS cell
+  `ad5857c4` with 9 defs. It now reads the triage cutoff from `webapp.cutoffs[ep]` instead of a
+  notebook-local `CUTOFFS` dict. Proven identical to the old helper (frame AND html) on all 9
+  endpoints. Covered by `tests/test_metrics_table.py`.
+- `plot_confidence_panel(ax, conf, resid, split, colors, ...)` — one confidence-vs-residual panel,
+  was written out 3 times (`560d161e`, `eb77e860`, FP_preds `36f4fb87`).
+- `sol_binary_frames(test, test_MF, public, public_MF, cutoff)` — the internal/public solubility
+  frames the 4 evaluation arms of `Solubility_sticky_cmps` each rebuilt.
+
+**Behaviour changes, deliberate:**
+1. `Solubility_sticky_cmps` could not run: it read `SOL_OVERWRITE`, `CUTOFF_SOL`, `CHEMLIB_PATH` and
+   `CHEMLIB_OVERWRITE` from the config, and all 4 keys were removed long ago. They are now cell
+   constants (rule 17), so the notebook runs again. `CUTOFF_SOL = 10` uM and `CHEMLIB_PATH =
+   data/chemical_libs/SERAC_lib.csv` restore the documented values — CHECK THEM before trusting a run.
+2. Same notebook, cell `998c6bb9` fitted `model` (XGB) on every row, but the prediction cell
+   `9ff2de8f` scores with `champion` (HistGradientBoosting). The shipped fit is now `champion`, so
+   the sticky predictions no longer come from a model fitted on the last CV fold alone.
+3. Same notebook, cell `e2adcb45` named its XGB hyperparameter dict `params`, which overwrote the
+   PARAMS object for every later cell. It is now `XGB_KW`.
+4. The `globals().update(...)` config shim is gone from all notebooks; cells read `params.<KEY>`.
+5. `_endpoint_ML` dedups with a `sort_values('source', key=...)` instead of a temporary `_int`
+   column. Proven to return identical rows AND identical order on 300 random frames.
+6. `deploy`/`select_best_combo_and_update` docstring said "80/20 temporal split"; the code has always
+   cut at 0.7. The docstring now says 70/30. No code change.
+
+**Not changed:** the big import cells of the 4 older notebooks (they carry unused and commented-out
+imports, but removing one could break ad-hoc work), and the 4 dead `## TMP` chemprop cells of
+`Multitask_adme_preds` (`29c53348`, `f18969ea`, `c27df3eb`, `c9e001a2`), which have referenced
+undefined `d_aug` / `aug_ids` / `tlog` since before this pass. Their `SERAC_C[...]` was repointed at
+`params.SERAC_C` so the shim removal adds no new failure.
+
+**The `f2rm.md` cleanup ran on 2026-10-19** (full record: "Repo cleanup done"). Of the 28 git-tracked
+deletions, `delete_old_files.sh` removed 24: 17 `safe to delete` and 7 `YOUR CALL` (2 config files,
+5 python modules). Claude removed the other 4 afterwards, at the user's request: `tests/_adme_fixture.py`,
+`tests/test_chemprop_systematic.py`, `tests/test_nvs_subset_search.py`, `tests/test_rf_systematic.py`.
+`test_rf_systematic` and `test_chemprop_systematic` had failed at `setUpModule` since 2026-09-08 (retired
+config sections `CHEMPROP_SYSTEMATIC` and `features_type`). The 63 remaining tests pass after the cleanup.
+CAUTION: to restore one deleted tracked file, name it: `git checkout d1cf116 -- <path>`. Do NOT run
+`git checkout .` — it also discards every uncommitted edit in the repo (this house-style pass, the test
+conversion, the README and the wiki).
